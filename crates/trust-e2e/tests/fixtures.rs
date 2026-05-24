@@ -755,10 +755,39 @@ fn fail_multiplication_unproved_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_variable_addition_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_variable_addition", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+}
+
+#[test]
+fn fail_division_by_zero_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_division_by_zero", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer division denominator is nonzero");
+}
+
+#[test]
+fn fail_remainder_by_zero_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_remainder_by_zero", Expected::Fail);
+
+    output
+        .assert_contains("error[trust]: could not prove integer remainder denominator is nonzero");
+}
+
+#[test]
 fn fail_slice_index_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_slice_index_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove index is in bounds");
+}
+
+#[test]
+fn fail_vec_index_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_vec_index", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported index expression in `get_vec`: `xs[i]`");
 }
 
 #[test]

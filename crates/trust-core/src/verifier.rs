@@ -19,7 +19,19 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    IntegerDivisionByZero {
+        function: String,
+        expression: String,
+    },
+    IntegerRemainderByZero {
+        function: String,
+        expression: String,
+    },
     SliceIndexOutOfBounds {
+        function: String,
+        expression: String,
+    },
+    UnsupportedIndex {
         function: String,
         expression: String,
     },
@@ -110,12 +122,33 @@ impl fmt::Display for VerificationError {
                 f,
                 "could not prove integer multiplication cannot overflow in `{function}`: `{expression}`"
             ),
+            VerificationError::IntegerDivisionByZero {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer division denominator is nonzero in `{function}`: `{expression}`"
+            ),
+            VerificationError::IntegerRemainderByZero {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer remainder denominator is nonzero in `{function}`: `{expression}`"
+            ),
             VerificationError::SliceIndexOutOfBounds {
                 function,
                 expression,
             } => write!(
                 f,
                 "could not prove index is in bounds in `{function}`: `{expression}`"
+            ),
+            VerificationError::UnsupportedIndex {
+                function,
+                expression,
+            } => write!(
+                f,
+                "unsupported index expression in `{function}`: `{expression}`"
             ),
             VerificationError::CalleePreconditionUnproved {
                 function,
@@ -306,6 +339,31 @@ fn verify_total_with_env(
         }
     }
 
+    for obligation in division_obligations(body, &params) {
+        if !denominator_nonzero(&obligation.denominator, &contracts) {
+            return Err(VerificationError::IntegerDivisionByZero {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    for obligation in remainder_obligations(body, &params) {
+        if !denominator_nonzero(&obligation.denominator, &contracts) {
+            return Err(VerificationError::IntegerRemainderByZero {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    if let Some(expression) = unsupported_index_expression(body, &params) {
+        return Err(VerificationError::UnsupportedIndex {
+            function: metadata.rust_function_path.clone(),
+            expression,
+        });
+    }
+
     for obligation in slice_index_obligations(body, &params) {
         if !slice_index_obligation_proved(&obligation, &contracts) {
             return Err(VerificationError::SliceIndexOutOfBounds {
@@ -359,16 +417,17 @@ struct TrustFunctionSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AddObligation {
     variable: String,
-    ty: String,
-    constant: i128,
+    ty: Option<String>,
+    constant: Option<i128>,
     expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubObligation {
     variable: String,
-    ty: String,
-    constant: i128,
+    ty: Option<String>,
+    constant: Option<i128>,
+    rhs: Option<String>,
     expression: String,
 }
 
@@ -382,8 +441,14 @@ struct NegObligation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MulObligation {
     variable: String,
-    ty: String,
-    constant: i128,
+    ty: Option<String>,
+    constant: Option<i128>,
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DenominatorObligation {
+    denominator: String,
     expression: String,
 }
 
@@ -589,28 +654,41 @@ fn return_field_expression(return_expression: &str, field: &str) -> Option<Strin
 }
 
 fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
-    let tokens = tokens(body);
+    let tokens = executable_tokens(body);
     let mut obligations = Vec::new();
 
-    for window in tokens.windows(3) {
-        let [left, op, right] = window else {
-            continue;
-        };
-        if op != "+" {
+    for idx in 0..tokens.len().saturating_sub(2) {
+        let left = &tokens[idx];
+        let op = &tokens[idx + 1];
+        let right = &tokens[idx + 2];
+        if op != "+" || !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
 
-        if let Some(param) = params.iter().find(|param| param.name == *left) {
-            if let Ok(constant) = right.parse::<i128>() {
-                if is_supported_integer(&param.ty) {
-                    obligations.push(AddObligation {
-                        variable: left.clone(),
-                        ty: param.ty.clone(),
-                        constant,
-                        expression: format!("{left} + {right}"),
-                    });
-                }
-            }
+        let expression = format!("{left} + {right}");
+        if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+            obligations.push(AddObligation {
+                variable: left.clone(),
+                ty: Some(ty.to_string()),
+                constant: Some(constant),
+                expression,
+            });
+        } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
+            obligations.push(AddObligation {
+                variable: right.clone(),
+                ty: Some(ty.to_string()),
+                constant: Some(constant),
+                expression,
+            });
+        } else if expression_needs_integer_proof(left, right, params) {
+            obligations.push(AddObligation {
+                variable: left.clone(),
+                ty: param_type(left, params)
+                    .or_else(|| param_type(right, params))
+                    .map(|ty| ty.to_string()),
+                constant: None,
+                expression,
+            });
         }
     }
 
@@ -618,28 +696,39 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
 }
 
 fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
-    let tokens = tokens(body);
+    let tokens = executable_tokens(body);
     let mut obligations = Vec::new();
 
-    for window in tokens.windows(3) {
-        let [left, op, right] = window else {
-            continue;
-        };
-        if op != "-" {
+    for idx in 0..tokens.len().saturating_sub(2) {
+        let left = &tokens[idx];
+        let op = &tokens[idx + 1];
+        let right = &tokens[idx + 2];
+        if op != "-" || !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
 
-        if let Some(param) = params.iter().find(|param| param.name == *left) {
-            if let Ok(constant) = right.parse::<i128>() {
-                if constant > 0 && is_supported_integer(&param.ty) {
-                    obligations.push(SubObligation {
-                        variable: left.clone(),
-                        ty: param.ty.clone(),
-                        constant,
-                        expression: format!("{left} - {right}"),
-                    });
-                }
+        let variable = field_expression_before(&tokens, idx + 1).unwrap_or_else(|| left.clone());
+        let expression = format!("{variable} - {right}");
+        if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+            if constant > 0 {
+                obligations.push(SubObligation {
+                    variable,
+                    ty: Some(ty.to_string()),
+                    constant: Some(constant),
+                    rhs: None,
+                    expression,
+                });
             }
+        } else if expression_needs_integer_proof(left, right, params)
+            || field_expression_before(&tokens, idx + 1).is_some()
+        {
+            obligations.push(SubObligation {
+                variable,
+                ty: param_type(left, params).map(|ty| ty.to_string()),
+                constant: None,
+                rhs: Some(right.clone()),
+                expression,
+            });
         }
     }
 
@@ -647,7 +736,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
 }
 
 fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
-    let tokens = tokens(body);
+    let tokens = executable_tokens(body);
     let mut obligations = Vec::new();
 
     for (idx, token) in tokens.iter().enumerate() {
@@ -674,28 +763,81 @@ fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
 }
 
 fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation> {
-    let tokens = tokens(body);
+    let tokens = executable_tokens(body);
     let mut obligations = Vec::new();
 
-    for window in tokens.windows(3) {
-        let [left, op, right] = window else {
-            continue;
-        };
-        if op != "*" {
+    for idx in 0..tokens.len().saturating_sub(2) {
+        let left = &tokens[idx];
+        let op = &tokens[idx + 1];
+        let right = &tokens[idx + 2];
+        if op != "*" || !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
 
-        if let Some(param) = params.iter().find(|param| param.name == *left) {
-            if let Ok(constant) = right.parse::<i128>() {
-                if constant > 1 && is_supported_integer(&param.ty) {
-                    obligations.push(MulObligation {
-                        variable: left.clone(),
-                        ty: param.ty.clone(),
-                        constant,
-                        expression: format!("{left} * {right}"),
-                    });
-                }
+        let expression = format!("{left} * {right}");
+        if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+            if constant > 1 {
+                obligations.push(MulObligation {
+                    variable: left.clone(),
+                    ty: Some(ty.to_string()),
+                    constant: Some(constant),
+                    expression,
+                });
             }
+        } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
+            if constant > 1 {
+                obligations.push(MulObligation {
+                    variable: right.clone(),
+                    ty: Some(ty.to_string()),
+                    constant: Some(constant),
+                    expression,
+                });
+            }
+        } else if expression_needs_integer_proof(left, right, params) {
+            obligations.push(MulObligation {
+                variable: left.clone(),
+                ty: param_type(left, params)
+                    .or_else(|| param_type(right, params))
+                    .map(|ty| ty.to_string()),
+                constant: None,
+                expression,
+            });
+        }
+    }
+
+    obligations
+}
+
+fn division_obligations(body: &str, params: &[Param]) -> Vec<DenominatorObligation> {
+    denominator_obligations(body, params, "/")
+}
+
+fn remainder_obligations(body: &str, params: &[Param]) -> Vec<DenominatorObligation> {
+    denominator_obligations(body, params, "%")
+}
+
+fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<DenominatorObligation> {
+    let tokens = executable_tokens(body);
+    let mut obligations = Vec::new();
+
+    for idx in 0..tokens.len().saturating_sub(2) {
+        let left = &tokens[idx];
+        let operator = &tokens[idx + 1];
+        let right = &tokens[idx + 2];
+        if operator != op || !is_value_operand(left) || !is_value_operand(right) {
+            continue;
+        }
+        if right.parse::<i128>().is_ok_and(|value| value != 0) {
+            continue;
+        }
+        if param_type(left, params).is_some()
+            || param_type(right, params).is_some()
+            || right.parse::<i128>() == Ok(0)
+        {
+            obligations.push(DenominatorObligation {
+                denominator: right.clone(),
+                expression: format!("{left} {op} {right}"),
+            });
         }
     }
 
@@ -703,7 +845,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
 }
 
 fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObligation> {
-    let tokens = tokens(body);
+    let tokens = executable_tokens(body);
     let mut obligations = Vec::new();
     let mut idx = 0;
 
@@ -745,6 +887,30 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
     }
 
     obligations
+}
+
+fn unsupported_index_expression(body: &str, params: &[Param]) -> Option<String> {
+    let tokens = executable_tokens(body);
+    let mut idx = 0;
+
+    while idx + 3 < tokens.len() {
+        let base = &tokens[idx];
+        if tokens[idx + 1] != "[" {
+            idx += 1;
+            continue;
+        }
+        let Some(end) = matching_token_group(&tokens, idx + 1, "[", "]") else {
+            idx += 1;
+            continue;
+        };
+        if !is_read_only_slice_param(base, params) {
+            let index = token_expression(&tokens[idx + 2..end]);
+            return Some(format!("{base}[{index}]"));
+        }
+        idx = end + 1;
+    }
+
+    None
 }
 
 fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObligation> {
@@ -1162,19 +1328,28 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
 }
 
 fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
-    let Some(max) = max_value(&obligation.ty) else {
+    let Some(constant) = obligation.constant else {
         return false;
     };
-    let required_bound = max - obligation.constant;
-    let lt_exact = format!("{}<{}::MAX", obligation.variable, obligation.ty);
+    if constant == 0 {
+        return true;
+    }
+    let Some(ty) = &obligation.ty else {
+        return false;
+    };
+    let Some(max) = max_value(ty) else {
+        return false;
+    };
+    let required_bound = max - constant;
+    let lt_exact = format!("{}<{}::MAX", obligation.variable, ty);
     let le_required = format!(
         "{}<={}",
         obligation.variable,
-        constant_with_type(required_bound, &obligation.ty)
+        constant_with_type(required_bound, ty)
     );
     let le_unqualified = format!("{}<={required_bound}", obligation.variable);
 
-    if obligation.constant == 1 && contracts.iter().any(|contract| contract == &lt_exact) {
+    if constant == 1 && contracts.iter().any(|contract| contract == &lt_exact) {
         return true;
     }
 
@@ -1184,33 +1359,51 @@ fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) 
 }
 
 fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String]) -> bool {
-    let Some(min) = min_value(&obligation.ty) else {
+    if let Some(constant) = obligation.constant {
+        if constant == 0 {
+            return true;
+        }
+        let Some(ty) = &obligation.ty else {
+            return false;
+        };
+        let Some(min) = min_value(ty) else {
+            return false;
+        };
+        let required_bound = min + constant;
+        let gt_min = format!("{}>{ty}::MIN", obligation.variable);
+        let ge_required = format!(
+            "{}>={}",
+            obligation.variable,
+            min_bound_with_type(required_bound, ty)
+        );
+        let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
+
+        if constant == 1 && contracts.iter().any(|contract| contract == &gt_min) {
+            return true;
+        }
+        if ty == "usize"
+            && constant == 1
+            && contracts
+                .iter()
+                .any(|contract| contract == &format!("{}>0", obligation.variable))
+        {
+            return true;
+        }
+
+        return contracts
+            .iter()
+            .any(|contract| contract == &ge_required || contract == &ge_unqualified);
+    }
+
+    let Some(rhs) = &obligation.rhs else {
         return false;
     };
-    let required_bound = min + obligation.constant;
-    let gt_min = format!("{}>{}::MIN", obligation.variable, obligation.ty);
-    let ge_required = format!(
-        "{}>={}",
-        obligation.variable,
-        min_bound_with_type(required_bound, &obligation.ty)
-    );
-    let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
-
-    if obligation.constant == 1 && contracts.iter().any(|contract| contract == &gt_min) {
-        return true;
-    }
-    if obligation.ty == "usize"
-        && obligation.constant == 1
+    let ge_rhs = format!("{}>={rhs}", obligation.variable);
+    let rhs_nonnegative = format!("{rhs}>=0");
+    contracts.iter().any(|contract| contract == &ge_rhs)
         && contracts
             .iter()
-            .any(|contract| contract == &format!("{}>0", obligation.variable))
-    {
-        return true;
-    }
-
-    contracts
-        .iter()
-        .any(|contract| contract == &ge_required || contract == &ge_unqualified)
+            .any(|contract| contract == &rhs_nonnegative)
 }
 
 fn negation_obligation_proved(obligation: &NegObligation, contracts: &[String]) -> bool {
@@ -1232,35 +1425,52 @@ fn negation_obligation_proved(obligation: &NegObligation, contracts: &[String]) 
 }
 
 fn multiplication_obligation_proved(obligation: &MulObligation, contracts: &[String]) -> bool {
-    let Some(max) = max_value(&obligation.ty) else {
+    let Some(constant) = obligation.constant else {
         return false;
     };
-    let upper_symbolic = format!(
-        "{}<={}::MAX/{}",
-        obligation.variable, obligation.ty, obligation.constant
-    );
-    let upper_numeric = format!("{}<={}", obligation.variable, max / obligation.constant);
+    if constant == 0 || constant == 1 {
+        return true;
+    }
+    let Some(ty) = &obligation.ty else {
+        return false;
+    };
+    let Some(max) = max_value(ty) else {
+        return false;
+    };
+    let upper_symbolic = format!("{}<={}::MAX/{}", obligation.variable, ty, constant);
+    let upper_numeric = format!("{}<={}", obligation.variable, max / constant);
     let upper_proved = contracts
         .iter()
         .any(|contract| contract == &upper_symbolic || contract == &upper_numeric);
 
-    if obligation.ty == "usize" {
+    if ty == "usize" {
         return upper_proved;
     }
 
-    let Some(min) = min_value(&obligation.ty) else {
+    let Some(min) = min_value(ty) else {
         return false;
     };
-    let lower_symbolic = format!(
-        "{}>={}::MIN/{}",
-        obligation.variable, obligation.ty, obligation.constant
-    );
-    let lower_numeric = format!("{}>={}", obligation.variable, min / obligation.constant);
+    let lower_symbolic = format!("{}>={}::MIN/{}", obligation.variable, ty, constant);
+    let lower_numeric = format!("{}>={}", obligation.variable, min / constant);
     let lower_proved = contracts
         .iter()
         .any(|contract| contract == &lower_symbolic || contract == &lower_numeric);
 
     upper_proved && lower_proved
+}
+
+fn denominator_nonzero(denominator: &str, contracts: &[String]) -> bool {
+    if denominator.parse::<i128>().is_ok_and(|value| value != 0) {
+        return true;
+    }
+
+    let ne_zero = format!("{denominator}!=0");
+    let zero_ne = format!("0!={denominator}");
+    let gt_zero = format!("{denominator}>0");
+    let lt_zero = format!("{denominator}<0");
+    contracts.iter().any(|contract| {
+        contract == &ne_zero || contract == &zero_ne || contract == &gt_zero || contract == &lt_zero
+    })
 }
 
 fn slice_index_obligation_proved(obligation: &SliceIndexObligation, contracts: &[String]) -> bool {
@@ -1281,6 +1491,56 @@ fn callee_precondition_proved(condition: &str, contracts: &[String]) -> bool {
         return false;
     };
     contracts.iter().any(|contract| contract == &flipped)
+}
+
+fn executable_tokens(body: &str) -> Vec<String> {
+    let tokens = tokens(body);
+    let mut executable = Vec::new();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if let Some(open_idx) = loop_spec_open_idx(&tokens, idx) {
+            if let Some(close_idx) = matching_token_group(&tokens, open_idx, "{", "}") {
+                idx = close_idx + 1;
+                continue;
+            }
+        }
+
+        executable.push(tokens[idx].clone());
+        idx += 1;
+    }
+
+    executable
+}
+
+fn param_type<'a>(name: &str, params: &'a [Param]) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|param| param.name == name && is_supported_integer(&param.ty))
+        .map(|param| param.ty.as_str())
+}
+
+fn expression_needs_integer_proof(left: &str, right: &str, params: &[Param]) -> bool {
+    param_type(left, params).is_some()
+        || param_type(right, params).is_some()
+        || (is_ident(left) && is_ident(right))
+}
+
+fn is_value_operand(token: &str) -> bool {
+    is_ident(token) || token.parse::<i128>().is_ok()
+}
+
+fn field_expression_before(tokens: &[String], op_idx: usize) -> Option<String> {
+    if op_idx < 3 || tokens.get(op_idx - 2) != Some(&".".to_string()) {
+        return None;
+    }
+    let base = tokens.get(op_idx - 3)?;
+    let field = tokens.get(op_idx - 1)?;
+    if !is_ident(base) || !is_ident(field) {
+        return None;
+    }
+
+    Some(format!("{base}.{field}"))
 }
 
 fn is_supported_integer(ty: &str) -> bool {
@@ -1710,6 +1970,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unproved_variable_addition() {
+        let metadata = metadata_named("add", "pub fn add(x: i32, y: i32) -> i32 { x + y }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add".to_string(),
+                expression: "x + y".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn ignores_non_arithmetic_identity() {
         let metadata = metadata("pub fn id_i32(x: i32) -> i32 { x }", &[]);
 
@@ -1732,6 +2005,31 @@ mod tests {
             Err(VerificationError::IntegerSubtractionOverflow {
                 function: "sub_one".to_string(),
                 expression: "x - 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_field_subtraction_from_nonnegative_bound() {
+        let account = model_metadata("Account");
+        let withdraw = metadata_named(
+            "withdraw",
+            "pub fn withdraw(acct: Account, amount: i64) -> Account { Account { balance: acct.balance - amount } }",
+            &["amount >= 0", "acct.balance >= amount"],
+        );
+
+        assert_eq!(verify_totals(&[account, withdraw]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_variable_subtraction() {
+        let metadata = metadata_named("sub", "pub fn sub(x: i32, y: i32) -> i32 { x - y }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerSubtractionOverflow {
+                function: "sub".to_string(),
+                expression: "x - y".to_string(),
             })
         );
     }
@@ -1809,6 +2107,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unproved_variable_multiplication() {
+        let metadata = metadata_named("mul", "pub fn mul(x: i32, y: i32) -> i32 { x * y }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerMultiplicationOverflow {
+                function: "mul".to_string(),
+                expression: "x * y".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn proves_usize_mul_two_from_executable_precondition() {
         let metadata = metadata_named(
             "double",
@@ -1817,6 +2128,43 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_integer_division_denominator_nonzero() {
+        let metadata = metadata_named(
+            "div",
+            "pub fn div(x: i32, y: i32) -> i32 { x / y }",
+            &["y != 0"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_integer_division_denominator() {
+        let metadata = metadata_named("div", "pub fn div(x: i32, y: i32) -> i32 { x / y }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionByZero {
+                function: "div".to_string(),
+                expression: "x / y".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unproved_integer_remainder_denominator() {
+        let metadata = metadata_named("rem", "pub fn rem(x: i32, y: i32) -> i32 { x % y }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerRemainderByZero {
+                function: "rem".to_string(),
+                expression: "x % y".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1850,6 +2198,23 @@ mod tests {
             Err(VerificationError::SliceIndexOutOfBounds {
                 function: "first".to_string(),
                 expression: "xs[0]".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_vec_index() {
+        let metadata = metadata_named(
+            "get_vec",
+            "pub fn get_vec(xs: Vec<i32>, i: usize) -> i32 { xs[i] }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedIndex {
+                function: "get_vec".to_string(),
+                expression: "xs[i]".to_string(),
             })
         );
     }
@@ -2078,8 +2443,12 @@ mod tests {
         let withdraw = metadata_named_with_classes(
             "withdraw",
             "pub fn withdraw(acct: Account, amount: i64) -> Account { Account { id: 0, balance: acct.balance - amount } }",
-            &["out.id == old(acct.id)"],
-            &["gives ghost"],
+            &[
+                "amount >= 0",
+                "acct.balance >= amount",
+                "out.id == old(acct.id)",
+            ],
+            &["given executable", "given executable", "gives ghost"],
         );
 
         assert_eq!(

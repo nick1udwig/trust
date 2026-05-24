@@ -11,6 +11,11 @@ mod verified {
     use super::Account;
 
     trust::total! {
+        given executable {
+            amount >= 0;
+            acct.balance >= amount;
+        }
+
         gives ghost |out| {
             out.id == old(acct.id);
         }
