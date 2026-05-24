@@ -1,0 +1,259 @@
+use proc_macro::TokenStream;
+use std::collections::hash_map::DefaultHasher;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::path::Path;
+
+const SCHEMA_VERSION: u32 = 1;
+
+#[proc_macro_attribute]
+pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+
+    item
+}
+
+#[proc_macro]
+pub fn total(input: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+
+    let source = input.to_string();
+    let fn_info = match inspect_total_fn(&source) {
+        Ok(fn_info) => fn_info,
+        Err(message) => return compile_error(message),
+    };
+
+    let metadata = metadata_json(&fn_info, &source);
+    if let Err(err) = write_metadata_sidecar(&metadata) {
+        return compile_error(&format!(
+            "error[trust]: failed to write Trust metadata: {err}"
+        ));
+    }
+
+    let const_name = format!(
+        "__TRUST_META_{}_{}",
+        sanitize_ident(&fn_info.name),
+        short_hash(&source)
+    );
+    let expanded = format!(
+        r###"
+        {input}
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const {const_name}: &str = r##"{metadata}"##;
+        "###,
+        input = source,
+        const_name = const_name,
+        metadata = metadata
+    );
+
+    expanded.parse().unwrap_or_else(|_| {
+        compile_error("error[trust]: failed to generate Rust for trust::total!")
+    })
+}
+
+#[derive(Debug)]
+struct FnInfo {
+    name: String,
+    visibility: &'static str,
+}
+
+fn inspect_total_fn(input: &str) -> Result<FnInfo, &'static str> {
+    let tokens = lex(input);
+    let mut fn_positions = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if matches!(token, LexToken::Ident(ident) if ident == "fn") {
+            fn_positions.push(idx);
+        }
+    }
+
+    match fn_positions.len() {
+        0 => return Err("error[trust]: trust::total! requires exactly one Rust fn item"),
+        1 => {}
+        _ => return Err("error[trust]: trust::total! accepts exactly one Rust fn item"),
+    }
+
+    let fn_idx = fn_positions[0];
+    let name = match tokens.get(fn_idx + 1) {
+        Some(LexToken::Ident(ident)) => ident.to_string(),
+        _ => return Err("error[trust]: trust::total! could not read function name"),
+    };
+
+    if has_ident_before(&tokens, fn_idx, "async") {
+        return Err("error[trust]: async functions are not supported in Trust MVP");
+    }
+    if has_ident_before(&tokens, fn_idx, "unsafe") {
+        return Err("error[trust]: unsafe functions are not supported in Trust MVP");
+    }
+    if has_ident_before(&tokens, fn_idx, "extern") {
+        return Err("error[trust]: extern functions are not supported in Trust MVP");
+    }
+    if matches!(tokens.get(fn_idx + 2), Some(LexToken::Punct('<'))) {
+        return Err("error[trust]: generic total functions are not supported in MVP");
+    }
+    if !has_body_group(&tokens) {
+        return Err("error[trust]: trust::total! requires a function body");
+    }
+
+    let visibility = if matches!(tokens.first(), Some(LexToken::Ident(ident)) if ident == "pub") {
+        "public"
+    } else {
+        "private"
+    };
+
+    Ok(FnInfo { name, visibility })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LexToken {
+    Ident(String),
+    Punct(char),
+}
+
+fn lex(input: &str) -> Vec<LexToken> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let mut ident = String::new();
+            while let Some(ch) = chars.peek().copied() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ident.push(ch);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(LexToken::Ident(ident));
+            continue;
+        }
+
+        tokens.push(LexToken::Punct(ch));
+        chars.next();
+    }
+
+    tokens
+}
+
+fn has_ident_before(tokens: &[LexToken], end: usize, ident_name: &str) -> bool {
+    tokens[..end]
+        .iter()
+        .any(|token| matches!(token, LexToken::Ident(ident) if ident == ident_name))
+}
+
+fn has_body_group(tokens: &[LexToken]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(token, LexToken::Punct('{')))
+}
+
+fn metadata_json(fn_info: &FnInfo, source: &str) -> String {
+    let hash = short_hash(source);
+    format!(
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        schema = SCHEMA_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
+        name = json_escape(&fn_info.name),
+        hash = hash,
+        visibility = fn_info.visibility,
+    )
+}
+
+fn write_metadata_sidecar(metadata: &str) -> Result<(), String> {
+    let Ok(path) = env::var("TRUST_METADATA_OUT") else {
+        return Ok(());
+    };
+
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    writeln!(file, "{metadata}").map_err(|err| err.to_string())
+}
+
+fn wrapper_active() -> bool {
+    env::var("TRUST_RUSTC_ACTIVE").as_deref() == Ok("1")
+        || env::var("TRUST_MACRO_UNIT_TEST").is_ok()
+}
+
+fn compile_error(message: &str) -> TokenStream {
+    format!("compile_error!({:?});", message)
+        .parse()
+        .expect("compile_error! should parse")
+}
+
+fn short_hash(input: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn sanitize_ident(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn json_escape(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspects_single_public_function() {
+        let info = inspect_total_fn("pub fn id_i32(x: i32) -> i32 { x }").unwrap();
+
+        assert_eq!(info.name, "id_i32");
+        assert_eq!(info.visibility, "public");
+    }
+
+    #[test]
+    fn rejects_multiple_functions() {
+        let err = inspect_total_fn("fn a() {} fn b() {}").unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: trust::total! accepts exactly one Rust fn item"
+        );
+    }
+}

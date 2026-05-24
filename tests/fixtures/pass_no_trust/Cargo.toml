@@ -1,0 +1,8 @@
+[package]
+name = "pass_no_trust"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]

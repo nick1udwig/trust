@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/trust",
+    "crates/trust-core",
+    "crates/trust-e2e",
+    "crates/trust-macros",
+    "crates/trust-model",
+    "crates/trust-rustc",
+    "crates/trust-test-support",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+trust = { path = "crates/trust" }
+trust-core = { path = "crates/trust-core" }
+trust-macros = { path = "crates/trust-macros" }
+trust-model = { path = "crates/trust-model" }
+trust-test-support = { path = "crates/trust-test-support" }

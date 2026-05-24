@@ -1,0 +1,9 @@
+[package]
+name = "fail_missing_wrapper"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
