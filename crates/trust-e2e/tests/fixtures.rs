@@ -62,6 +62,11 @@ fn pass_trust_model_struct_allows_field_reasoning() {
 }
 
 #[test]
+fn pass_trusted_model_stub_is_accepted_and_ignored() {
+    run_fixture("pass_trusted_model_stub_ignored", Expected::Pass);
+}
+
+#[test]
 fn pass_add_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_add_one_precondition", Expected::Pass);
 
@@ -198,6 +203,13 @@ fn fail_missing_trust_model_is_rejected_by_wrapper_verifier() {
     output.assert_contains(
         "error[trust]: type Account must derive TrustModel before Trust may reason about its fields",
     );
+}
+
+#[test]
+fn fail_trusted_model_stub_cannot_prove_false() {
+    let output = run_fixture("fail_trusted_model_not_axiom", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove postcondition");
 }
 
 #[test]

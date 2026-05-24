@@ -65,6 +65,40 @@ pub fn total(input: TokenStream) -> TokenStream {
     })
 }
 
+#[proc_macro]
+pub fn trusted_model(input: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+
+    let source = input.to_string();
+    if source.trim().is_empty() {
+        return compile_error("error[trust]: trust::trusted_model! requires a declaration");
+    }
+
+    let metadata = trusted_model_metadata_json(&source);
+    if let Err(err) = write_metadata_sidecar(&metadata) {
+        return compile_error(&format!(
+            "error[trust]: failed to write Trust metadata: {err}"
+        ));
+    }
+
+    let const_name = format!("__TRUST_TRUSTED_MODEL_STUB_{}", short_hash(&source));
+    let expanded = format!(
+        r###"
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const {const_name}: &str = r##"{metadata}"##;
+        "###,
+        const_name = const_name,
+        metadata = metadata
+    );
+
+    expanded.parse().unwrap_or_else(|_| {
+        compile_error("error[trust]: failed to generate Rust for trust::trusted_model!")
+    })
+}
+
 #[proc_macro_derive(TrustModel)]
 pub fn derive_trust_model(input: TokenStream) -> TokenStream {
     if !wrapper_active() {
@@ -483,6 +517,17 @@ fn model_metadata_json(model: &ModelInfo, source: &str) -> String {
     )
 }
 
+fn trusted_model_metadata_json(source: &str) -> String {
+    let hash = short_hash(source);
+    format!(
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"trusted_model_stub:{hash}\",\"item_kind\":\"trusted_model_stub\",\"source_span\":\"unknown\",\"rust_function_path\":\"trusted_model_stub\",\"visibility\":\"unknown\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        schema = SCHEMA_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
+        hash = hash,
+        source = json_escape(source),
+    )
+}
+
 fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     let input = input.trim_start();
     let rest = input.strip_prefix(keyword)?;
@@ -743,6 +788,14 @@ mod tests {
             err,
             "error[trust]: generic TrustModel types are not supported in MVP"
         );
+    }
+
+    #[test]
+    fn trusted_model_metadata_is_inert_stub() {
+        let metadata = trusted_model_metadata_json("axiom false_is_true: false;");
+
+        assert!(metadata.contains("\"item_kind\":\"trusted_model_stub\""));
+        assert!(metadata.contains("\"contracts_original\":[]"));
     }
 
     #[test]
