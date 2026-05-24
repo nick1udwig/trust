@@ -113,6 +113,46 @@ fn pass_cache_hit_reuses_proof_cache() {
 }
 
 #[test]
+fn pass_cache_misses_when_body_changes() {
+    let suffix = std::process::id();
+    let cache_name = format!("pass_cache_body_changed_shared_{suffix}");
+    let first_target = format!("pass_cache_body_changed_first_{suffix}");
+    let second_target = format!("pass_cache_body_changed_second_{suffix}");
+
+    let first =
+        run_fixture_with_cache("pass_cache_hit", Expected::Pass, &first_target, &cache_name);
+    let second = run_fixture_with_cache(
+        "pass_cache_body_changed",
+        Expected::Pass,
+        &second_target,
+        &cache_name,
+    );
+
+    first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    second.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+}
+
+#[test]
+fn pass_cache_misses_when_contract_changes() {
+    let suffix = std::process::id();
+    let cache_name = format!("pass_cache_contract_changed_shared_{suffix}");
+    let first_target = format!("pass_cache_contract_changed_first_{suffix}");
+    let second_target = format!("pass_cache_contract_changed_second_{suffix}");
+
+    let first =
+        run_fixture_with_cache("pass_cache_hit", Expected::Pass, &first_target, &cache_name);
+    let second = run_fixture_with_cache(
+        "pass_cache_contract_changed",
+        Expected::Pass,
+        &second_target,
+        &cache_name,
+    );
+
+    first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    second.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+}
+
+#[test]
 fn pass_add_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_add_one_precondition", Expected::Pass);
 
