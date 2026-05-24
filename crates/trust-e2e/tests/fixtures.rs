@@ -64,6 +64,14 @@ fn pass_trust_model_struct_allows_field_reasoning() {
 }
 
 #[test]
+fn pass_withdraw_account_proves_old_field_postconditions() {
+    let output = run_fixture("pass_withdraw_account", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_trusted_model_stub_is_accepted_and_ignored() {
     run_fixture("pass_trusted_model_stub_ignored", Expected::Pass);
 }
@@ -232,6 +240,13 @@ fn fail_missing_trust_model_is_rejected_by_wrapper_verifier() {
     output.assert_contains(
         "error[trust]: type Account must derive TrustModel before Trust may reason about its fields",
     );
+}
+
+#[test]
+fn fail_withdraw_account_wrong_id_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_withdraw_account_wrong_id", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove postcondition");
 }
 
 #[test]

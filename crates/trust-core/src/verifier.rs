@@ -375,7 +375,7 @@ fn postconditions(metadata: &TrustMetadata) -> Vec<Contract> {
         .filter(|(_contract, class)| matches!(class.as_str(), "gives executable" | "gives ghost"))
         .map(|(contract, _class)| Contract {
             original: contract.clone(),
-            normalized: normalize(&remove_int_wrappers(contract)),
+            normalized: normalize(&remove_old_wrappers(&remove_int_wrappers(contract))),
         })
         .collect()
 }
@@ -437,6 +437,53 @@ fn postcondition_proved(postcondition: &Contract, body: &str, raw_body: &str) ->
         || (right == "out" && left == return_expression)
         || (left == "out" && loop_exit_proves_value(raw_body, &return_expression, right))
         || (right == "out" && loop_exit_proves_value(raw_body, &return_expression, left))
+        || output_field_equals_return_field(left, right, &return_expression)
+        || output_field_equals_return_field(right, left, &return_expression)
+}
+
+fn output_field_equals_return_field(output: &str, expected: &str, return_expression: &str) -> bool {
+    let Some(field) = output.strip_prefix("out.") else {
+        return false;
+    };
+    return_field_expression(return_expression, field).as_deref() == Some(expected)
+}
+
+fn return_field_expression(return_expression: &str, field: &str) -> Option<String> {
+    let open = return_expression.find('{')?;
+    let close = return_expression.rfind('}')?;
+    let fields = &return_expression[open + 1..close];
+    let tokens = tokens(fields);
+    let mut idx = 0;
+
+    while idx + 2 < tokens.len() {
+        if tokens[idx] != field || tokens[idx + 1] != ":" {
+            idx += 1;
+            continue;
+        }
+
+        let start = idx + 2;
+        let mut end = start;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        while end < tokens.len() {
+            match tokens[end].as_str() {
+                "," if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
+                "(" => paren_depth += 1,
+                ")" => paren_depth -= 1,
+                "[" => bracket_depth += 1,
+                "]" => bracket_depth -= 1,
+                "{" => brace_depth += 1,
+                "}" => brace_depth -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+
+        return Some(token_expression(&tokens[start..end]));
+    }
+
+    None
 }
 
 fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
@@ -1096,6 +1143,21 @@ fn remove_int_wrappers(input: &str) -> String {
     out
 }
 
+fn remove_old_wrappers(input: &str) -> String {
+    let mut out = input.to_string();
+
+    while let Some(start) = out.find("old(") {
+        let inner_start = start + "old(".len();
+        let Some(end) = matching_paren(&out, inner_start - 1) else {
+            break;
+        };
+        let inner = out[inner_start..end].to_string();
+        out.replace_range(start..=end, &inner);
+    }
+
+    out
+}
+
 fn matching_paren(input: &str, open_idx: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (idx, ch) in input.char_indices().skip_while(|(idx, _)| *idx < open_idx) {
@@ -1580,6 +1642,48 @@ mod tests {
             Err(VerificationError::LoopDecreasesNotDecreasing {
                 function: "count_up".to_string(),
                 measure: "n-i".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_struct_field_postconditions_with_old_values() {
+        let account = model_metadata("Account");
+        let withdraw = metadata_named_with_classes(
+            "withdraw",
+            "pub fn withdraw(acct: Account, amount: i64) -> Account { Account { id: acct.id, balance: acct.balance - amount } }",
+            &[
+                "amount >= 0",
+                "acct.balance >= amount",
+                "out.id == old(acct.id)",
+                "int(out.balance) == int(old(acct.balance)) - int(old(amount))",
+            ],
+            &[
+                "given executable",
+                "given executable",
+                "gives ghost",
+                "gives ghost",
+            ],
+        );
+
+        assert_eq!(verify_totals(&[account, withdraw]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_wrong_struct_field_postcondition() {
+        let account = model_metadata("Account");
+        let withdraw = metadata_named_with_classes(
+            "withdraw",
+            "pub fn withdraw(acct: Account, amount: i64) -> Account { Account { id: 0, balance: acct.balance - amount } }",
+            &["out.id == old(acct.id)"],
+            &["gives ghost"],
+        );
+
+        assert_eq!(
+            verify_totals(&[account, withdraw]),
+            Err(VerificationError::PostconditionUnproved {
+                function: "withdraw".to_string(),
+                condition: "out.id == old(acct.id)".to_string(),
             })
         );
     }
