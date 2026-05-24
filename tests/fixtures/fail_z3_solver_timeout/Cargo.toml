@@ -1,0 +1,18 @@
+[package]
+name = "fail_z3_solver_timeout"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
+
+[package.metadata.trust]
+assertions = "always"
+solver = "z3"
+timeout_ms = 1
+cache = "local"

@@ -737,6 +737,34 @@ fn pass_z3_solver_runs_external_backend() {
     output.assert_contains("trust: proved 1 total function");
 }
 
+#[cfg(unix)]
+#[test]
+fn fail_z3_solver_timeout_is_rejected_by_wrapper_verifier() {
+    let suffix = std::process::id();
+    let solver_dir = fixture_cache_dir(&format!("slow_z3_solver_{suffix}"));
+    fs::create_dir_all(&solver_dir).expect("create slow z3 dir");
+    let solver = solver_dir.join("z3");
+    fs::write(
+        &solver,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Z3 version 4.12.0'; exit 0; fi\ncat >/dev/null\nsleep 2\necho unsat\n",
+    )
+    .expect("write slow z3");
+    let mut permissions = fs::metadata(&solver).expect("stat slow z3").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&solver, permissions).expect("chmod slow z3");
+    let solver = solver.to_str().expect("slow z3 path should be UTF-8");
+
+    let output = run_fixture_with_cache_and_env(
+        "fail_z3_solver_timeout",
+        Expected::Fail,
+        &format!("fail_z3_solver_timeout_{suffix}"),
+        &format!("fail_z3_solver_timeout_{suffix}"),
+        &[("TRUST_SOLVER_BIN", solver)],
+    );
+
+    output.assert_contains("error[trust]: solver timed out");
+}
+
 #[test]
 fn fail_trusted_model_stub_cannot_prove_false() {
     let output = run_fixture("fail_trusted_model_not_axiom", Expected::Fail);

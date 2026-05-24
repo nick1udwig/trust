@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{self, Command, ExitStatus, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use trust_core::{metadata::parse_metadata_line, verifier::verify_totals};
 
 fn main() {
@@ -315,7 +315,29 @@ fn check_mock_solver_status() -> Result<(), String> {
 
 fn check_z3_solver_status(config: &TrustConfig) -> Result<(), String> {
     let solver = z3_solver_bin();
-    let mut child = Command::new(&solver)
+    let query = format!(
+        "(set-logic QF_LIA)\n(set-option :timeout {})\n(assert false)\n(check-sat)\n",
+        config.timeout_ms
+    );
+    let output = run_solver_with_timeout(&solver, &query, config.timeout_ms)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            return Err("solver error".to_string());
+        }
+        return Err(format!("solver error: {detail}"));
+    }
+
+    solver_result_from_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn run_solver_with_timeout(
+    solver: &PathBuf,
+    input: &str,
+    timeout_ms: u64,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(solver)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -332,28 +354,28 @@ fn check_z3_solver_status(config: &TrustConfig) -> Result<(), String> {
             .stdin
             .take()
             .ok_or_else(|| "solver error".to_string())?;
-        let query = format!(
-            "(set-logic QF_LIA)\n(set-option :timeout {})\n(assert false)\n(check-sat)\n",
-            config.timeout_ms
-        );
         stdin
-            .write_all(query.as_bytes())
+            .write_all(input.as_bytes())
             .map_err(|_| "solver error".to_string())?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|_| "solver error".to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            return Err("solver error".to_string());
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("solver timed out".to_string());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return Err("solver error".to_string()),
         }
-        return Err(format!("solver error: {detail}"));
     }
 
-    solver_result_from_output(&String::from_utf8_lossy(&output.stdout))
+    child
+        .wait_with_output()
+        .map_err(|_| "solver error".to_string())
 }
 
 fn solver_version(config: &TrustConfig) -> Result<String, String> {
