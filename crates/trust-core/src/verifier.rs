@@ -15,6 +15,10 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    IntegerMultiplicationOverflow {
+        function: String,
+        expression: String,
+    },
 }
 
 impl fmt::Display for VerificationError {
@@ -40,6 +44,13 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "could not prove integer negation cannot overflow in `{function}`: `{expression}`"
+            ),
+            VerificationError::IntegerMultiplicationOverflow {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer multiplication cannot overflow in `{function}`: `{expression}`"
             ),
         }
     }
@@ -88,6 +99,15 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
         }
     }
 
+    for obligation in multiplication_obligations(body, &params) {
+        if !multiplication_obligation_proved(&obligation, &contracts) {
+            return Err(VerificationError::IntegerMultiplicationOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -117,6 +137,14 @@ struct SubObligation {
 struct NegObligation {
     variable: String,
     ty: String,
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MulObligation {
+    variable: String,
+    ty: String,
+    constant: i128,
     expression: String,
 }
 
@@ -236,6 +264,35 @@ fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
     obligations
 }
 
+fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation> {
+    let tokens = tokens(body);
+    let mut obligations = Vec::new();
+
+    for window in tokens.windows(3) {
+        let [left, op, right] = window else {
+            continue;
+        };
+        if op != "*" {
+            continue;
+        }
+
+        if let Some(param) = params.iter().find(|param| param.name == *left) {
+            if let Ok(constant) = right.parse::<i128>() {
+                if constant > 1 && is_supported_integer(&param.ty) {
+                    obligations.push(MulObligation {
+                        variable: left.clone(),
+                        ty: param.ty.clone(),
+                        constant,
+                        expression: format!("{left} * {right}"),
+                    });
+                }
+            }
+        }
+    }
+
+    obligations
+}
+
 fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
     let Some(max) = max_value(&obligation.ty) else {
         return false;
@@ -296,6 +353,38 @@ fn negation_obligation_proved(obligation: &NegObligation, contracts: &[String]) 
     contracts.iter().any(|contract| {
         contract == &gt_min || contract == &ge_required || contract == &ge_unqualified
     })
+}
+
+fn multiplication_obligation_proved(obligation: &MulObligation, contracts: &[String]) -> bool {
+    let Some(max) = max_value(&obligation.ty) else {
+        return false;
+    };
+    let upper_symbolic = format!(
+        "{}<={}::MAX/{}",
+        obligation.variable, obligation.ty, obligation.constant
+    );
+    let upper_numeric = format!("{}<={}", obligation.variable, max / obligation.constant);
+    let upper_proved = contracts
+        .iter()
+        .any(|contract| contract == &upper_symbolic || contract == &upper_numeric);
+
+    if obligation.ty == "usize" {
+        return upper_proved;
+    }
+
+    let Some(min) = min_value(&obligation.ty) else {
+        return false;
+    };
+    let lower_symbolic = format!(
+        "{}>={}::MIN/{}",
+        obligation.variable, obligation.ty, obligation.constant
+    );
+    let lower_numeric = format!("{}>={}", obligation.variable, min / obligation.constant);
+    let lower_proved = contracts
+        .iter()
+        .any(|contract| contract == &lower_symbolic || contract == &lower_numeric);
+
+    upper_proved && lower_proved
 }
 
 fn is_supported_integer(ty: &str) -> bool {
@@ -497,5 +586,40 @@ mod tests {
                 expression: "-x".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn proves_i32_mul_two_from_executable_preconditions() {
+        let metadata = metadata_named(
+            "double",
+            "pub fn double(x: i32) -> i32 { x * 2 }",
+            &["x <= i32::MAX / 2", "x >= i32::MIN / 2"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_i32_mul_two() {
+        let metadata = metadata_named("double", "pub fn double(x: i32) -> i32 { x * 2 }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerMultiplicationOverflow {
+                function: "double".to_string(),
+                expression: "x * 2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_usize_mul_two_from_executable_precondition() {
+        let metadata = metadata_named(
+            "double",
+            "pub fn double(n: usize) -> usize { n * 2 }",
+            &["n <= usize::MAX / 2"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
     }
 }

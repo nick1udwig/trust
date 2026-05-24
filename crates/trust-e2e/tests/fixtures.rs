@@ -62,6 +62,22 @@ fn pass_abs_nonmin_precondition_proves_negation_overflow_safety() {
 }
 
 #[test]
+fn pass_double_precondition_proves_i32_overflow_safety() {
+    let output = run_fixture("pass_double_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_usize_double_precondition_proves_overflow_safety() {
+    let output = run_fixture("pass_usize_double_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_missing_wrapper_requires_trust_rustc() {
     let output = run_fixture_without_wrapper("fail_missing_wrapper", Expected::Fail);
 
@@ -139,4 +155,11 @@ fn fail_negation_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_negation_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer negation cannot overflow");
+}
+
+#[test]
+fn fail_multiplication_unproved_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_multiplication_unproved", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer multiplication cannot overflow");
 }
