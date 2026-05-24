@@ -514,6 +514,20 @@ fn fail_unsafe_total_is_rejected() {
 }
 
 #[test]
+fn fail_extern_total_is_rejected() {
+    let output = run_fixture("fail_extern_total", Expected::Fail);
+
+    output.assert_contains("error[trust]: extern functions are not supported in Trust MVP");
+}
+
+#[test]
+fn fail_generic_total_is_rejected() {
+    let output = run_fixture("fail_generic_total", Expected::Fail);
+
+    output.assert_contains("error[trust]: generic total functions are not supported in MVP");
+}
+
+#[test]
 fn fail_multiple_fn_in_total_is_rejected() {
     let output = run_fixture("fail_multiple_fn_in_total", Expected::Fail);
 
