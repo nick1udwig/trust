@@ -63,6 +63,13 @@ pub enum VerificationError {
         function: String,
         condition: String,
     },
+    ProofObligationUnproved {
+        proof: String,
+        condition: String,
+    },
+    UnsupportedProofStep {
+        proof: String,
+    },
 }
 
 impl fmt::Display for VerificationError {
@@ -147,6 +154,12 @@ impl fmt::Display for VerificationError {
                 function,
                 condition,
             } => write!(f, "could not prove postcondition in `{function}`: `{condition}`"),
+            VerificationError::ProofObligationUnproved { proof, condition } => {
+                write!(f, "could not prove proof obligation in `{proof}`: `{condition}`")
+            }
+            VerificationError::UnsupportedProofStep { proof } => {
+                write!(f, "unsupported proof step in `{proof}`")
+            }
         }
     }
 }
@@ -162,6 +175,31 @@ pub fn verify_totals(metadata: &[TrustMetadata]) -> Result<(), VerificationError
     let model_types = model_env(metadata);
     for item in metadata {
         verify_total_with_env(item, &env, &model_types)?;
+        verify_proof(item)?;
+    }
+
+    Ok(())
+}
+
+fn verify_proof(metadata: &TrustMetadata) -> Result<(), VerificationError> {
+    if metadata.item_kind != "proof" {
+        return Ok(());
+    }
+
+    let body = body(&metadata.function_source);
+    if contains_unsupported_proof_step(body) {
+        return Err(VerificationError::UnsupportedProofStep {
+            proof: metadata.rust_function_path.clone(),
+        });
+    }
+
+    for obligation in proof_obligations(metadata) {
+        if !proof_body_asserts(body, &obligation) {
+            return Err(VerificationError::ProofObligationUnproved {
+                proof: metadata.rust_function_path.clone(),
+                condition: obligation,
+            });
+        }
     }
 
     Ok(())
@@ -407,6 +445,16 @@ fn postconditions(metadata: &TrustMetadata) -> Vec<Contract> {
             original: contract.clone(),
             normalized: normalize(&remove_old_wrappers(&remove_int_wrappers(contract))),
         })
+        .collect()
+}
+
+fn proof_obligations(metadata: &TrustMetadata) -> Vec<String> {
+    metadata
+        .contracts_original
+        .iter()
+        .zip(metadata.contract_classes.iter())
+        .filter(|(_contract, class)| class.starts_with("gives"))
+        .map(|(contract, _class)| contract.clone())
         .collect()
 }
 
@@ -904,6 +952,64 @@ fn contains_explicit_panic(body: &str) -> bool {
         };
         matches!(name.as_str(), "panic" | "todo" | "unimplemented") && bang == "!" && open == "("
     })
+}
+
+fn contains_unsupported_proof_step(body: &str) -> bool {
+    let tokens = tokens(body);
+    for (idx, window) in tokens.windows(3).enumerate() {
+        let [name, bang, open] = window else {
+            continue;
+        };
+        if bang == "!" && open == "(" && name != "assert" {
+            return true;
+        }
+        if bang == "("
+            && is_ident(name)
+            && idx.checked_sub(1).is_none_or(|prev| tokens[prev] != ".")
+            && !matches!(
+                name.as_str(),
+                "assert" | "int" | "old" | "forall" | "exists" | "implies"
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn proof_body_asserts(body: &str, obligation: &str) -> bool {
+    let tokens = tokens(body);
+    let normalized_obligation = normalize(obligation);
+    let mut idx = 0;
+
+    while idx + 1 < tokens.len() {
+        if tokens[idx] != "assert" {
+            idx += 1;
+            continue;
+        }
+        let open_idx = if tokens.get(idx + 1) == Some(&"!".to_string())
+            && tokens.get(idx + 2) == Some(&"(".to_string())
+        {
+            idx + 2
+        } else if tokens.get(idx + 1) == Some(&"(".to_string()) {
+            idx + 1
+        } else {
+            idx += 1;
+            continue;
+        };
+        let Some(close_idx) = matching_token_group(&tokens, open_idx, "(", ")") else {
+            idx += 1;
+            continue;
+        };
+        let assertion = token_expression(&tokens[open_idx + 1..close_idx]);
+        if normalize(&assertion) == normalized_obligation {
+            return true;
+        }
+        idx = close_idx + 1;
+    }
+
+    false
 }
 
 fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
@@ -1404,11 +1510,70 @@ mod tests {
         }
     }
 
+    fn proof_metadata(name: &str, function_source: &str, contracts: &[&str]) -> TrustMetadata {
+        TrustMetadata {
+            schema_version: 1,
+            item_kind: "proof".to_string(),
+            item_id: format!("proof:{name}:test"),
+            rust_function_path: name.to_string(),
+            contracts_original: contracts
+                .iter()
+                .map(|contract| contract.to_string())
+                .collect(),
+            contract_classes: vec!["gives ghost".to_string(); contracts.len()],
+            function_source: function_source.to_string(),
+        }
+    }
+
     #[test]
     fn proves_i32_add_one_from_executable_precondition() {
         let metadata = metadata("pub fn add_one(x: i32) -> i32 { x + 1 }", &["x < i32::MAX"]);
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_proof_obligation_from_assert_step() {
+        let proof = proof_metadata(
+            "le_refl",
+            "fn le_refl(a: i32) gives ghost { a <= a; } { assert(a <= a); }",
+            &["a <= a"],
+        );
+
+        assert_eq!(verify_totals(&[proof]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_proof_obligation() {
+        let proof = proof_metadata(
+            "le_refl",
+            "fn le_refl(a: i32, b: i32) gives ghost { a <= a; } { assert(a <= b); }",
+            &["a <= a"],
+        );
+
+        assert_eq!(
+            verify_totals(&[proof]),
+            Err(VerificationError::ProofObligationUnproved {
+                proof: "le_refl".to_string(),
+                condition: "a <= a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_proof_step() {
+        let proof = proof_metadata(
+            "le_refl",
+            "fn le_refl(a: i32) gives ghost { a <= a; } { println!(\"runtime\"); assert(a <= a); }",
+            &["a <= a"],
+        );
+
+        assert_eq!(
+            verify_totals(&[proof]),
+            Err(VerificationError::UnsupportedProofStep {
+                proof: "le_refl".to_string(),
+            })
+        );
     }
 
     #[test]

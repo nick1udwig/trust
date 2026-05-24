@@ -139,6 +139,20 @@ fn pass_proof_function_is_erased() {
 }
 
 #[test]
+fn fail_wrong_proof_assert_is_rejected() {
+    let output = run_fixture("fail_proof_wrong_assert", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove proof obligation in `le_refl`: `a <= a`");
+}
+
+#[test]
+fn fail_runtime_call_in_proof_is_rejected() {
+    let output = run_fixture("fail_proof_runtime_call", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported proof step in `le_refl`");
+}
+
+#[test]
 fn fail_public_proof_is_rejected() {
     let output = run_fixture("fail_public_proof", Expected::Fail);
 

@@ -44,7 +44,11 @@ fn run() -> Result<i32, String> {
         .iter()
         .filter(|item| item.item_kind == "total")
         .count();
-    let cache_stats = if totals == 0 {
+    let verification_items = metadata
+        .iter()
+        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .count();
+    let cache_stats = if verification_items == 0 {
         CacheStats { hits: 0, misses: 0 }
     } else {
         let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args, &config);
@@ -255,11 +259,11 @@ fn verify_metadata(
     cache_context: &CacheContext,
     config: &TrustConfig,
 ) -> Result<CacheStats, String> {
-    let totals = metadata
+    let verification_items = metadata
         .iter()
-        .filter(|item| item.item_kind == "total")
+        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
         .count();
-    if totals == 0 {
+    if verification_items == 0 {
         return Ok(CacheStats { hits: 0, misses: 0 });
     }
     check_mock_solver_status(config)?;
@@ -270,7 +274,7 @@ fn verify_metadata(
             Ok(contents) if contents == "status=proved\n"
         ) {
             return Ok(CacheStats {
-                hits: totals,
+                hits: verification_items,
                 misses: 0,
             });
         }
@@ -279,14 +283,14 @@ fn verify_metadata(
         write_cache_entry(&cache_file)?;
         return Ok(CacheStats {
             hits: 0,
-            misses: totals,
+            misses: verification_items,
         });
     }
 
     verify_totals(metadata).map_err(|err| err.to_string())?;
     Ok(CacheStats {
         hits: 0,
-        misses: totals,
+        misses: verification_items,
     })
 }
 
