@@ -19,6 +19,10 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    SliceIndexOutOfBounds {
+        function: String,
+        expression: String,
+    },
     PostconditionUnproved {
         function: String,
         condition: String,
@@ -55,6 +59,13 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "could not prove integer multiplication cannot overflow in `{function}`: `{expression}`"
+            ),
+            VerificationError::SliceIndexOutOfBounds {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove index is in bounds in `{function}`: `{expression}`"
             ),
             VerificationError::PostconditionUnproved {
                 function,
@@ -106,6 +117,15 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
     for obligation in multiplication_obligations(body, &params) {
         if !multiplication_obligation_proved(&obligation, &contracts) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    for obligation in slice_index_obligations(body, &params) {
+        if !slice_index_obligation_proved(&obligation, &contracts) {
+            return Err(VerificationError::SliceIndexOutOfBounds {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
             });
@@ -164,6 +184,13 @@ struct MulObligation {
     variable: String,
     ty: String,
     constant: i128,
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SliceIndexObligation {
+    base: String,
+    index: String,
     expression: String,
 }
 
@@ -351,6 +378,51 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
     obligations
 }
 
+fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObligation> {
+    let tokens = tokens(body);
+    let mut obligations = Vec::new();
+    let mut idx = 0;
+
+    while idx + 3 < tokens.len() {
+        let base = &tokens[idx];
+        if tokens[idx + 1] != "[" || !is_read_only_slice_param(base, params) {
+            idx += 1;
+            continue;
+        }
+
+        let mut depth = 1usize;
+        let mut end = idx + 2;
+        while end < tokens.len() {
+            match tokens[end].as_str() {
+                "[" => depth += 1,
+                "]" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+
+        if end >= tokens.len() || end == idx + 2 {
+            idx += 1;
+            continue;
+        }
+
+        let index = token_expression(&tokens[idx + 2..end]);
+        obligations.push(SliceIndexObligation {
+            base: base.clone(),
+            index: index.clone(),
+            expression: format!("{base}[{index}]"),
+        });
+        idx += 1;
+    }
+
+    obligations
+}
+
 fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
     let Some(max) = max_value(&obligation.ty) else {
         return false;
@@ -445,6 +517,15 @@ fn multiplication_obligation_proved(obligation: &MulObligation, contracts: &[Str
     upper_proved && lower_proved
 }
 
+fn slice_index_obligation_proved(obligation: &SliceIndexObligation, contracts: &[String]) -> bool {
+    let index_lt_len = format!("{}<{}.len()", obligation.index, obligation.base);
+    let len_gt_index = format!("{}.len()>{}", obligation.base, obligation.index);
+
+    contracts
+        .iter()
+        .any(|contract| contract == &index_lt_len || contract == &len_gt_index)
+}
+
 fn is_supported_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64" | "usize")
 }
@@ -469,6 +550,12 @@ fn min_value(ty: &str) -> Option<i128> {
         "usize" => Some(0),
         _ => None,
     }
+}
+
+fn is_read_only_slice_param(name: &str, params: &[Param]) -> bool {
+    params
+        .iter()
+        .any(|param| param.name == name && param.ty.starts_with("&[") && param.ty.ends_with(']'))
 }
 
 fn constant_with_type(value: i128, ty: &str) -> String {
@@ -530,6 +617,10 @@ fn matching_paren(input: &str, open_idx: usize) -> Option<usize> {
     }
 
     None
+}
+
+fn token_expression(tokens: &[String]) -> String {
+    tokens.concat()
 }
 
 fn normalize(input: &str) -> String {
@@ -727,6 +818,41 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_slice_index_from_executable_precondition() {
+        let metadata = metadata_named(
+            "get",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[i] }",
+            &["i < xs.len()"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_first_slice_index_from_nonempty_precondition() {
+        let metadata = metadata_named(
+            "first",
+            "pub fn first(xs: &[i32]) -> i32 { xs[0] }",
+            &["xs.len() > 0"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_slice_index() {
+        let metadata = metadata_named("first", "pub fn first(xs: &[i32]) -> i32 { xs[0] }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::SliceIndexOutOfBounds {
+                function: "first".to_string(),
+                expression: "xs[0]".to_string(),
+            })
+        );
     }
 
     #[test]
