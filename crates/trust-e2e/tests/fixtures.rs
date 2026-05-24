@@ -413,3 +413,81 @@ fn fail_postcondition_wrong_expression_is_rejected_by_wrapper_verifier() {
 
     output.assert_contains("error[trust]: could not prove postcondition");
 }
+
+#[test]
+fn golden_diagnostics_cover_main_failure_modes() {
+    const CASES: &[(&str, Option<&str>, &str)] = &[
+        (
+            "fail_missing_wrapper",
+            None,
+            include_str!("../../../tests/golden/diagnostics/missing_wrapper.txt"),
+        ),
+        (
+            "fail_async_total",
+            None,
+            include_str!("../../../tests/golden/diagnostics/unsupported_feature.txt"),
+        ),
+        (
+            "fail_missing_trust_model",
+            None,
+            include_str!("../../../tests/golden/diagnostics/missing_trust_model.txt"),
+        ),
+        (
+            "fail_public_ghost_precondition",
+            None,
+            include_str!("../../../tests/golden/diagnostics/public_ghost_precondition.txt"),
+        ),
+        (
+            "fail_overflow_unproved",
+            None,
+            include_str!("../../../tests/golden/diagnostics/overflow_unproved.txt"),
+        ),
+        (
+            "fail_slice_index_unproved",
+            None,
+            include_str!("../../../tests/golden/diagnostics/slice_index_unproved.txt"),
+        ),
+        (
+            "fail_callee_precondition",
+            None,
+            include_str!("../../../tests/golden/diagnostics/callee_precondition_unproved.txt"),
+        ),
+        (
+            "fail_postcondition_false",
+            None,
+            include_str!("../../../tests/golden/diagnostics/postcondition_unproved.txt"),
+        ),
+        (
+            "fail_loop_invariant_not_preserved",
+            None,
+            include_str!("../../../tests/golden/diagnostics/loop_invariant_failure.txt"),
+        ),
+        (
+            "fail_loop_missing_decreases",
+            None,
+            include_str!("../../../tests/golden/diagnostics/loop_decreases_failure.txt"),
+        ),
+        (
+            "fail_solver_unknown",
+            Some("unknown"),
+            include_str!("../../../tests/golden/diagnostics/solver_unknown.txt"),
+        ),
+        (
+            "fail_solver_unknown",
+            Some("timeout"),
+            include_str!("../../../tests/golden/diagnostics/solver_timeout.txt"),
+        ),
+    ];
+
+    for (fixture, solver_status, golden) in CASES {
+        let output = if let Some(solver_status) = solver_status {
+            run_fixture_with_solver_status(fixture, Expected::Fail, solver_status)
+        } else if *fixture == "fail_missing_wrapper" {
+            run_fixture_without_wrapper(fixture, Expected::Fail)
+        } else {
+            run_fixture(fixture, Expected::Fail)
+        };
+
+        output.assert_trust_diagnostics_golden(golden);
+    }
+}

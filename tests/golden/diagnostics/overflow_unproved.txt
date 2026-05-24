@@ -1,0 +1,1 @@
+error[trust]: could not prove integer addition cannot overflow in `add_one`: `x + 1`

@@ -1,0 +1,1 @@
+error[trust]: could not prove index is in bounds in `first`: `xs[0]`

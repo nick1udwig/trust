@@ -28,6 +28,32 @@ impl FixtureOutput {
             normalize_paths(&combined)
         );
     }
+
+    pub fn trust_diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        for line in self.combined().lines() {
+            let Some(start) = line.find("error[trust]:") else {
+                continue;
+            };
+            let diagnostic = line[start..].trim().to_string();
+            if diagnostics.last() != Some(&diagnostic) {
+                diagnostics.push(diagnostic);
+            }
+        }
+
+        diagnostics
+    }
+
+    pub fn assert_trust_diagnostics_golden(&self, expected: &str) {
+        let actual = self.trust_diagnostics().join("\n");
+        let expected = expected.trim_end();
+        assert_eq!(
+            actual,
+            expected,
+            "Trust diagnostic golden mismatch\n\nfull output:\n{}",
+            normalize_paths(&self.combined())
+        );
+    }
 }
 
 pub fn run_fixture(name: &str, expected: Expected) -> FixtureOutput {

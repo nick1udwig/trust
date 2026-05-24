@@ -1,0 +1,1 @@
+error[trust]: loop invariant may not be preserved

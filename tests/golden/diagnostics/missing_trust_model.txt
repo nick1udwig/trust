@@ -1,0 +1,1 @@
+error[trust]: type Account must derive TrustModel before Trust may reason about its fields

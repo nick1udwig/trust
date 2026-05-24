@@ -1,0 +1,1 @@
+error[trust]: async functions are not supported in Trust MVP
