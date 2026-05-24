@@ -58,12 +58,15 @@ pub fn run_fixture_with_solver_status(
     solver_status: &str,
 ) -> FixtureOutput {
     let wrapper = build_trust_rustc();
+    let suffix = std::process::id();
+    let target_name = format!("{name}_{solver_status}_{suffix}");
+    let cache_name = format!("{name}_{solver_status}_{suffix}");
     run_fixture_inner(
         name,
         expected,
         Some(&wrapper),
-        name,
-        name,
+        &target_name,
+        &cache_name,
         Some(solver_status),
     )
 }

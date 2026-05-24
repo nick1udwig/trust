@@ -109,7 +109,7 @@ fn check_mock_solver_status() -> Result<(), String> {
         Ok("counterexample") => Err("solver found counterexample".to_string()),
         Ok("unknown") => Err("solver returned unknown".to_string()),
         Ok("timeout") => Err("solver timed out".to_string()),
-        Ok("error") => Err("solver error".to_string()),
+        Ok("error" | "solver_error") => Err("solver error".to_string()),
         Ok(status) => Err(format!("unsupported mock solver status `{status}`")),
     }
 }

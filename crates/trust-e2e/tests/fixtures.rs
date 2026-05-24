@@ -275,6 +275,29 @@ fn fail_solver_unknown_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_solver_counterexample_is_rejected_by_wrapper_verifier() {
+    let output =
+        run_fixture_with_solver_status("fail_solver_unknown", Expected::Fail, "counterexample");
+
+    output.assert_contains("error[trust]: solver found counterexample");
+}
+
+#[test]
+fn fail_solver_timeout_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture_with_solver_status("fail_solver_unknown", Expected::Fail, "timeout");
+
+    output.assert_contains("error[trust]: solver timed out");
+}
+
+#[test]
+fn fail_solver_error_is_rejected_by_wrapper_verifier() {
+    let output =
+        run_fixture_with_solver_status("fail_solver_unknown", Expected::Fail, "solver_error");
+
+    output.assert_contains("error[trust]: solver error");
+}
+
+#[test]
 fn fail_trusted_model_stub_cannot_prove_false() {
     let output = run_fixture("fail_trusted_model_not_axiom", Expected::Fail);
 
