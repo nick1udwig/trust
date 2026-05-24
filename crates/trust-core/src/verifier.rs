@@ -1510,7 +1510,29 @@ fn executable_tokens(body: &str) -> Vec<String> {
         idx += 1;
     }
 
-    executable
+    compact_parenthesized_value_tokens(&executable)
+}
+
+fn compact_parenthesized_value_tokens(tokens: &[String]) -> Vec<String> {
+    let mut compacted = Vec::new();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if idx + 2 < tokens.len()
+            && tokens[idx] == "("
+            && tokens[idx + 2] == ")"
+            && is_value_operand(&tokens[idx + 1])
+        {
+            compacted.push(tokens[idx + 1].clone());
+            idx += 3;
+            continue;
+        }
+
+        compacted.push(tokens[idx].clone());
+        idx += 1;
+    }
+
+    compacted
 }
 
 fn param_type<'a>(name: &str, params: &'a [Param]) -> Option<&'a str> {
@@ -1983,6 +2005,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_parenthesized_variable_addition() {
+        let metadata = metadata_named("add", "pub fn add(x: i32, y: i32) -> i32 { x + (y) }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add".to_string(),
+                expression: "x + y".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn ignores_non_arithmetic_identity() {
         let metadata = metadata("pub fn id_i32(x: i32) -> i32 { x }", &[]);
 
@@ -2144,6 +2179,19 @@ mod tests {
     #[test]
     fn rejects_unproved_integer_division_denominator() {
         let metadata = metadata_named("div", "pub fn div(x: i32, y: i32) -> i32 { x / y }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionByZero {
+                function: "div".to_string(),
+                expression: "x / y".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_parenthesized_integer_division_denominator() {
+        let metadata = metadata_named("div", "pub fn div(x: i32, y: i32) -> i32 { x / (y) }", &[]);
 
         assert_eq!(
             verify_total(&metadata),

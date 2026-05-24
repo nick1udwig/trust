@@ -769,6 +769,13 @@ fn fail_division_by_zero_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_parenthesized_division_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_parenthesized_division", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer division denominator is nonzero");
+}
+
+#[test]
 fn fail_remainder_by_zero_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_remainder_by_zero", Expected::Fail);
 
