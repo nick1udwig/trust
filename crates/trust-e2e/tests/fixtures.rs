@@ -22,6 +22,14 @@ fn pass_is_zero_builds_and_metadata_is_discovered() {
 }
 
 #[test]
+fn pass_runtime_assert_get_checks_public_precondition() {
+    let output = run_fixture("pass_runtime_assert_get", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_missing_wrapper_requires_trust_rustc() {
     let output = run_fixture_without_wrapper("fail_missing_wrapper", Expected::Fail);
 

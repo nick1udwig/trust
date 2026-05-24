@@ -29,12 +29,12 @@ pub fn total(input: TokenStream) -> TokenStream {
     }
 
     let source = input.to_string();
-    let fn_info = match inspect_total_fn(&source) {
-        Ok(fn_info) => fn_info,
+    let total = match parse_total_source(&source) {
+        Ok(total) => total,
         Err(message) => return compile_error(message),
     };
 
-    let metadata = metadata_json(&fn_info, &source);
+    let metadata = metadata_json(&total.fn_info, &source, &total.contracts);
     if let Err(err) = write_metadata_sidecar(&metadata) {
         return compile_error(&format!(
             "error[trust]: failed to write Trust metadata: {err}"
@@ -43,9 +43,10 @@ pub fn total(input: TokenStream) -> TokenStream {
 
     let const_name = format!(
         "__TRUST_META_{}_{}",
-        sanitize_ident(&fn_info.name),
+        sanitize_ident(&total.fn_info.name),
         short_hash(&source)
     );
+    let function = render_function(&total);
     let expanded = format!(
         r###"
         {input}
@@ -54,7 +55,7 @@ pub fn total(input: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         const {const_name}: &str = r##"{metadata}"##;
         "###,
-        input = source,
+        input = function,
         const_name = const_name,
         metadata = metadata
     );
@@ -68,6 +69,55 @@ pub fn total(input: TokenStream) -> TokenStream {
 struct FnInfo {
     name: String,
     visibility: &'static str,
+}
+
+#[derive(Debug)]
+struct TotalExpansion {
+    fn_source: String,
+    fn_info: FnInfo,
+    contracts: Vec<Contract>,
+}
+
+#[derive(Debug)]
+struct Contract {
+    class: &'static str,
+    expression_code: String,
+    expression_display: String,
+}
+
+fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
+    let mut rest = source.trim();
+    let mut contracts = Vec::new();
+
+    loop {
+        let Some(after_given) = strip_keyword(rest, "given") else {
+            break;
+        };
+        let Some(after_executable) = strip_keyword(after_given, "executable") else {
+            return Err("error[trust]: only `given executable` contracts are supported in this Trust MVP slice");
+        };
+        let Some((block, after_block)) = extract_braced(after_executable.trim_start()) else {
+            return Err("error[trust]: `given executable` requires a braced contract block");
+        };
+
+        for expression in split_contract_expressions(block) {
+            contracts.push(Contract {
+                class: "given executable",
+                expression_display: normalize_contract_display(&expression),
+                expression_code: expression,
+            });
+        }
+        rest = after_block.trim_start();
+    }
+
+    let fn_source = rest.to_string();
+    let fn_info = inspect_total_fn(&fn_source)?;
+
+    Ok(TotalExpansion {
+        fn_source,
+        fn_info,
+        contracts,
+    })
 }
 
 fn inspect_total_fn(input: &str) -> Result<FnInfo, &'static str> {
@@ -236,16 +286,119 @@ fn skip_macro_invocation_group(tokens: &[LexToken], ident_idx: usize) -> usize {
     tokens.len()
 }
 
-fn metadata_json(fn_info: &FnInfo, source: &str) -> String {
+fn render_function(total: &TotalExpansion) -> String {
+    if total.fn_info.visibility != "public" || total.contracts.is_empty() {
+        return total.fn_source.clone();
+    }
+
+    let Some(body_start) = total.fn_source.find('{') else {
+        return total.fn_source.clone();
+    };
+
+    let mut assertions = String::new();
+    for contract in &total.contracts {
+        if contract.class != "given executable" {
+            continue;
+        }
+        assertions.push_str(&format!(
+            "::trust::__rt::assert_precondition(({}), {:?}, {:?});",
+            contract.expression_code, total.fn_info.name, contract.expression_display
+        ));
+    }
+
+    let mut function = total.fn_source.clone();
+    function.insert_str(body_start + 1, &assertions);
+    function
+}
+
+fn metadata_json(fn_info: &FnInfo, source: &str, contracts: &[Contract]) -> String {
     let hash = short_hash(source);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
         name = json_escape(&fn_info.name),
         hash = hash,
         visibility = fn_info.visibility,
+        contracts_original = json_string_array(
+            contracts
+                .iter()
+                .map(|contract| contract.expression_display.as_str())
+        ),
+        contracts_normalized = json_string_array(
+            contracts
+                .iter()
+                .map(|contract| contract.expression_display.as_str())
+        ),
+        contract_classes = json_string_array(contracts.iter().map(|contract| contract.class)),
     )
+}
+
+fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let input = input.trim_start();
+    let rest = input.strip_prefix(keyword)?;
+    let boundary = rest
+        .chars()
+        .next()
+        .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+    boundary.then_some(rest)
+}
+
+fn extract_braced(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if !input.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut body_start = None;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    body_start = Some(idx + ch.len_utf8());
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let body_start = body_start?;
+                    return Some((&input[body_start..idx], &input[idx + ch.len_utf8()..]));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn split_contract_expressions(block: &str) -> Vec<String> {
+    block
+        .split(';')
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_contract_display(expression: &str) -> String {
+    expression
+        .replace(" . ", ".")
+        .replace(" (", "(")
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace("[ ", "[")
+        .replace(" ]", "]")
+}
+
+fn json_string_array<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    let values = values
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{values}]")
 }
 
 fn write_metadata_sidecar(metadata: &str) -> Result<(), String> {
@@ -324,7 +477,7 @@ mod tests {
 
     #[test]
     fn rejects_multiple_functions() {
-        let err = inspect_total_fn("fn a() {} fn b() {}").unwrap_err();
+        let err = parse_total_source("fn a() {} fn b() {}").unwrap_err();
 
         assert_eq!(
             err,
@@ -361,5 +514,21 @@ mod tests {
             err,
             "error[trust]: unverified Rust functions are not allowed inside #[trust::module] in the MVP"
         );
+    }
+
+    #[test]
+    fn total_parses_executable_given_and_renders_assertion() {
+        let total = parse_total_source(
+            "given executable { i < xs . len(); } pub fn get(xs: &[i32], i: usize) -> i32 { xs[i] }",
+        )
+        .unwrap();
+
+        assert_eq!(total.fn_info.name, "get");
+        assert_eq!(total.contracts[0].expression_display, "i < xs.len()");
+
+        let function = render_function(&total);
+        assert!(function.contains(
+            "::trust::__rt::assert_precondition((i < xs . len()), \"get\", \"i < xs.len()\");"
+        ));
     }
 }
