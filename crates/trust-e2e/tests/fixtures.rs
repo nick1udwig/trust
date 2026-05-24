@@ -1,5 +1,6 @@
 use trust_test_support::{
-    run_fixture, run_fixture_with_cache, run_fixture_without_wrapper, Expected,
+    run_fixture, run_fixture_with_cache, run_fixture_with_solver_status,
+    run_fixture_without_wrapper, Expected,
 };
 
 #[test]
@@ -264,6 +265,13 @@ fn fail_withdraw_account_wrong_id_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_withdraw_account_wrong_id", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove postcondition");
+}
+
+#[test]
+fn fail_solver_unknown_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture_with_solver_status("fail_solver_unknown", Expected::Fail, "unknown");
+
+    output.assert_contains("error[trust]: solver returned unknown");
 }
 
 #[test]

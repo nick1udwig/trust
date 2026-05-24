@@ -32,7 +32,7 @@ impl FixtureOutput {
 
 pub fn run_fixture(name: &str, expected: Expected) -> FixtureOutput {
     let wrapper = build_trust_rustc();
-    run_fixture_inner(name, expected, Some(&wrapper), name, name)
+    run_fixture_inner(name, expected, Some(&wrapper), name, name, None)
 }
 
 pub fn run_fixture_with_cache(
@@ -42,11 +42,34 @@ pub fn run_fixture_with_cache(
     cache_name: &str,
 ) -> FixtureOutput {
     let wrapper = build_trust_rustc();
-    run_fixture_inner(name, expected, Some(&wrapper), target_name, cache_name)
+    run_fixture_inner(
+        name,
+        expected,
+        Some(&wrapper),
+        target_name,
+        cache_name,
+        None,
+    )
+}
+
+pub fn run_fixture_with_solver_status(
+    name: &str,
+    expected: Expected,
+    solver_status: &str,
+) -> FixtureOutput {
+    let wrapper = build_trust_rustc();
+    run_fixture_inner(
+        name,
+        expected,
+        Some(&wrapper),
+        name,
+        name,
+        Some(solver_status),
+    )
 }
 
 pub fn run_fixture_without_wrapper(name: &str, expected: Expected) -> FixtureOutput {
-    run_fixture_inner(name, expected, None, name, name)
+    run_fixture_inner(name, expected, None, name, name, None)
 }
 
 fn run_fixture_inner(
@@ -55,6 +78,7 @@ fn run_fixture_inner(
     wrapper: Option<&Path>,
     target_name: &str,
     cache_name: &str,
+    solver_status: Option<&str>,
 ) -> FixtureOutput {
     let root = workspace_root();
     let manifest = root
@@ -88,6 +112,11 @@ fn run_fixture_inner(
         command.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
     } else {
         command.env_remove("RUSTC_WORKSPACE_WRAPPER");
+    }
+    if let Some(solver_status) = solver_status {
+        command.env("TRUST_SOLVER_STATUS", solver_status);
+    } else {
+        command.env_remove("TRUST_SOLVER_STATUS");
     }
 
     let output = command.output().unwrap_or_else(|err| {

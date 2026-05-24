@@ -75,6 +75,7 @@ fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<C
     if totals == 0 {
         return Ok(CacheStats { hits: 0, misses: 0 });
     }
+    check_mock_solver_status()?;
 
     if let Some(cache_file) = cache_file(metadata) {
         if matches!(
@@ -100,6 +101,17 @@ fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<C
         hits: 0,
         misses: totals,
     })
+}
+
+fn check_mock_solver_status() -> Result<(), String> {
+    match env::var("TRUST_SOLVER_STATUS").as_deref() {
+        Ok("proved") | Err(_) => Ok(()),
+        Ok("counterexample") => Err("solver found counterexample".to_string()),
+        Ok("unknown") => Err("solver returned unknown".to_string()),
+        Ok("timeout") => Err("solver timed out".to_string()),
+        Ok("error") => Err("solver error".to_string()),
+        Ok(status) => Err(format!("unsupported mock solver status `{status}`")),
+    }
 }
 
 fn split_rustc_args(args: Vec<OsString>) -> (OsString, Vec<OsString>) {
@@ -170,6 +182,9 @@ fn cache_file(metadata: &[trust_core::metadata::TrustMetadata]) -> Option<PathBu
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
     env::var("TRUST_SOLVER")
         .unwrap_or_else(|_| "mock".to_string())
+        .hash(&mut hasher);
+    env::var("TRUST_SOLVER_STATUS")
+        .unwrap_or_else(|_| "proved".to_string())
         .hash(&mut hasher);
     for item in metadata {
         item.schema_version.hash(&mut hasher);
