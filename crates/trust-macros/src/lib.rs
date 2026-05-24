@@ -14,6 +14,11 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         return compile_error("error[trust]: Trust verification requires trust-rustc");
     }
 
+    let source = item.to_string();
+    if let Err(message) = inspect_module(&source) {
+        return compile_error(message);
+    }
+
     item
 }
 
@@ -112,6 +117,46 @@ fn inspect_total_fn(input: &str) -> Result<FnInfo, &'static str> {
     Ok(FnInfo { name, visibility })
 }
 
+fn inspect_module(input: &str) -> Result<(), &'static str> {
+    let tokens = lex(input);
+    let Some(module_body_start) = tokens
+        .iter()
+        .position(|token| matches!(token, LexToken::Punct('{')))
+    else {
+        return Err("error[trust]: #[trust::module] must be applied to a module");
+    };
+
+    let mut idx = module_body_start + 1;
+    let mut depth = 1usize;
+
+    while idx < tokens.len() && depth > 0 {
+        match &tokens[idx] {
+            LexToken::Ident(ident) if depth == 1 && ident == "total" => {
+                idx = skip_macro_invocation_group(&tokens, idx);
+            }
+            LexToken::Ident(ident) if depth == 1 && ident == "unsafe" => {
+                return Err(
+                    "error[trust]: unsafe items are not allowed inside #[trust::module] in the MVP",
+                );
+            }
+            LexToken::Ident(ident) if depth == 1 && ident == "fn" => {
+                return Err("error[trust]: unverified Rust functions are not allowed inside #[trust::module] in the MVP");
+            }
+            LexToken::Punct('{') => {
+                depth += 1;
+                idx += 1;
+            }
+            LexToken::Punct('}') => {
+                depth -= 1;
+                idx += 1;
+            }
+            _ => idx += 1,
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LexToken {
     Ident(String),
@@ -159,6 +204,36 @@ fn has_body_group(tokens: &[LexToken]) -> bool {
     tokens
         .iter()
         .any(|token| matches!(token, LexToken::Punct('{')))
+}
+
+fn skip_macro_invocation_group(tokens: &[LexToken], ident_idx: usize) -> usize {
+    if !matches!(tokens.get(ident_idx + 1), Some(LexToken::Punct('!'))) {
+        return ident_idx + 1;
+    }
+
+    let Some(open_idx) = tokens[ident_idx + 2..]
+        .iter()
+        .position(|token| matches!(token, LexToken::Punct('{')))
+        .map(|offset| ident_idx + 2 + offset)
+    else {
+        return ident_idx + 1;
+    };
+
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
+        match token {
+            LexToken::Punct('{') => depth += 1,
+            LexToken::Punct('}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return idx + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    tokens.len()
 }
 
 fn metadata_json(fn_info: &FnInfo, source: &str) -> String {
@@ -254,6 +329,37 @@ mod tests {
         assert_eq!(
             err,
             "error[trust]: trust::total! accepts exactly one Rust fn item"
+        );
+    }
+
+    #[test]
+    fn module_accepts_total_function() {
+        inspect_module(
+            r#"
+            mod verified {
+                trust::total! {
+                    pub fn id_i32(x: i32) -> i32 { x }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn module_rejects_unverified_function() {
+        let err = inspect_module(
+            r#"
+            mod verified {
+                pub fn helper(x: i32) -> i32 { x }
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: unverified Rust functions are not allowed inside #[trust::module] in the MVP"
         );
     }
 }
