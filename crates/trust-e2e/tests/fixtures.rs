@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use trust_test_support::{
     fixture_cache_dir, run_fixture, run_fixture_with_cache, run_fixture_with_cache_and_env,
     run_fixture_with_cache_and_solver_status, run_fixture_with_solver_status,
@@ -689,6 +691,50 @@ fn fail_solver_error_is_rejected_by_wrapper_verifier() {
         run_fixture_with_solver_status("fail_solver_unknown", Expected::Fail, "solver_error");
 
     output.assert_contains("error[trust]: solver error");
+}
+
+#[test]
+fn fail_z3_solver_unavailable_is_rejected_by_wrapper_verifier() {
+    let suffix = std::process::id();
+    let missing_solver = format!("/tmp/trust-missing-z3-{suffix}");
+    let output = run_fixture_with_cache_and_env(
+        "pass_z3_solver",
+        Expected::Fail,
+        &format!("pass_z3_solver_missing_{suffix}"),
+        &format!("pass_z3_solver_missing_{suffix}"),
+        &[("TRUST_SOLVER_BIN", &missing_solver)],
+    );
+
+    output.assert_contains("error[trust]: solver `z3` is unavailable");
+}
+
+#[cfg(unix)]
+#[test]
+fn pass_z3_solver_runs_external_backend() {
+    let suffix = std::process::id();
+    let solver_dir = fixture_cache_dir(&format!("fake_z3_solver_{suffix}"));
+    fs::create_dir_all(&solver_dir).expect("create fake z3 dir");
+    let solver = solver_dir.join("z3");
+    fs::write(
+        &solver,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Z3 version 4.12.0'; exit 0; fi\ncat >/dev/null\necho unsat\n",
+    )
+    .expect("write fake z3");
+    let mut permissions = fs::metadata(&solver).expect("stat fake z3").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&solver, permissions).expect("chmod fake z3");
+    let solver = solver.to_str().expect("fake z3 path should be UTF-8");
+
+    let output = run_fixture_with_cache_and_env(
+        "pass_z3_solver",
+        Expected::Pass,
+        &format!("pass_z3_solver_fake_{suffix}"),
+        &format!("pass_z3_solver_fake_{suffix}"),
+        &[("TRUST_SOLVER_BIN", solver)],
+    );
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
 }
 
 #[test]

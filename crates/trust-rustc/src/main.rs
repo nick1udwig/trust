@@ -5,7 +5,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{self, Command, ExitStatus};
+use std::process::{self, Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use trust_core::{metadata::parse_metadata_line, verifier::verify_totals};
 
@@ -51,7 +51,7 @@ fn run() -> Result<i32, String> {
     let cache_stats = if verification_items == 0 {
         CacheStats { hits: 0, misses: 0 }
     } else {
-        let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args, &config);
+        let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args, &config)?;
         verify_metadata(&metadata, &cache_context, &config)?
     };
 
@@ -149,7 +149,7 @@ impl TrustConfig {
         if !matches!(self.assertions.as_str(), "always" | "debug" | "assume") {
             return Err(format!("invalid assertion policy `{}`", self.assertions));
         }
-        if self.solver != "mock" {
+        if !matches!(self.solver.as_str(), "mock" | "z3") {
             return Err(format!("unsupported solver `{}`", self.solver));
         }
         if self.timeout_ms == 0 {
@@ -192,7 +192,11 @@ struct CacheContext {
 }
 
 impl CacheContext {
-    fn from_rustc_args(rustc: &OsString, rustc_args: &[OsString], config: &TrustConfig) -> Self {
+    fn from_rustc_args(
+        rustc: &OsString,
+        rustc_args: &[OsString],
+        config: &TrustConfig,
+    ) -> Result<Self, String> {
         let rustc_version = if deterministic_test_mode() {
             env::var("TRUST_TEST_RUSTC_VERSION").unwrap_or_else(|_| "rustc-test".to_string())
         } else {
@@ -227,7 +231,7 @@ impl CacheContext {
         cargo_features.sort();
         cargo_features.dedup();
 
-        Self {
+        Ok(Self {
             rustc_version,
             target_triple,
             pointer_width: target_cfg.pointer_width,
@@ -235,15 +239,14 @@ impl CacheContext {
             target_features,
             cargo_features,
             solver_name: config.solver.clone(),
-            solver_version: env::var("TRUST_SOLVER_VERSION")
-                .unwrap_or_else(|_| "mock-v1".to_string()),
+            solver_version: solver_version(config)?,
             solver_options: format!(
                 "timeout_ms={};{}",
                 config.timeout_ms,
                 env::var("TRUST_SOLVER_OPTIONS").unwrap_or_default()
             ),
             trust_config_fingerprint: config.fingerprint.clone(),
-        }
+        })
     }
 }
 
@@ -266,7 +269,7 @@ fn verify_metadata(
     if verification_items == 0 {
         return Ok(CacheStats { hits: 0, misses: 0 });
     }
-    check_mock_solver_status(config)?;
+    check_solver_status(config)?;
 
     if let Some(cache_file) = cache_file(metadata, cache_context) {
         if matches!(
@@ -294,21 +297,115 @@ fn verify_metadata(
     })
 }
 
-fn check_mock_solver_status(config: &TrustConfig) -> Result<(), String> {
-    if config.solver != "mock" {
-        return Err(format!(
-            "solver `{}` is unavailable in Trust MVP",
-            config.solver
-        ));
+fn check_solver_status(config: &TrustConfig) -> Result<(), String> {
+    match config.solver.as_str() {
+        "mock" => check_mock_solver_status(),
+        "z3" => check_z3_solver_status(config),
+        solver => Err(format!("unsupported solver `{solver}`")),
+    }
+}
+
+fn check_mock_solver_status() -> Result<(), String> {
+    solver_result_from_status(
+        env::var("TRUST_SOLVER_STATUS")
+            .as_deref()
+            .unwrap_or("proved"),
+    )
+}
+
+fn check_z3_solver_status(config: &TrustConfig) -> Result<(), String> {
+    let solver = z3_solver_bin();
+    let mut child = Command::new(&solver)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "solver `z3` is unavailable at `{}`: {err}",
+                solver.display()
+            )
+        })?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "solver error".to_string())?;
+        let query = format!(
+            "(set-logic QF_LIA)\n(set-option :timeout {})\n(assert false)\n(check-sat)\n",
+            config.timeout_ms
+        );
+        stdin
+            .write_all(query.as_bytes())
+            .map_err(|_| "solver error".to_string())?;
     }
 
-    match env::var("TRUST_SOLVER_STATUS").as_deref() {
-        Ok("proved") | Err(_) => Ok(()),
-        Ok("counterexample") => Err("solver found counterexample".to_string()),
-        Ok("unknown") => Err("solver returned unknown".to_string()),
-        Ok("timeout") => Err("solver timed out".to_string()),
-        Ok("error" | "solver_error") => Err("solver error".to_string()),
-        Ok(status) => Err(format!("unsupported mock solver status `{status}`")),
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "solver error".to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            return Err("solver error".to_string());
+        }
+        return Err(format!("solver error: {detail}"));
+    }
+
+    solver_result_from_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn solver_version(config: &TrustConfig) -> Result<String, String> {
+    if let Ok(version) = env::var("TRUST_SOLVER_VERSION") {
+        return Ok(version);
+    }
+
+    match config.solver.as_str() {
+        "mock" => Ok("mock-v1".to_string()),
+        "z3" => {
+            let solver = z3_solver_bin();
+            let output = Command::new(&solver)
+                .arg("--version")
+                .output()
+                .map_err(|err| {
+                    format!(
+                        "solver `z3` is unavailable at `{}`: {err}",
+                        solver.display()
+                    )
+                })?;
+            if !output.status.success() {
+                return Err("solver error".to_string());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        solver => Err(format!("unsupported solver `{solver}`")),
+    }
+}
+
+fn z3_solver_bin() -> PathBuf {
+    env::var_os("TRUST_SOLVER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("z3"))
+}
+
+fn solver_result_from_output(output: &str) -> Result<(), String> {
+    let status = output
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "solver error".to_string())?;
+
+    solver_result_from_status(status)
+}
+
+fn solver_result_from_status(status: &str) -> Result<(), String> {
+    match status {
+        "proved" | "unsat" => Ok(()),
+        "counterexample" | "sat" => Err("solver found counterexample".to_string()),
+        "unknown" => Err("solver returned unknown".to_string()),
+        "timeout" => Err("solver timed out".to_string()),
+        "error" | "solver_error" => Err("solver error".to_string()),
+        status => Err(format!("unsupported solver status `{status}`")),
     }
 }
 
@@ -578,5 +675,26 @@ mod tests {
         let (_rustc, args) = split_rustc_args(vec![OsString::from("--version")]);
 
         assert_eq!(args, vec![OsString::from("--version")]);
+    }
+
+    #[test]
+    fn solver_output_maps_unsat_to_proved() {
+        assert_eq!(solver_result_from_output("unsat\n"), Ok(()));
+    }
+
+    #[test]
+    fn solver_output_maps_sat_to_counterexample() {
+        assert_eq!(
+            solver_result_from_output("sat\n"),
+            Err("solver found counterexample".to_string())
+        );
+    }
+
+    #[test]
+    fn solver_output_maps_unknown_to_failure() {
+        assert_eq!(
+            solver_result_from_output("unknown\n"),
+            Err("solver returned unknown".to_string())
+        );
     }
 }
