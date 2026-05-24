@@ -889,11 +889,11 @@ fn loop_exit_proves_value(body: &str, return_expression: &str, expected: &str) -
 }
 
 fn contains_unchecked_unwrap(body: &str) -> bool {
-    tokens(body).windows(4).any(|window| {
-        let [dot, unwrap, open, close] = window else {
+    tokens(body).windows(3).any(|window| {
+        let [dot, method, open] = window else {
             return false;
         };
-        dot == "." && unwrap == "unwrap" && open == "(" && close == ")"
+        dot == "." && matches!(method.as_str(), "unwrap" | "expect") && open == "("
     })
 }
 
@@ -1412,6 +1412,17 @@ mod tests {
     }
 
     #[test]
+    fn proves_i64_add_one_from_executable_precondition() {
+        let metadata = metadata_named(
+            "add_one_i64",
+            "pub fn add_one_i64(x: i64) -> i64 { x + 1 }",
+            &["x < i64::MAX"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
     fn rejects_unproved_i32_add_one() {
         let metadata = metadata("pub fn add_one(x: i32) -> i32 { x + 1 }", &[]);
 
@@ -1829,6 +1840,22 @@ mod tests {
             verify_total(&metadata),
             Err(VerificationError::UncheckedUnwrap {
                 function: "bad_unwrap".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unchecked_result_expect() {
+        let metadata = metadata_named(
+            "bad_expect",
+            "pub fn bad_expect(x: Result<i32, i32>) -> i32 { x.expect(\"ok\") }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UncheckedUnwrap {
+                function: "bad_expect".to_string(),
             })
         );
     }

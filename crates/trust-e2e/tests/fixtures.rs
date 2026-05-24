@@ -420,6 +420,14 @@ fn pass_add_one_precondition_proves_i32_overflow_safety() {
 }
 
 #[test]
+fn pass_i64_add_one_precondition_proves_overflow_safety() {
+    let output = run_fixture("pass_i64_add_one_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_sub_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_sub_one_precondition", Expected::Pass);
 
@@ -551,6 +559,23 @@ fn fail_option_unwrap_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_result_expect_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_result_expect", Expected::Fail);
+
+    output.assert_contains(
+        "error[trust]: unchecked unwrap is not supported; prove Some or use match",
+    );
+}
+
+#[test]
+fn pass_result_match_builds() {
+    let output = run_fixture("pass_result_match", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_explicit_panic_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_explicit_panic", Expected::Fail);
 
@@ -627,6 +652,13 @@ fn fail_loop_invariant_not_preserved_is_rejected_by_wrapper_verifier() {
 #[test]
 fn fail_overflow_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_overflow_unproved", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+}
+
+#[test]
+fn fail_i64_overflow_unproved_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_i64_overflow_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
 }
