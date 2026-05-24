@@ -96,6 +96,34 @@ fn pass_loop_countdown_proves_decreases() {
 }
 
 #[test]
+fn fail_loop_without_spec_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_without_spec", Expected::Fail);
+
+    output.assert_contains("error[trust]: loop in `countdown` requires loop_spec");
+}
+
+#[test]
+fn fail_loop_spec_without_loop_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_spec_without_loop", Expected::Fail);
+
+    output.assert_contains("error[trust]: loop in `id` requires loop_spec");
+}
+
+#[test]
+fn fail_loop_two_specs_one_loop_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_two_specs_one_loop", Expected::Fail);
+
+    output.assert_contains("error[trust]: multiple loop_spec blocks before loop in `countdown`");
+}
+
+#[test]
+fn fail_loop_break_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_break", Expected::Fail);
+
+    output.assert_contains("error[trust]: `break` is not supported in loops in `countdown`");
+}
+
+#[test]
 fn pass_executable_spec_builds_as_runtime_rust() {
     run_fixture("pass_spec_executable", Expected::Pass);
 }

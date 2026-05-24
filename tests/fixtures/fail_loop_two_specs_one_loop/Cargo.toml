@@ -1,0 +1,16 @@
+[package]
+name = "fail_loop_two_specs_one_loop"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
+
+[package.metadata.trust]
+assertions = "always"
+solver = "mock"

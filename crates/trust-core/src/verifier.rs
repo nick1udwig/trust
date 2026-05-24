@@ -35,6 +35,9 @@ pub enum VerificationError {
     LoopMissingSpec {
         function: String,
     },
+    LoopAmbiguousSpec {
+        function: String,
+    },
     LoopMissingDecreases {
         function: String,
     },
@@ -114,6 +117,9 @@ impl fmt::Display for VerificationError {
             ),
             VerificationError::LoopMissingSpec { function } => {
                 write!(f, "loop in `{function}` requires loop_spec")
+            }
+            VerificationError::LoopAmbiguousSpec { function } => {
+                write!(f, "multiple loop_spec blocks before loop in `{function}`")
             }
             VerificationError::LoopMissingDecreases { function: _ } => {
                 write!(f, "loop in total function requires decreases measure")
@@ -707,6 +713,11 @@ fn verify_loops(body: &str, function: &str) -> Result<Vec<LoopFact>, Verificatio
                 idx += 1;
                 continue;
             };
+            if pending_spec.is_some() {
+                return Err(VerificationError::LoopAmbiguousSpec {
+                    function: function.to_string(),
+                });
+            }
             pending_spec = Some(parse_loop_spec(&tokens[open_idx + 1..close_idx]));
             idx = close_idx + 1;
             continue;
@@ -1650,6 +1661,71 @@ mod tests {
             verify_total(&metadata),
             Err(VerificationError::LoopMissingDecreases {
                 function: "count_up".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_loop_without_spec() {
+        let metadata = metadata_named(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { while n > 0 { n = n - 1; } n }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopMissingSpec {
+                function: "countdown".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_loop_spec_without_loop() {
+        let metadata = metadata_named(
+            "id",
+            "pub fn id(n: usize) -> usize { trust::loop_spec! { decreases(n); } n }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopMissingSpec {
+                function: "id".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_two_specs_one_loop() {
+        let metadata = metadata_named(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } trust::loop_spec! { decreases(n); } while n > 0 { n = n - 1; } n }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopAmbiguousSpec {
+                function: "countdown".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_loop_break() {
+        let metadata = metadata_named(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { break; } n }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedLoopControl {
+                function: "countdown".to_string(),
+                keyword: "break".to_string(),
             })
         );
     }
