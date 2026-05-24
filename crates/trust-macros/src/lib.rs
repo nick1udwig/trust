@@ -34,7 +34,7 @@ pub fn total(input: TokenStream) -> TokenStream {
         Err(message) => return compile_error(message),
     };
 
-    let metadata = metadata_json(&total.fn_info, &source, &total.contracts);
+    let metadata = metadata_json(&total.fn_info, &source, &total.fn_source, &total.contracts);
     if let Err(err) = write_metadata_sidecar(&metadata) {
         return compile_error(&format!(
             "error[trust]: failed to write Trust metadata: {err}"
@@ -312,15 +312,21 @@ fn render_function(total: &TotalExpansion) -> String {
     function
 }
 
-fn metadata_json(fn_info: &FnInfo, source: &str, contracts: &[Contract]) -> String {
+fn metadata_json(
+    fn_info: &FnInfo,
+    source: &str,
+    function_source: &str,
+    contracts: &[Contract],
+) -> String {
     let hash = short_hash(source);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
         name = json_escape(&fn_info.name),
         hash = hash,
         visibility = fn_info.visibility,
+        function_source = json_escape(function_source),
         contracts_original = json_string_array(
             contracts
                 .iter()

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{self, Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trust_core::metadata::parse_metadata_line;
+use trust_core::{metadata::parse_metadata_line, verifier::verify_total};
 
 fn main() {
     match run() {
@@ -34,6 +34,7 @@ fn run() -> Result<i32, String> {
     }
 
     let metadata = read_metadata(&metadata_path)?;
+    verify_metadata(&metadata)?;
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -49,6 +50,14 @@ fn run() -> Result<i32, String> {
 
     let _ = fs::remove_file(&metadata_path);
     Ok(exit_code(status))
+}
+
+fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<(), String> {
+    for item in metadata {
+        verify_total(item).map_err(|err| err.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn split_rustc_args(args: Vec<OsString>) -> (OsString, Vec<OsString>) {
