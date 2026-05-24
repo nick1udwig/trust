@@ -46,6 +46,14 @@ fn pass_private_ghost_precondition_builds_without_runtime_assertion() {
 }
 
 #[test]
+fn pass_callee_precondition_proves_trust_to_trust_call() {
+    let output = run_fixture("pass_callee_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 2 total functions");
+    output.assert_contains("trust: proved 2 total functions");
+}
+
+#[test]
 fn pass_add_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_add_one_precondition", Expected::Pass);
 
@@ -166,6 +174,13 @@ fn fail_public_ghost_precondition_is_rejected() {
     let output = run_fixture("fail_public_ghost_precondition", Expected::Fail);
 
     output.assert_contains("error[trust]: public function has ghost-only precondition");
+}
+
+#[test]
+fn fail_callee_precondition_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_callee_precondition", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove callee precondition");
 }
 
 #[test]

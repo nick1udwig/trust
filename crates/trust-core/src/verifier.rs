@@ -23,6 +23,11 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    CalleePreconditionUnproved {
+        function: String,
+        callee: String,
+        condition: String,
+    },
     PostconditionUnproved {
         function: String,
         condition: String,
@@ -67,6 +72,14 @@ impl fmt::Display for VerificationError {
                 f,
                 "could not prove index is in bounds in `{function}`: `{expression}`"
             ),
+            VerificationError::CalleePreconditionUnproved {
+                function,
+                callee,
+                condition,
+            } => write!(
+                f,
+                "could not prove callee precondition in `{function}` for `{callee}`: `{condition}`"
+            ),
             VerificationError::PostconditionUnproved {
                 function,
                 condition,
@@ -78,12 +91,29 @@ impl fmt::Display for VerificationError {
 impl std::error::Error for VerificationError {}
 
 pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
+    verify_total_with_env(metadata, &[])
+}
+
+pub fn verify_totals(metadata: &[TrustMetadata]) -> Result<(), VerificationError> {
+    let env = function_env(metadata);
+    for item in metadata {
+        verify_total_with_env(item, &env)?;
+    }
+
+    Ok(())
+}
+
+fn verify_total_with_env(
+    metadata: &TrustMetadata,
+    env: &[TrustFunctionSummary],
+) -> Result<(), VerificationError> {
     if metadata.item_kind != "total" {
         return Ok(());
     }
 
     let source = normalize(&metadata.function_source);
     let contracts = executable_preconditions(metadata);
+    let given_contracts = given_preconditions(metadata);
     let params = parse_params(&source);
     let body = body(&source);
 
@@ -132,6 +162,16 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
         }
     }
 
+    for obligation in call_obligations(body, env) {
+        if !callee_precondition_proved(&obligation.condition, &given_contracts) {
+            return Err(VerificationError::CalleePreconditionUnproved {
+                function: metadata.rust_function_path.clone(),
+                callee: obligation.callee,
+                condition: obligation.condition,
+            });
+        }
+    }
+
     for postcondition in postconditions(metadata) {
         if !postcondition_proved(&postcondition, body) {
             return Err(VerificationError::PostconditionUnproved {
@@ -154,6 +194,13 @@ struct Contract {
 struct Param {
     name: String,
     ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustFunctionSummary {
+    name: String,
+    params: Vec<Param>,
+    preconditions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,12 +241,43 @@ struct SliceIndexObligation {
     expression: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallObligation {
+    callee: String,
+    condition: String,
+}
+
+fn function_env(metadata: &[TrustMetadata]) -> Vec<TrustFunctionSummary> {
+    metadata
+        .iter()
+        .filter(|item| item.item_kind == "total")
+        .map(|item| {
+            let source = normalize(&item.function_source);
+            TrustFunctionSummary {
+                name: item.rust_function_path.clone(),
+                params: parse_params(&source),
+                preconditions: given_preconditions(item),
+            }
+        })
+        .collect()
+}
+
 fn executable_preconditions(metadata: &TrustMetadata) -> Vec<String> {
     metadata
         .contracts_original
         .iter()
         .zip(metadata.contract_classes.iter())
         .filter(|(_contract, class)| class.as_str() == "given executable")
+        .map(|(contract, _class)| normalize(contract))
+        .collect()
+}
+
+fn given_preconditions(metadata: &TrustMetadata) -> Vec<String> {
+    metadata
+        .contracts_original
+        .iter()
+        .zip(metadata.contract_classes.iter())
+        .filter(|(_contract, class)| matches!(class.as_str(), "given executable" | "given ghost"))
         .map(|(contract, _class)| normalize(contract))
         .collect()
 }
@@ -423,6 +501,46 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
     obligations
 }
 
+fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
+    let tokens = tokens(body);
+    let mut obligations = Vec::new();
+    let mut idx = 0;
+
+    while idx + 1 < tokens.len() {
+        let callee_name = &tokens[idx];
+        if tokens[idx + 1] != "(" || idx.checked_sub(1).is_some_and(|prev| tokens[prev] == ".") {
+            idx += 1;
+            continue;
+        }
+
+        let Some(callee) = env.iter().find(|function| function.name == *callee_name) else {
+            idx += 1;
+            continue;
+        };
+        let Some(end) = matching_token_group(&tokens, idx + 1, "(", ")") else {
+            idx += 1;
+            continue;
+        };
+
+        let args = split_arguments(&tokens[idx + 2..end])
+            .iter()
+            .map(|tokens| token_expression(tokens))
+            .collect::<Vec<_>>();
+        if args.len() == callee.params.len() {
+            for precondition in &callee.preconditions {
+                obligations.push(CallObligation {
+                    callee: callee.name.clone(),
+                    condition: substitute_params(precondition, &callee.params, &args),
+                });
+            }
+        }
+
+        idx += 1;
+    }
+
+    obligations
+}
+
 fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
     let Some(max) = max_value(&obligation.ty) else {
         return false;
@@ -526,6 +644,17 @@ fn slice_index_obligation_proved(obligation: &SliceIndexObligation, contracts: &
         .any(|contract| contract == &index_lt_len || contract == &len_gt_index)
 }
 
+fn callee_precondition_proved(condition: &str, contracts: &[String]) -> bool {
+    if contracts.iter().any(|contract| contract == condition) {
+        return true;
+    }
+
+    let Some(flipped) = flipped_inequality(condition) else {
+        return false;
+    };
+    contracts.iter().any(|contract| contract == &flipped)
+}
+
 fn is_supported_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64" | "usize")
 }
@@ -614,6 +743,98 @@ fn matching_paren(input: &str, open_idx: usize) -> Option<usize> {
             }
             _ => {}
         }
+    }
+
+    None
+}
+
+fn matching_token_group(
+    tokens: &[String],
+    open_idx: usize,
+    open: &str,
+    close: &str,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
+        if token == open {
+            depth += 1;
+        } else if token == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+
+    None
+}
+
+fn split_arguments(tokens: &[String]) -> Vec<Vec<String>> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut args = Vec::new();
+    let mut current = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for token in tokens {
+        match token.as_str() {
+            "," if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                args.push(std::mem::take(&mut current));
+            }
+            "(" => {
+                paren_depth += 1;
+                current.push(token.clone());
+            }
+            ")" => {
+                paren_depth -= 1;
+                current.push(token.clone());
+            }
+            "[" => {
+                bracket_depth += 1;
+                current.push(token.clone());
+            }
+            "]" => {
+                bracket_depth -= 1;
+                current.push(token.clone());
+            }
+            "{" => {
+                brace_depth += 1;
+                current.push(token.clone());
+            }
+            "}" => {
+                brace_depth -= 1;
+                current.push(token.clone());
+            }
+            _ => current.push(token.clone()),
+        }
+    }
+
+    args.push(current);
+    args
+}
+
+fn substitute_params(condition: &str, params: &[Param], args: &[String]) -> String {
+    let mut out = String::new();
+    for token in tokens(condition) {
+        if let Some(param_idx) = params.iter().position(|param| param.name == token) {
+            out.push_str(&args[param_idx]);
+        } else {
+            out.push_str(&token);
+        }
+    }
+    out
+}
+
+fn flipped_inequality(condition: &str) -> Option<String> {
+    for (op, flipped_op) in [("<=", ">="), (">=", "<="), ("<", ">"), (">", "<")] {
+        let Some((left, right)) = condition.split_once(op) else {
+            continue;
+        };
+        return Some(format!("{right}{flipped_op}{left}"));
     }
 
     None
@@ -851,6 +1072,45 @@ mod tests {
             Err(VerificationError::SliceIndexOutOfBounds {
                 function: "first".to_string(),
                 expression: "xs[0]".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_callee_precondition_from_caller_precondition() {
+        let get = metadata_named(
+            "get",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[i] }",
+            &["i < xs.len()"],
+        );
+        let first = metadata_named(
+            "first",
+            "pub fn first(xs: &[i32]) -> i32 { get(xs, 0) }",
+            &["xs.len() > 0"],
+        );
+
+        assert_eq!(verify_totals(&[get, first]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_callee_precondition() {
+        let get = metadata_named(
+            "get",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[i] }",
+            &["i < xs.len()"],
+        );
+        let bad_first = metadata_named(
+            "bad_first",
+            "pub fn bad_first(xs: &[i32]) -> i32 { get(xs, 0) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_totals(&[get, bad_first]),
+            Err(VerificationError::CalleePreconditionUnproved {
+                function: "bad_first".to_string(),
+                callee: "get".to_string(),
+                condition: "0<xs.len()".to_string(),
             })
         );
     }
