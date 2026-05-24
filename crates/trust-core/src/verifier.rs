@@ -7,6 +7,10 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    IntegerSubtractionOverflow {
+        function: String,
+        expression: String,
+    },
 }
 
 impl fmt::Display for VerificationError {
@@ -18,6 +22,13 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "could not prove integer addition cannot overflow in `{function}`: `{expression}`"
+            ),
+            VerificationError::IntegerSubtractionOverflow {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer subtraction cannot overflow in `{function}`: `{expression}`"
             ),
         }
     }
@@ -48,6 +59,15 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
         }
     }
 
+    for obligation in subtraction_obligations(body, &params) {
+        if !subtraction_obligation_proved(&obligation, &contracts) {
+            return Err(VerificationError::IntegerSubtractionOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -59,6 +79,14 @@ struct Param {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AddObligation {
+    variable: String,
+    ty: String,
+    constant: i128,
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubObligation {
     variable: String,
     ty: String,
     constant: i128,
@@ -125,6 +153,35 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
     obligations
 }
 
+fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
+    let tokens = tokens(body);
+    let mut obligations = Vec::new();
+
+    for window in tokens.windows(3) {
+        let [left, op, right] = window else {
+            continue;
+        };
+        if op != "-" {
+            continue;
+        }
+
+        if let Some(param) = params.iter().find(|param| param.name == *left) {
+            if let Ok(constant) = right.parse::<i128>() {
+                if constant > 0 && is_supported_integer(&param.ty) {
+                    obligations.push(SubObligation {
+                        variable: left.clone(),
+                        ty: param.ty.clone(),
+                        constant,
+                        expression: format!("{left} - {right}"),
+                    });
+                }
+            }
+        }
+    }
+
+    obligations
+}
+
 fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
     let Some(max) = max_value(&obligation.ty) else {
         return false;
@@ -147,6 +204,28 @@ fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) 
         .any(|contract| contract == &le_required || contract == &le_unqualified)
 }
 
+fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String]) -> bool {
+    let Some(min) = min_value(&obligation.ty) else {
+        return false;
+    };
+    let required_bound = min + obligation.constant;
+    let gt_min = format!("{}>{}::MIN", obligation.variable, obligation.ty);
+    let ge_required = format!(
+        "{}>={}",
+        obligation.variable,
+        min_bound_with_type(required_bound, &obligation.ty)
+    );
+    let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
+
+    if obligation.constant == 1 && contracts.iter().any(|contract| contract == &gt_min) {
+        return true;
+    }
+
+    contracts
+        .iter()
+        .any(|contract| contract == &ge_required || contract == &ge_unqualified)
+}
+
 fn is_supported_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64" | "usize")
 }
@@ -160,10 +239,27 @@ fn max_value(ty: &str) -> Option<i128> {
     }
 }
 
+fn min_value(ty: &str) -> Option<i128> {
+    match ty {
+        "i32" => Some(i32::MIN as i128),
+        "i64" => Some(i64::MIN as i128),
+        "usize" => Some(0),
+        _ => None,
+    }
+}
+
 fn constant_with_type(value: i128, ty: &str) -> String {
     match (value, ty) {
         (2147483646, "i32") => "i32::MAX-1".to_string(),
         (9223372036854775806, "i64") => "i64::MAX-1".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn min_bound_with_type(value: i128, ty: &str) -> String {
+    match (value, ty) {
+        (-2147483647, "i32") => "i32::MIN+1".to_string(),
+        (-9223372036854775807, "i64") => "i64::MIN+1".to_string(),
         _ => value.to_string(),
     }
 }
@@ -241,5 +337,45 @@ mod tests {
         let metadata = metadata("pub fn id_i32(x: i32) -> i32 { x }", &[]);
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_i32_sub_one_from_executable_precondition() {
+        let metadata = metadata("pub fn sub_one(x: i32) -> i32 { x - 1 }", &["x > i32::MIN"]);
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_i32_sub_one() {
+        let metadata = metadata("pub fn sub_one(x: i32) -> i32 { x - 1 }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerSubtractionOverflow {
+                function: "add_one".to_string(),
+                expression: "x - 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_usize_sub_one_from_executable_precondition() {
+        let metadata = metadata("pub fn pred(n: usize) -> usize { n - 1 }", &["n >= 1"]);
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_usize_sub_one() {
+        let metadata = metadata("pub fn pred(n: usize) -> usize { n - 1 }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerSubtractionOverflow {
+                function: "add_one".to_string(),
+                expression: "n - 1".to_string(),
+            })
+        );
     }
 }
