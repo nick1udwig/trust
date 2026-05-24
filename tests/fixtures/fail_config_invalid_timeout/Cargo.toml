@@ -1,0 +1,17 @@
+[package]
+name = "fail_config_invalid_timeout"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
+
+[package.metadata.trust]
+assertions = "always"
+solver = "mock"
+timeout_ms = "soon"

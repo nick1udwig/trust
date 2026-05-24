@@ -134,6 +134,37 @@ fn fail_executable_spec_quantifier_is_rejected() {
 }
 
 #[test]
+fn pass_missing_config_uses_defaults() {
+    run_fixture("pass_config_missing_defaults", Expected::Pass);
+}
+
+#[test]
+fn pass_assume_config_omits_runtime_precondition_assertion() {
+    run_fixture("pass_config_assume_no_runtime_assertion", Expected::Pass);
+}
+
+#[test]
+fn fail_invalid_assertion_policy_config_is_rejected() {
+    let output = run_fixture("fail_config_invalid_assertions", Expected::Fail);
+
+    output.assert_contains("error[trust]: invalid assertion policy `sometimes`");
+}
+
+#[test]
+fn fail_invalid_solver_config_is_rejected() {
+    let output = run_fixture("fail_config_invalid_solver", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported solver `bogus`");
+}
+
+#[test]
+fn fail_invalid_timeout_config_is_rejected() {
+    let output = run_fixture("fail_config_invalid_timeout", Expected::Fail);
+
+    output.assert_contains("error[trust]: invalid timeout_ms `\"soon\"`");
+}
+
+#[test]
 fn pass_cache_hit_reuses_proof_cache() {
     let suffix = std::process::id();
     let first_target = format!("pass_cache_hit_first_{suffix}");

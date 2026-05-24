@@ -775,6 +775,10 @@ fn render_function(total: &TotalExpansion) -> String {
     if total.fn_info.visibility != "public" || total.contracts.is_empty() {
         return total.fn_source.clone();
     }
+    let policy = assertion_policy();
+    if policy == "assume" {
+        return total.fn_source.clone();
+    }
 
     let Some(body_start) = total.fn_source.find('{') else {
         return total.fn_source.clone();
@@ -787,15 +791,21 @@ fn render_function(total: &TotalExpansion) -> String {
     let mut postcondition_assertions = String::new();
     for contract in &total.contracts {
         if contract.class == "given executable" {
-            precondition_assertions.push_str(&format!(
-                "::trust::__rt::assert_precondition(({}), {:?}, {:?});",
-                contract.expression_code, total.fn_info.name, contract.expression_display
+            precondition_assertions.push_str(&render_runtime_assertion(
+                &policy,
+                &format!(
+                    "::trust::__rt::assert_precondition(({}), {:?}, {:?});",
+                    contract.expression_code, total.fn_info.name, contract.expression_display
+                ),
             ));
         } else if contract.class == "gives executable" {
             let expression = replace_result_binder(&contract.expression_code);
-            postcondition_assertions.push_str(&format!(
-                "::trust::__rt::assert_postcondition(({}), {:?}, {:?});",
-                expression, total.fn_info.name, contract.expression_display
+            postcondition_assertions.push_str(&render_runtime_assertion(
+                &policy,
+                &format!(
+                    "::trust::__rt::assert_postcondition(({}), {:?}, {:?});",
+                    expression, total.fn_info.name, contract.expression_display
+                ),
             ));
         }
     }
@@ -814,6 +824,14 @@ fn render_function(total: &TotalExpansion) -> String {
     )
 }
 
+fn render_runtime_assertion(policy: &str, assertion: &str) -> String {
+    if policy == "debug" {
+        format!("if cfg!(debug_assertions) {{ {assertion} }};")
+    } else {
+        assertion.to_string()
+    }
+}
+
 fn metadata_json(
     fn_info: &FnInfo,
     source: &str,
@@ -822,12 +840,13 @@ fn metadata_json(
 ) -> String {
     let hash = short_hash(source);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"{assertion_policy}\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
         name = json_escape(&fn_info.name),
         hash = hash,
         visibility = fn_info.visibility,
+        assertion_policy = json_escape(&assertion_policy()),
         function_source = json_escape(function_source),
         contracts_original = json_string_array(
             contracts
@@ -1054,6 +1073,10 @@ fn write_metadata_sidecar(metadata: &str) -> Result<(), String> {
 fn wrapper_active() -> bool {
     env::var("TRUST_RUSTC_ACTIVE").as_deref() == Ok("1")
         || env::var("TRUST_MACRO_UNIT_TEST").is_ok()
+}
+
+fn assertion_policy() -> String {
+    env::var("TRUST_ASSERTION_POLICY").unwrap_or_else(|_| "always".to_string())
 }
 
 fn compile_error(message: &str) -> TokenStream {

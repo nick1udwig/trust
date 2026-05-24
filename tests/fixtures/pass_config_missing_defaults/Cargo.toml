@@ -1,0 +1,12 @@
+[package]
+name = "pass_config_missing_defaults"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }

@@ -23,12 +23,15 @@ fn run() -> Result<i32, String> {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let (rustc, rustc_args) = split_rustc_args(args);
     let metadata_path = metadata_path();
+    let config = TrustConfig::load()?;
 
     let status = Command::new(&rustc)
         .args(&rustc_args)
         .env("TRUST_RUSTC_ACTIVE", "1")
         .env("TRUST_RUSTC_VERSION", env!("CARGO_PKG_VERSION"))
         .env("TRUST_METADATA_OUT", &metadata_path)
+        .env("TRUST_ASSERTION_POLICY", &config.assertions)
+        .env("TRUST_SOLVER", &config.solver)
         .status()
         .map_err(|err| format!("failed to invoke rustc through trust-rustc: {err}"))?;
 
@@ -44,8 +47,8 @@ fn run() -> Result<i32, String> {
     let cache_stats = if totals == 0 {
         CacheStats { hits: 0, misses: 0 }
     } else {
-        let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args);
-        verify_metadata(&metadata, &cache_context)?
+        let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args, &config);
+        verify_metadata(&metadata, &cache_context, &config)?
     };
 
     if deterministic_test_mode() && totals > 0 {
@@ -72,6 +75,104 @@ struct CacheStats {
     misses: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustConfig {
+    assertions: String,
+    solver: String,
+    timeout_ms: u64,
+    cache: String,
+    fingerprint: String,
+}
+
+impl TrustConfig {
+    fn load() -> Result<Self, String> {
+        let mut config = Self {
+            assertions: "always".to_string(),
+            solver: env::var("TRUST_SOLVER").unwrap_or_else(|_| "mock".to_string()),
+            timeout_ms: 5000,
+            cache: "local".to_string(),
+            fingerprint: "missing-config".to_string(),
+        };
+
+        let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+            config.validate()?;
+            return Ok(config);
+        };
+        let manifest = manifest_dir.join("Cargo.toml");
+        let Ok(contents) = fs::read_to_string(&manifest) else {
+            config.validate()?;
+            return Ok(config);
+        };
+
+        let mut in_trust_section = false;
+        let mut trust_lines = Vec::new();
+        for raw_line in contents.lines() {
+            let line = raw_line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                in_trust_section = line == "[package.metadata.trust]";
+                continue;
+            }
+            if !in_trust_section {
+                continue;
+            }
+
+            trust_lines.push(line.to_string());
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(format!("invalid Trust config entry `{line}`"));
+            };
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "assertions" => config.assertions = parse_config_string(value, key)?,
+                "solver" => config.solver = parse_config_string(value, key)?,
+                "timeout_ms" => config.timeout_ms = parse_timeout_ms(value)?,
+                "cache" => config.cache = parse_config_string(value, key)?,
+                _ => {}
+            }
+        }
+
+        if !trust_lines.is_empty() {
+            config.fingerprint = trust_lines.join("\n");
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(self.assertions.as_str(), "always" | "debug" | "assume") {
+            return Err(format!("invalid assertion policy `{}`", self.assertions));
+        }
+        if self.solver != "mock" {
+            return Err(format!("unsupported solver `{}`", self.solver));
+        }
+        if self.timeout_ms == 0 {
+            return Err("invalid timeout_ms `0`".to_string());
+        }
+        if self.cache != "local" {
+            return Err(format!("unsupported cache mode `{}`", self.cache));
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_config_string(value: &str, key: &str) -> Result<String, String> {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .map(str::to_string)
+        .ok_or_else(|| format!("Trust config `{key}` must be a string"))
+}
+
+fn parse_timeout_ms(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid timeout_ms `{value}`"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheContext {
     rustc_version: String,
@@ -83,10 +184,11 @@ struct CacheContext {
     solver_name: String,
     solver_version: String,
     solver_options: String,
+    trust_config_fingerprint: String,
 }
 
 impl CacheContext {
-    fn from_rustc_args(rustc: &OsString, rustc_args: &[OsString]) -> Self {
+    fn from_rustc_args(rustc: &OsString, rustc_args: &[OsString], config: &TrustConfig) -> Self {
         let rustc_version = if deterministic_test_mode() {
             env::var("TRUST_TEST_RUSTC_VERSION").unwrap_or_else(|_| "rustc-test".to_string())
         } else {
@@ -128,10 +230,15 @@ impl CacheContext {
             endianness: target_cfg.endianness,
             target_features,
             cargo_features,
-            solver_name: env::var("TRUST_SOLVER").unwrap_or_else(|_| "mock".to_string()),
+            solver_name: config.solver.clone(),
             solver_version: env::var("TRUST_SOLVER_VERSION")
                 .unwrap_or_else(|_| "mock-v1".to_string()),
-            solver_options: env::var("TRUST_SOLVER_OPTIONS").unwrap_or_default(),
+            solver_options: format!(
+                "timeout_ms={};{}",
+                config.timeout_ms,
+                env::var("TRUST_SOLVER_OPTIONS").unwrap_or_default()
+            ),
+            trust_config_fingerprint: config.fingerprint.clone(),
         }
     }
 }
@@ -146,6 +253,7 @@ struct TargetCfg {
 fn verify_metadata(
     metadata: &[trust_core::metadata::TrustMetadata],
     cache_context: &CacheContext,
+    config: &TrustConfig,
 ) -> Result<CacheStats, String> {
     let totals = metadata
         .iter()
@@ -154,7 +262,7 @@ fn verify_metadata(
     if totals == 0 {
         return Ok(CacheStats { hits: 0, misses: 0 });
     }
-    check_mock_solver_status()?;
+    check_mock_solver_status(config)?;
 
     if let Some(cache_file) = cache_file(metadata, cache_context) {
         if matches!(
@@ -182,7 +290,14 @@ fn verify_metadata(
     })
 }
 
-fn check_mock_solver_status() -> Result<(), String> {
+fn check_mock_solver_status(config: &TrustConfig) -> Result<(), String> {
+    if config.solver != "mock" {
+        return Err(format!(
+            "solver `{}` is unavailable in Trust MVP",
+            config.solver
+        ));
+    }
+
     match env::var("TRUST_SOLVER_STATUS").as_deref() {
         Ok("proved") | Err(_) => Ok(()),
         Ok("counterexample") => Err("solver found counterexample".to_string()),
