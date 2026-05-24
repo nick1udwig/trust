@@ -492,6 +492,13 @@ fn fail_option_unwrap_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_explicit_panic_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_explicit_panic", Expected::Fail);
+
+    output.assert_contains("error[trust]: explicit panic is not supported in `fail`");
+}
+
+#[test]
 fn fail_missing_trust_model_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_missing_trust_model", Expected::Fail);
 

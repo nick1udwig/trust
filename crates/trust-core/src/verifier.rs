@@ -50,6 +50,9 @@ pub enum VerificationError {
         function: String,
         keyword: String,
     },
+    ExplicitPanic {
+        function: String,
+    },
     UncheckedUnwrap {
         function: String,
     },
@@ -127,6 +130,9 @@ impl fmt::Display for VerificationError {
                 f,
                 "`{keyword}` is not supported in loops in `{function}`"
             ),
+            VerificationError::ExplicitPanic { function } => {
+                write!(f, "explicit panic is not supported in `{function}`")
+            }
             VerificationError::UncheckedUnwrap { function: _ } => write!(
                 f,
                 "unchecked unwrap is not supported; prove Some or use match"
@@ -175,6 +181,11 @@ fn verify_total_with_env(
 
     if contains_unchecked_unwrap(body) {
         return Err(VerificationError::UncheckedUnwrap {
+            function: metadata.rust_function_path.clone(),
+        });
+    }
+    if contains_explicit_panic(body) {
+        return Err(VerificationError::ExplicitPanic {
             function: metadata.rust_function_path.clone(),
         });
     }
@@ -872,6 +883,15 @@ fn contains_unchecked_unwrap(body: &str) -> bool {
             return false;
         };
         dot == "." && unwrap == "unwrap" && open == "(" && close == ")"
+    })
+}
+
+fn contains_explicit_panic(body: &str) -> bool {
+    tokens(body).windows(3).any(|window| {
+        let [name, bang, open] = window else {
+            return false;
+        };
+        matches!(name.as_str(), "panic" | "todo" | "unimplemented") && bang == "!" && open == "("
     })
 }
 
@@ -1733,6 +1753,18 @@ mod tests {
             verify_total(&metadata),
             Err(VerificationError::UncheckedUnwrap {
                 function: "bad_unwrap".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_panic() {
+        let metadata = metadata_named("fail", "pub fn fail() -> i32 { panic!(\"boom\") }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::ExplicitPanic {
+                function: "fail".to_string(),
             })
         );
     }
