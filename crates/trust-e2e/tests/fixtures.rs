@@ -596,6 +596,41 @@ fn fail_result_expect_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_unknown_method_call_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_unknown_method_call", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported function call in `abs_value`: `x.abs`");
+}
+
+#[test]
+fn fail_trait_dispatch_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_trait_dispatch", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported function call in `display`: `x.to_string`");
+}
+
+#[test]
+fn fail_ordinary_call_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_ordinary_call", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported function call in `call_helper`: `helper`");
+}
+
+#[test]
+fn fail_closure_body_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_closure_body", Expected::Fail);
+
+    output.assert_contains("error[trust]: closures are not supported in `apply`");
+}
+
+#[test]
+fn fail_recursive_total_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_recursive_total", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported function call in `recurse`: `recurse`");
+}
+
+#[test]
 fn pass_result_match_builds() {
     let output = run_fixture("pass_result_match", Expected::Pass);
 

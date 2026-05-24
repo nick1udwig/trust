@@ -53,6 +53,13 @@ pub enum VerificationError {
         function: String,
         keyword: String,
     },
+    UnsupportedCall {
+        function: String,
+        callee: String,
+    },
+    UnsupportedClosure {
+        function: String,
+    },
     ExplicitPanic {
         function: String,
     },
@@ -143,6 +150,12 @@ impl fmt::Display for VerificationError {
                 f,
                 "`{keyword}` is not supported in loops in `{function}`"
             ),
+            VerificationError::UnsupportedCall { function, callee } => {
+                write!(f, "unsupported function call in `{function}`: `{callee}`")
+            }
+            VerificationError::UnsupportedClosure { function } => {
+                write!(f, "closures are not supported in `{function}`")
+            }
             VerificationError::ExplicitPanic { function } => {
                 write!(f, "explicit panic is not supported in `{function}`")
             }
@@ -231,6 +244,17 @@ fn verify_total_with_env(
     if contains_explicit_panic(body) {
         return Err(VerificationError::ExplicitPanic {
             function: metadata.rust_function_path.clone(),
+        });
+    }
+    if contains_closure(body) {
+        return Err(VerificationError::UnsupportedClosure {
+            function: metadata.rust_function_path.clone(),
+        });
+    }
+    if let Some(callee) = unsupported_call(body, &params, env, &metadata.rust_function_path) {
+        return Err(VerificationError::UnsupportedCall {
+            function: metadata.rust_function_path.clone(),
+            callee,
         });
     }
 
@@ -952,6 +976,91 @@ fn contains_explicit_panic(body: &str) -> bool {
         };
         matches!(name.as_str(), "panic" | "todo" | "unimplemented") && bang == "!" && open == "("
     })
+}
+
+fn contains_closure(body: &str) -> bool {
+    let tokens = tokens(body);
+    tokens.iter().enumerate().any(|(idx, token)| {
+        token == "|"
+            && (idx == 0
+                || tokens[idx - 1] == "="
+                || tokens[idx - 1] == "("
+                || tokens.get(idx + 1).is_some_and(|next| {
+                    next == "|" || is_ident(next) || matches!(next.as_str(), "mut" | "move" | "_")
+                }))
+    })
+}
+
+fn unsupported_call(
+    body: &str,
+    params: &[Param],
+    env: &[TrustFunctionSummary],
+    function: &str,
+) -> Option<String> {
+    let tokens = tokens(body);
+
+    for window in tokens.windows(4) {
+        let [base, dot, method, open] = window else {
+            continue;
+        };
+        if dot != "." || open != "(" || !is_ident(method) {
+            continue;
+        }
+        if method == "len" && is_read_only_slice_param(base, params) {
+            continue;
+        }
+
+        return Some(format!("{base}.{method}"));
+    }
+
+    for (idx, window) in tokens.windows(3).enumerate() {
+        let [name, bang, open] = window else {
+            continue;
+        };
+        if bang == "!" && matches!(open.as_str(), "(" | "[" | "{") {
+            if name == "loop_spec" {
+                continue;
+            }
+            return Some(format!("{name}!"));
+        }
+
+        if bang != "(" || !is_ident(name) {
+            continue;
+        }
+        if idx.checked_sub(1).is_some_and(|prev| tokens[prev] == ".") {
+            continue;
+        }
+        if allowed_builtin_call(name) {
+            continue;
+        }
+        if name == function {
+            return Some(name.clone());
+        }
+        if env.iter().any(|callee| callee.name == *name) {
+            continue;
+        }
+
+        return Some(name.clone());
+    }
+
+    None
+}
+
+fn allowed_builtin_call(name: &str) -> bool {
+    matches!(
+        name,
+        "Some"
+            | "None"
+            | "Ok"
+            | "Err"
+            | "if"
+            | "while"
+            | "match"
+            | "return"
+            | "invariant"
+            | "decreases"
+            | "assert"
+    )
 }
 
 fn contains_unsupported_proof_step(body: &str) -> bool {
@@ -2021,6 +2130,76 @@ mod tests {
             verify_total(&metadata),
             Err(VerificationError::UncheckedUnwrap {
                 function: "bad_expect".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ordinary_rust_call() {
+        let metadata = metadata_named(
+            "call_helper",
+            "pub fn call_helper(x: i32) -> i32 { helper(x) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedCall {
+                function: "call_helper".to_string(),
+                callee: "helper".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_method_call() {
+        let metadata = metadata_named("abs", "pub fn abs(x: i32) -> i32 { x.abs() }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedCall {
+                function: "abs".to_string(),
+                callee: "x.abs".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn allows_slice_len_method() {
+        let metadata = metadata_named("len", "pub fn len(xs: &[i32]) -> usize { xs.len() }", &[]);
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_closure_body() {
+        let metadata = metadata_named(
+            "apply",
+            "pub fn apply(x: i32) -> i32 { let inc = |n: i32| n + 1; inc(x) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedClosure {
+                function: "apply".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_recursive_total_call() {
+        let recurse = metadata_named(
+            "recurse",
+            "pub fn recurse(x: i32) -> i32 { recurse(x) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_totals(&[recurse]),
+            Err(VerificationError::UnsupportedCall {
+                function: "recurse".to_string(),
+                callee: "recurse".to_string(),
             })
         );
     }
