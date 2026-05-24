@@ -54,6 +54,14 @@ fn pass_usize_sub_one_precondition_proves_underflow_safety() {
 }
 
 #[test]
+fn pass_abs_nonmin_precondition_proves_negation_overflow_safety() {
+    let output = run_fixture("pass_abs_nonmin_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_missing_wrapper_requires_trust_rustc() {
     let output = run_fixture_without_wrapper("fail_missing_wrapper", Expected::Fail);
 
@@ -124,4 +132,11 @@ fn fail_usize_subtraction_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_usize_subtraction_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer subtraction cannot overflow");
+}
+
+#[test]
+fn fail_negation_unproved_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_negation_unproved", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer negation cannot overflow");
 }

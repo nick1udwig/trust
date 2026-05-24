@@ -11,6 +11,10 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    IntegerNegationOverflow {
+        function: String,
+        expression: String,
+    },
 }
 
 impl fmt::Display for VerificationError {
@@ -29,6 +33,13 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "could not prove integer subtraction cannot overflow in `{function}`: `{expression}`"
+            ),
+            VerificationError::IntegerNegationOverflow {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer negation cannot overflow in `{function}`: `{expression}`"
             ),
         }
     }
@@ -68,6 +79,15 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
         }
     }
 
+    for obligation in negation_obligations(body, &params) {
+        if !negation_obligation_proved(&obligation, &contracts) {
+            return Err(VerificationError::IntegerNegationOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -90,6 +110,13 @@ struct SubObligation {
     variable: String,
     ty: String,
     constant: i128,
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NegObligation {
+    variable: String,
+    ty: String,
     expression: String,
 }
 
@@ -182,6 +209,33 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
     obligations
 }
 
+fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
+    let tokens = tokens(body);
+    let mut obligations = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if token != "-" || idx + 1 >= tokens.len() {
+            continue;
+        }
+
+        let variable = &tokens[idx + 1];
+        let Some(param) = params.iter().find(|param| param.name == *variable) else {
+            continue;
+        };
+        if !is_signed_integer(&param.ty) || !looks_unary_minus(&tokens, idx) {
+            continue;
+        }
+
+        obligations.push(NegObligation {
+            variable: variable.clone(),
+            ty: param.ty.clone(),
+            expression: format!("-{variable}"),
+        });
+    }
+
+    obligations
+}
+
 fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
     let Some(max) = max_value(&obligation.ty) else {
         return false;
@@ -226,8 +280,30 @@ fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String
         .any(|contract| contract == &ge_required || contract == &ge_unqualified)
 }
 
+fn negation_obligation_proved(obligation: &NegObligation, contracts: &[String]) -> bool {
+    let Some(min) = min_value(&obligation.ty) else {
+        return false;
+    };
+    let required_bound = min + 1;
+    let gt_min = format!("{}>{}::MIN", obligation.variable, obligation.ty);
+    let ge_required = format!(
+        "{}>={}",
+        obligation.variable,
+        min_bound_with_type(required_bound, &obligation.ty)
+    );
+    let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
+
+    contracts.iter().any(|contract| {
+        contract == &gt_min || contract == &ge_required || contract == &ge_unqualified
+    })
+}
+
 fn is_supported_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64" | "usize")
+}
+
+fn is_signed_integer(ty: &str) -> bool {
+    matches!(ty, "i32" | "i64")
 }
 
 fn max_value(ty: &str) -> Option<i128> {
@@ -262,6 +338,18 @@ fn min_bound_with_type(value: i128, ty: &str) -> String {
         (-9223372036854775807, "i64") => "i64::MIN+1".to_string(),
         _ => value.to_string(),
     }
+}
+
+fn looks_unary_minus(tokens: &[String], minus_idx: usize) -> bool {
+    if minus_idx == 0 {
+        return true;
+    }
+
+    let previous = &tokens[minus_idx - 1];
+    matches!(
+        previous.as_str(),
+        "{" | "(" | "[" | "," | "return" | "=>" | "=" | "<" | ">" | "<=" | ">=" | "==" | "!="
+    )
 }
 
 fn normalize(input: &str) -> String {
@@ -299,11 +387,15 @@ mod tests {
     use super::*;
 
     fn metadata(function_source: &str, contracts: &[&str]) -> TrustMetadata {
+        metadata_named("add_one", function_source, contracts)
+    }
+
+    fn metadata_named(name: &str, function_source: &str, contracts: &[&str]) -> TrustMetadata {
         TrustMetadata {
             schema_version: 1,
             item_kind: "total".to_string(),
             item_id: "total:add_one:test".to_string(),
-            rust_function_path: "add_one".to_string(),
+            rust_function_path: name.to_string(),
             contracts_original: contracts
                 .iter()
                 .map(|contract| contract.to_string())
@@ -348,12 +440,12 @@ mod tests {
 
     #[test]
     fn rejects_unproved_i32_sub_one() {
-        let metadata = metadata("pub fn sub_one(x: i32) -> i32 { x - 1 }", &[]);
+        let metadata = metadata_named("sub_one", "pub fn sub_one(x: i32) -> i32 { x - 1 }", &[]);
 
         assert_eq!(
             verify_total(&metadata),
             Err(VerificationError::IntegerSubtractionOverflow {
-                function: "add_one".to_string(),
+                function: "sub_one".to_string(),
                 expression: "x - 1".to_string(),
             })
         );
@@ -368,13 +460,41 @@ mod tests {
 
     #[test]
     fn rejects_unproved_usize_sub_one() {
-        let metadata = metadata("pub fn pred(n: usize) -> usize { n - 1 }", &[]);
+        let metadata = metadata_named("pred", "pub fn pred(n: usize) -> usize { n - 1 }", &[]);
 
         assert_eq!(
             verify_total(&metadata),
             Err(VerificationError::IntegerSubtractionOverflow {
-                function: "add_one".to_string(),
+                function: "pred".to_string(),
                 expression: "n - 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_i32_negation_from_executable_precondition() {
+        let metadata = metadata_named(
+            "abs_nonmin",
+            "pub fn abs_nonmin(x: i32) -> i32 { if x < 0 { -x } else { x } }",
+            &["x > i32::MIN"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_i32_negation() {
+        let metadata = metadata_named(
+            "abs_nonmin",
+            "pub fn abs_nonmin(x: i32) -> i32 { if x < 0 { -x } else { x } }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerNegationOverflow {
+                function: "abs_nonmin".to_string(),
+                expression: "-x".to_string(),
             })
         );
     }
