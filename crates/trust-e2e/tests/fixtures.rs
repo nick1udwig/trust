@@ -1,4 +1,6 @@
-use trust_test_support::{run_fixture, run_fixture_without_wrapper, Expected};
+use trust_test_support::{
+    run_fixture, run_fixture_with_cache, run_fixture_without_wrapper, Expected,
+};
 
 #[test]
 fn pass_no_trust_builds_through_wrapper() {
@@ -72,6 +74,25 @@ fn pass_loop_countdown_proves_decreases() {
 
     output.assert_contains("trust: discovered 1 total function");
     output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_cache_hit_reuses_proof_cache() {
+    let suffix = std::process::id();
+    let first_target = format!("pass_cache_hit_first_{suffix}");
+    let second_target = format!("pass_cache_hit_second_{suffix}");
+    let cache_name = format!("pass_cache_hit_shared_{suffix}");
+    let first =
+        run_fixture_with_cache("pass_cache_hit", Expected::Pass, &first_target, &cache_name);
+    let second = run_fixture_with_cache(
+        "pass_cache_hit",
+        Expected::Pass,
+        &second_target,
+        &cache_name,
+    );
+
+    first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    second.assert_contains("trust: verified 1 function; cache hits 1; cache misses 0");
 }
 
 #[test]

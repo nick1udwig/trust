@@ -1,6 +1,9 @@
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{self, Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +37,7 @@ fn run() -> Result<i32, String> {
     }
 
     let metadata = read_metadata(&metadata_path)?;
-    verify_metadata(&metadata)?;
+    let cache_stats = verify_metadata(&metadata)?;
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -46,14 +49,57 @@ fn run() -> Result<i32, String> {
             plural(totals)
         );
         eprintln!("trust: proved {totals} total function{}", plural(totals));
+        eprintln!(
+            "trust: verified {totals} function{}; cache hits {}; cache misses {}",
+            plural(totals),
+            cache_stats.hits,
+            cache_stats.misses
+        );
     }
 
     let _ = fs::remove_file(&metadata_path);
     Ok(exit_code(status))
 }
 
-fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<(), String> {
-    verify_totals(metadata).map_err(|err| err.to_string())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheStats {
+    hits: usize,
+    misses: usize,
+}
+
+fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<CacheStats, String> {
+    let totals = metadata
+        .iter()
+        .filter(|item| item.item_kind == "total")
+        .count();
+    if totals == 0 {
+        return Ok(CacheStats { hits: 0, misses: 0 });
+    }
+
+    if let Some(cache_file) = cache_file(metadata) {
+        if matches!(
+            fs::read_to_string(&cache_file),
+            Ok(contents) if contents == "status=proved\n"
+        ) {
+            return Ok(CacheStats {
+                hits: totals,
+                misses: 0,
+            });
+        }
+
+        verify_totals(metadata).map_err(|err| err.to_string())?;
+        write_cache_entry(&cache_file)?;
+        return Ok(CacheStats {
+            hits: 0,
+            misses: totals,
+        });
+    }
+
+    verify_totals(metadata).map_err(|err| err.to_string())?;
+    Ok(CacheStats {
+        hits: 0,
+        misses: totals,
+    })
 }
 
 fn split_rustc_args(args: Vec<OsString>) -> (OsString, Vec<OsString>) {
@@ -115,6 +161,46 @@ fn metadata_path() -> PathBuf {
 
 fn deterministic_test_mode() -> bool {
     env::var("TRUST_TEST_DETERMINISTIC").as_deref() == Ok("1")
+}
+
+fn cache_file(metadata: &[trust_core::metadata::TrustMetadata]) -> Option<PathBuf> {
+    let cache_dir = env::var_os("TRUST_CACHE_DIR").map(PathBuf::from)?;
+    let mut hasher = DefaultHasher::new();
+    "trust-proof-cache-v1".hash(&mut hasher);
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    env::var("TRUST_SOLVER")
+        .unwrap_or_else(|_| "mock".to_string())
+        .hash(&mut hasher);
+    for item in metadata {
+        item.schema_version.hash(&mut hasher);
+        item.item_kind.hash(&mut hasher);
+        item.item_id.hash(&mut hasher);
+        item.rust_function_path.hash(&mut hasher);
+        item.contracts_original.hash(&mut hasher);
+        item.contract_classes.hash(&mut hasher);
+        item.function_source.hash(&mut hasher);
+    }
+
+    Some(cache_dir.join(format!("{:016x}.proof", hasher.finish())))
+}
+
+fn write_cache_entry(cache_file: &PathBuf) -> Result<(), String> {
+    if let Some(parent) = cache_file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create Trust cache directory: {err}"))?;
+    }
+
+    let temp_file = cache_file.with_extension(format!("{}.tmp", process::id()));
+    {
+        let mut file = fs::File::create(&temp_file)
+            .map_err(|err| format!("failed to write Trust cache entry: {err}"))?;
+        file.write_all(b"status=proved\n")
+            .map_err(|err| format!("failed to write Trust cache entry: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("failed to persist Trust cache entry: {err}"))?;
+    }
+    fs::rename(&temp_file, cache_file)
+        .map_err(|err| format!("failed to install Trust cache entry: {err}"))
 }
 
 fn plural(count: usize) -> &'static str {

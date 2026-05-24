@@ -32,21 +32,37 @@ impl FixtureOutput {
 
 pub fn run_fixture(name: &str, expected: Expected) -> FixtureOutput {
     let wrapper = build_trust_rustc();
-    run_fixture_inner(name, expected, Some(&wrapper))
+    run_fixture_inner(name, expected, Some(&wrapper), name, name)
+}
+
+pub fn run_fixture_with_cache(
+    name: &str,
+    expected: Expected,
+    target_name: &str,
+    cache_name: &str,
+) -> FixtureOutput {
+    let wrapper = build_trust_rustc();
+    run_fixture_inner(name, expected, Some(&wrapper), target_name, cache_name)
 }
 
 pub fn run_fixture_without_wrapper(name: &str, expected: Expected) -> FixtureOutput {
-    run_fixture_inner(name, expected, None)
+    run_fixture_inner(name, expected, None, name, name)
 }
 
-fn run_fixture_inner(name: &str, expected: Expected, wrapper: Option<&Path>) -> FixtureOutput {
+fn run_fixture_inner(
+    name: &str,
+    expected: Expected,
+    wrapper: Option<&Path>,
+    target_name: &str,
+    cache_name: &str,
+) -> FixtureOutput {
     let root = workspace_root();
     let manifest = root
         .join("tests")
         .join("fixtures")
         .join(name)
         .join("Cargo.toml");
-    let target_dir = root.join("target").join("fixtures").join(name);
+    let target_dir = root.join("target").join("fixtures").join(target_name);
 
     let mut command = Command::new(cargo());
     command
@@ -60,7 +76,9 @@ fn run_fixture_inner(name: &str, expected: Expected, wrapper: Option<&Path>) -> 
         .env("TRUST_SOLVER", "mock")
         .env(
             "TRUST_CACHE_DIR",
-            root.join("target").join("trust-cache-tests").join(name),
+            root.join("target")
+                .join("trust-cache-tests")
+                .join(cache_name),
         )
         .env_remove("TRUST_MACRO_UNIT_TEST")
         .env_remove("TRUST_RUSTC_ACTIVE")
