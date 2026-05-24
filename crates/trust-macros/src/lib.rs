@@ -65,10 +65,57 @@ pub fn total(input: TokenStream) -> TokenStream {
     })
 }
 
+#[proc_macro_derive(TrustModel)]
+pub fn derive_trust_model(input: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+
+    let source = input.to_string();
+    let model = match parse_trust_model_source(&source) {
+        Ok(model) => model,
+        Err(message) => return compile_error(message),
+    };
+    let metadata = model_metadata_json(&model, &source);
+    if let Err(err) = write_metadata_sidecar(&metadata) {
+        return compile_error(&format!(
+            "error[trust]: failed to write Trust metadata: {err}"
+        ));
+    }
+
+    let const_name = format!(
+        "__TRUST_MODEL_META_{}_{}",
+        sanitize_ident(&model.name),
+        short_hash(&source)
+    );
+    let name = &model.name;
+    let expanded = format!(
+        r###"
+        impl ::trust::TrustModel for {name} {{}}
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const {const_name}: &str = r##"{metadata}"##;
+        "###,
+        name = name,
+        const_name = const_name,
+        metadata = metadata
+    );
+
+    expanded.parse().unwrap_or_else(|_| {
+        compile_error("error[trust]: failed to generate Rust for #[derive(TrustModel)]")
+    })
+}
+
 #[derive(Debug)]
 struct FnInfo {
     name: String,
     visibility: &'static str,
+}
+
+#[derive(Debug)]
+struct ModelInfo {
+    name: String,
 }
 
 #[derive(Debug)]
@@ -208,6 +255,29 @@ fn inspect_total_fn(input: &str) -> Result<FnInfo, &'static str> {
     };
 
     Ok(FnInfo { name, visibility })
+}
+
+fn parse_trust_model_source(source: &str) -> Result<ModelInfo, &'static str> {
+    let tokens = lex(source);
+    let Some(struct_idx) = tokens
+        .iter()
+        .position(|token| matches!(token, LexToken::Ident(ident) if ident == "struct"))
+    else {
+        return Err("error[trust]: TrustModel derive supports simple structs in this MVP");
+    };
+
+    let name = match tokens.get(struct_idx + 1) {
+        Some(LexToken::Ident(ident)) => ident.to_string(),
+        _ => return Err("error[trust]: TrustModel derive could not read type name"),
+    };
+    if matches!(tokens.get(struct_idx + 2), Some(LexToken::Punct('<'))) {
+        return Err("error[trust]: generic TrustModel types are not supported in MVP");
+    }
+    if !has_body_group(&tokens) {
+        return Err("error[trust]: TrustModel derive requires a braced struct body");
+    }
+
+    Ok(ModelInfo { name })
 }
 
 fn inspect_module(input: &str) -> Result<(), &'static str> {
@@ -398,6 +468,18 @@ fn metadata_json(
                 .map(|contract| contract.expression_display.as_str())
         ),
         contract_classes = json_string_array(contracts.iter().map(|contract| contract.class)),
+    )
+}
+
+fn model_metadata_json(model: &ModelInfo, source: &str) -> String {
+    let hash = short_hash(source);
+    format!(
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"model:{name}:{hash}\",\"item_kind\":\"trust_model\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"unknown\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        schema = SCHEMA_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
+        name = json_escape(&model.name),
+        hash = hash,
+        source = json_escape(source),
     )
 }
 
@@ -636,6 +718,30 @@ mod tests {
         assert_eq!(
             err,
             "error[trust]: unverified Rust functions are not allowed inside #[trust::module] in the MVP"
+        );
+    }
+
+    #[test]
+    fn trust_model_derive_accepts_simple_struct() {
+        let model =
+            parse_trust_model_source("pub struct Account { pub id: u64, pub balance: i64 }")
+                .unwrap();
+
+        assert_eq!(model.name, "Account");
+        assert!(model_metadata_json(
+            &model,
+            "pub struct Account { pub id: u64, pub balance: i64 }"
+        )
+        .contains("\"item_kind\":\"trust_model\""));
+    }
+
+    #[test]
+    fn trust_model_derive_rejects_generic_struct() {
+        let err = parse_trust_model_source("pub struct Boxed<T> { pub value: T }").unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: generic TrustModel types are not supported in MVP"
         );
     }
 

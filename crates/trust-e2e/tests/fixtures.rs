@@ -54,6 +54,14 @@ fn pass_callee_precondition_proves_trust_to_trust_call() {
 }
 
 #[test]
+fn pass_trust_model_struct_allows_field_reasoning() {
+    let output = run_fixture("pass_trust_model_struct", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_add_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_add_one_precondition", Expected::Pass);
 
@@ -181,6 +189,15 @@ fn fail_callee_precondition_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_callee_precondition", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove callee precondition");
+}
+
+#[test]
+fn fail_missing_trust_model_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_missing_trust_model", Expected::Fail);
+
+    output.assert_contains(
+        "error[trust]: type Account must derive TrustModel before Trust may reason about its fields",
+    );
 }
 
 #[test]

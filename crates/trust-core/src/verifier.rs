@@ -28,6 +28,10 @@ pub enum VerificationError {
         callee: String,
         condition: String,
     },
+    MissingTrustModel {
+        function: String,
+        ty: String,
+    },
     PostconditionUnproved {
         function: String,
         condition: String,
@@ -80,6 +84,10 @@ impl fmt::Display for VerificationError {
                 f,
                 "could not prove callee precondition in `{function}` for `{callee}`: `{condition}`"
             ),
+            VerificationError::MissingTrustModel { function: _, ty } => write!(
+                f,
+                "type {ty} must derive TrustModel before Trust may reason about its fields"
+            ),
             VerificationError::PostconditionUnproved {
                 function,
                 condition,
@@ -91,13 +99,14 @@ impl fmt::Display for VerificationError {
 impl std::error::Error for VerificationError {}
 
 pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
-    verify_total_with_env(metadata, &[])
+    verify_total_with_env(metadata, &[], &[])
 }
 
 pub fn verify_totals(metadata: &[TrustMetadata]) -> Result<(), VerificationError> {
     let env = function_env(metadata);
+    let model_types = model_env(metadata);
     for item in metadata {
-        verify_total_with_env(item, &env)?;
+        verify_total_with_env(item, &env, &model_types)?;
     }
 
     Ok(())
@@ -106,6 +115,7 @@ pub fn verify_totals(metadata: &[TrustMetadata]) -> Result<(), VerificationError
 fn verify_total_with_env(
     metadata: &TrustMetadata,
     env: &[TrustFunctionSummary],
+    model_types: &[String],
 ) -> Result<(), VerificationError> {
     if metadata.item_kind != "total" {
         return Ok(());
@@ -116,6 +126,18 @@ fn verify_total_with_env(
     let given_contracts = given_preconditions(metadata);
     let params = parse_params(&source);
     let body = body(&source);
+
+    for obligation in field_access_obligations(body, &params) {
+        if !model_types
+            .iter()
+            .any(|model_type| model_type == &type_name_tail(&obligation.ty))
+        {
+            return Err(VerificationError::MissingTrustModel {
+                function: metadata.rust_function_path.clone(),
+                ty: obligation.ty,
+            });
+        }
+    }
 
     for obligation in addition_obligations(body, &params) {
         if !addition_obligation_proved(&obligation, &contracts) {
@@ -247,6 +269,11 @@ struct CallObligation {
     condition: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldAccessObligation {
+    ty: String,
+}
+
 fn function_env(metadata: &[TrustMetadata]) -> Vec<TrustFunctionSummary> {
     metadata
         .iter()
@@ -259,6 +286,14 @@ fn function_env(metadata: &[TrustMetadata]) -> Vec<TrustFunctionSummary> {
                 preconditions: given_preconditions(item),
             }
         })
+        .collect()
+}
+
+fn model_env(metadata: &[TrustMetadata]) -> Vec<String> {
+    metadata
+        .iter()
+        .filter(|item| item.item_kind == "trust_model")
+        .map(|item| item.rust_function_path.clone())
         .collect()
 }
 
@@ -501,6 +536,32 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
     obligations
 }
 
+fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObligation> {
+    let tokens = tokens(body);
+    let mut obligations = Vec::new();
+
+    for (idx, window) in tokens.windows(3).enumerate() {
+        let [base, dot, field] = window else {
+            continue;
+        };
+        if dot != "." || !is_ident(field) {
+            continue;
+        }
+        if tokens.get(idx + 3).is_some_and(|token| token == "(") {
+            continue;
+        }
+
+        let Some(param) = params.iter().find(|param| param.name == *base) else {
+            continue;
+        };
+        obligations.push(FieldAccessObligation {
+            ty: param.ty.clone(),
+        });
+    }
+
+    obligations
+}
+
 fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
     let tokens = tokens(body);
     let mut obligations = Vec::new();
@@ -685,6 +746,20 @@ fn is_read_only_slice_param(name: &str, params: &[Param]) -> bool {
     params
         .iter()
         .any(|param| param.name == name && param.ty.starts_with("&[") && param.ty.ends_with(']'))
+}
+
+fn type_name_tail(ty: &str) -> String {
+    ty.rsplit("::").next().unwrap_or(ty).to_string()
+}
+
+fn is_ident(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn constant_with_type(value: i128, ty: &str) -> String {
@@ -911,6 +986,18 @@ mod tests {
         }
     }
 
+    fn model_metadata(name: &str) -> TrustMetadata {
+        TrustMetadata {
+            schema_version: 1,
+            item_kind: "trust_model".to_string(),
+            item_id: format!("model:{name}:test"),
+            rust_function_path: name.to_string(),
+            contracts_original: Vec::new(),
+            contract_classes: Vec::new(),
+            function_source: format!("pub struct {name} {{ pub balance: i64 }}"),
+        }
+    }
+
     #[test]
     fn proves_i32_add_one_from_executable_precondition() {
         let metadata = metadata("pub fn add_one(x: i32) -> i32 { x + 1 }", &["x < i32::MAX"]);
@@ -1111,6 +1198,35 @@ mod tests {
                 function: "bad_first".to_string(),
                 callee: "get".to_string(),
                 condition: "0<xs.len()".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_field_access_for_trust_model_type() {
+        let account = model_metadata("Account");
+        let balance = metadata_named(
+            "balance",
+            "pub fn balance(acct: Account) -> i64 { acct.balance }",
+            &[],
+        );
+
+        assert_eq!(verify_totals(&[account, balance]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_field_access_without_trust_model_type() {
+        let balance = metadata_named(
+            "balance",
+            "pub fn balance(acct: Account) -> i64 { acct.balance }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_totals(&[balance]),
+            Err(VerificationError::MissingTrustModel {
+                function: "balance".to_string(),
+                ty: "Account".to_string(),
             })
         );
     }
