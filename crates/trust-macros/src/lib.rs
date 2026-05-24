@@ -100,6 +100,90 @@ pub fn trusted_model(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn spec(input: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+
+    let source = input.to_string();
+    let spec = match parse_spec_source(&source) {
+        Ok(spec) => spec,
+        Err(message) => return compile_error(message),
+    };
+    let metadata = spec_metadata_json(&spec, &source);
+    if let Err(err) = write_metadata_sidecar(&metadata) {
+        return compile_error(&format!(
+            "error[trust]: failed to write Trust metadata: {err}"
+        ));
+    }
+
+    let const_name = format!(
+        "__TRUST_SPEC_META_{}_{}",
+        sanitize_ident(&spec.fn_info.name),
+        short_hash(&source)
+    );
+    let runtime_item = if spec.kind == "executable" {
+        spec.fn_source.as_str()
+    } else {
+        ""
+    };
+    let expanded = format!(
+        r###"
+        {runtime_item}
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const {const_name}: &str = r##"{metadata}"##;
+        "###,
+        runtime_item = runtime_item,
+        const_name = const_name,
+        metadata = metadata
+    );
+
+    expanded
+        .parse()
+        .unwrap_or_else(|_| compile_error("error[trust]: failed to generate Rust for trust::spec!"))
+}
+
+#[proc_macro]
+pub fn proof(input: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+
+    let source = input.to_string();
+    let proof = match parse_proof_source(&source) {
+        Ok(proof) => proof,
+        Err(message) => return compile_error(message),
+    };
+    let metadata = proof_metadata_json(&proof, &source);
+    if let Err(err) = write_metadata_sidecar(&metadata) {
+        return compile_error(&format!(
+            "error[trust]: failed to write Trust metadata: {err}"
+        ));
+    }
+
+    let const_name = format!(
+        "__TRUST_PROOF_META_{}_{}",
+        sanitize_ident(&proof.fn_info.name),
+        short_hash(&source)
+    );
+    let expanded = format!(
+        r###"
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const {const_name}: &str = r##"{metadata}"##;
+        "###,
+        const_name = const_name,
+        metadata = metadata
+    );
+
+    expanded.parse().unwrap_or_else(|_| {
+        compile_error("error[trust]: failed to generate Rust for trust::proof!")
+    })
+}
+
+#[proc_macro]
 pub fn loop_spec(input: TokenStream) -> TokenStream {
     if !wrapper_active() {
         return compile_error("error[trust]: Trust verification requires trust-rustc");
@@ -172,10 +256,142 @@ struct TotalExpansion {
 }
 
 #[derive(Debug)]
+struct SpecExpansion {
+    kind: &'static str,
+    fn_source: String,
+    fn_info: FnInfo,
+}
+
+#[derive(Debug)]
+struct ProofExpansion {
+    fn_info: FnInfo,
+    contracts: Vec<Contract>,
+}
+
+#[derive(Debug)]
 struct Contract {
     class: &'static str,
     expression_code: String,
     expression_display: String,
+}
+
+fn parse_spec_source(source: &str) -> Result<SpecExpansion, &'static str> {
+    let rest = source.trim();
+    let (kind, fn_source) = if let Some(after_executable) = strip_keyword(rest, "executable") {
+        ("executable", after_executable.trim_start())
+    } else if let Some(after_ghost) = strip_keyword(rest, "ghost") {
+        ("ghost", after_ghost.trim_start())
+    } else {
+        return Err("error[trust]: trust::spec! must be `executable fn` or `ghost fn`");
+    };
+
+    let fn_info = inspect_spec_fn(fn_source)?;
+    if kind == "executable" {
+        validate_executable_spec_body(fn_source)?;
+    }
+
+    Ok(SpecExpansion {
+        kind,
+        fn_source: fn_source.to_string(),
+        fn_info,
+    })
+}
+
+fn parse_proof_source(source: &str) -> Result<ProofExpansion, &'static str> {
+    let source = source.trim();
+    let tokens = lex(source);
+    let Some(fn_idx) = tokens
+        .iter()
+        .position(|token| matches!(token, LexToken::Ident(ident) if ident == "fn"))
+    else {
+        return Err("error[trust]: trust::proof! requires a proof function");
+    };
+    if has_ident_before(&tokens, fn_idx, "pub") {
+        return Err("error[trust]: proof functions are erased and cannot be public Rust APIs");
+    }
+    if has_ident_before(&tokens, fn_idx, "async") {
+        return Err("error[trust]: async proof functions are not supported in Trust MVP");
+    }
+    if has_ident_before(&tokens, fn_idx, "unsafe") {
+        return Err("error[trust]: unsafe proof functions are not supported in Trust MVP");
+    }
+    if has_ident_before(&tokens, fn_idx, "extern") {
+        return Err("error[trust]: extern proof functions are not supported in Trust MVP");
+    }
+    if matches!(tokens.get(fn_idx + 2), Some(LexToken::Punct('<'))) {
+        return Err("error[trust]: generic proof functions are not supported in MVP");
+    }
+
+    let name = match tokens.get(fn_idx + 1) {
+        Some(LexToken::Ident(ident)) => ident.to_string(),
+        _ => return Err("error[trust]: trust::proof! could not read function name"),
+    };
+    let Some(after_signature) = after_proof_signature(source) else {
+        return Err("error[trust]: trust::proof! requires a parameter list");
+    };
+
+    let mut rest = after_signature.trim_start();
+    let mut contracts = Vec::new();
+    while !rest.is_empty() && !rest.starts_with('{') {
+        if let Some(after_given) = strip_keyword(rest, "given") {
+            let (class, after_kind) = proof_contract_kind(after_given, "given")?;
+            let Some((block, after_block)) = extract_braced(after_kind.trim_start()) else {
+                return Err("error[trust]: `given` requires a braced contract block");
+            };
+            for expression in split_contract_expressions(block) {
+                if class == "given executable" {
+                    validate_executable_contract(&expression)?;
+                }
+                contracts.push(Contract {
+                    class,
+                    expression_display: normalize_contract_display(&expression),
+                    expression_code: expression,
+                });
+            }
+            rest = after_block.trim_start();
+            continue;
+        }
+
+        if let Some(after_gives) = strip_keyword(rest, "gives") {
+            let (class, after_kind) = proof_contract_kind(after_gives, "gives")?;
+            let Some((block, after_block)) = extract_braced(after_kind.trim_start()) else {
+                return Err("error[trust]: `gives` requires a braced contract block");
+            };
+            for expression in split_contract_expressions(block) {
+                contracts.push(Contract {
+                    class,
+                    expression_display: normalize_contract_display(&expression),
+                    expression_code: expression,
+                });
+            }
+            rest = after_block.trim_start();
+            continue;
+        }
+
+        return Err("error[trust]: proof contracts must be `given` or `gives` blocks");
+    }
+
+    let Some((body, after_body)) = extract_braced(rest) else {
+        return Err("error[trust]: trust::proof! requires a proof body");
+    };
+    if !after_body.trim().is_empty() {
+        return Err("error[trust]: unexpected tokens after proof body");
+    }
+    if body.trim().is_empty()
+        && contracts
+            .iter()
+            .any(|contract| contract.class.starts_with("gives"))
+    {
+        return Err("error[trust]: empty proof body cannot prove a nontrivial lemma");
+    }
+
+    Ok(ProofExpansion {
+        fn_info: FnInfo {
+            name,
+            visibility: "private",
+        },
+        contracts,
+    })
 }
 
 fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
@@ -303,6 +519,113 @@ fn inspect_total_fn(input: &str) -> Result<FnInfo, &'static str> {
     Ok(FnInfo { name, visibility })
 }
 
+fn inspect_spec_fn(input: &str) -> Result<FnInfo, &'static str> {
+    let tokens = lex(input);
+    let mut fn_positions = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if matches!(token, LexToken::Ident(ident) if ident == "fn") {
+            fn_positions.push(idx);
+        }
+    }
+
+    match fn_positions.len() {
+        0 => return Err("error[trust]: trust::spec! requires exactly one Rust fn item"),
+        1 => {}
+        _ => return Err("error[trust]: trust::spec! accepts exactly one Rust fn item"),
+    }
+
+    let fn_idx = fn_positions[0];
+    let name = match tokens.get(fn_idx + 1) {
+        Some(LexToken::Ident(ident)) => ident.to_string(),
+        _ => return Err("error[trust]: trust::spec! could not read function name"),
+    };
+
+    if has_ident_before(&tokens, fn_idx, "async") {
+        return Err("error[trust]: async spec functions are not supported in Trust MVP");
+    }
+    if has_ident_before(&tokens, fn_idx, "unsafe") {
+        return Err("error[trust]: unsafe spec functions are not supported in Trust MVP");
+    }
+    if has_ident_before(&tokens, fn_idx, "extern") {
+        return Err("error[trust]: extern spec functions are not supported in Trust MVP");
+    }
+    if matches!(tokens.get(fn_idx + 2), Some(LexToken::Punct('<'))) {
+        return Err("error[trust]: generic spec functions are not supported in MVP");
+    }
+    if !has_body_group(&tokens) {
+        return Err("error[trust]: trust::spec! requires a function body");
+    }
+
+    let visibility = if matches!(tokens.first(), Some(LexToken::Ident(ident)) if ident == "pub") {
+        "public"
+    } else {
+        "private"
+    };
+
+    Ok(FnInfo { name, visibility })
+}
+
+fn validate_executable_spec_body(fn_source: &str) -> Result<(), &'static str> {
+    let Some((body, _after_body)) = extract_fn_body(fn_source) else {
+        return Err("error[trust]: trust::spec! requires a function body");
+    };
+    if body.trim().is_empty() {
+        return Err("error[trust]: executable spec function requires a body expression");
+    }
+
+    validate_executable_contract(body.trim())
+}
+
+fn after_proof_signature(source: &str) -> Option<&str> {
+    let fn_pos = source.find("fn")?;
+    let after_fn = &source[fn_pos + "fn".len()..];
+    let open_offset = after_fn.find('(')?;
+    let after_open_start = fn_pos + "fn".len() + open_offset;
+    let mut depth = 0usize;
+    for (idx, ch) in source[after_open_start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[after_open_start + idx + ch.len_utf8()..]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn proof_contract_kind<'a>(
+    input: &'a str,
+    keyword: &str,
+) -> Result<(&'static str, &'a str), &'static str> {
+    if let Some(after_executable) = strip_keyword(input, "executable") {
+        Ok((
+            if keyword == "given" {
+                "given executable"
+            } else {
+                "gives executable"
+            },
+            after_executable,
+        ))
+    } else if let Some(after_ghost) = strip_keyword(input, "ghost") {
+        Ok((
+            if keyword == "given" {
+                "given ghost"
+            } else {
+                "gives ghost"
+            },
+            after_ghost,
+        ))
+    } else {
+        Err("error[trust]: proof contracts must be executable or ghost")
+    }
+}
+
 fn parse_trust_model_source(source: &str) -> Result<ModelInfo, &'static str> {
     let tokens = lex(source);
     let Some(struct_idx) = tokens
@@ -340,7 +663,10 @@ fn inspect_module(input: &str) -> Result<(), &'static str> {
 
     while idx < tokens.len() && depth > 0 {
         match &tokens[idx] {
-            LexToken::Ident(ident) if depth == 1 && ident == "total" => {
+            LexToken::Ident(ident)
+                if depth == 1
+                    && matches!(ident.as_str(), "total" | "spec" | "proof" | "trusted_model") =>
+            {
                 idx = skip_macro_invocation_group(&tokens, idx);
             }
             LexToken::Ident(ident) if depth == 1 && ident == "unsafe" => {
@@ -540,6 +866,45 @@ fn trusted_model_metadata_json(source: &str) -> String {
     )
 }
 
+fn spec_metadata_json(spec: &SpecExpansion, source: &str) -> String {
+    let hash = short_hash(source);
+    format!(
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"spec:{kind}:{name}:{hash}\",\"item_kind\":\"spec\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        schema = SCHEMA_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
+        kind = spec.kind,
+        name = json_escape(&spec.fn_info.name),
+        hash = hash,
+        visibility = spec.fn_info.visibility,
+        function_source = json_escape(&spec.fn_source),
+    )
+}
+
+fn proof_metadata_json(proof: &ProofExpansion, source: &str) -> String {
+    let hash = short_hash(source);
+    format!(
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"proof:{name}:{hash}\",\"item_kind\":\"proof\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"private\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        schema = SCHEMA_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
+        name = json_escape(&proof.fn_info.name),
+        hash = hash,
+        source = json_escape(source),
+        contracts_original = json_string_array(
+            proof
+                .contracts
+                .iter()
+                .map(|contract| contract.expression_display.as_str())
+        ),
+        contracts_normalized = json_string_array(
+            proof
+                .contracts
+                .iter()
+                .map(|contract| contract.expression_display.as_str())
+        ),
+        contract_classes = json_string_array(proof.contracts.iter().map(|contract| contract.class)),
+    )
+}
+
 fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     let input = input.trim_start();
     let rest = input.strip_prefix(keyword)?;
@@ -578,6 +943,11 @@ fn extract_braced(input: &str) -> Option<(&str, &str)> {
     }
 
     None
+}
+
+fn extract_fn_body(input: &str) -> Option<(&str, &str)> {
+    let body_start = input.find('{')?;
+    extract_braced(&input[body_start..])
 }
 
 fn extract_pipe_binder(input: &str) -> Option<(&str, &str)> {
@@ -808,6 +1178,73 @@ mod tests {
 
         assert!(metadata.contains("\"item_kind\":\"trusted_model_stub\""));
         assert!(metadata.contains("\"contracts_original\":[]"));
+    }
+
+    #[test]
+    fn spec_parses_executable_function_and_metadata() {
+        let spec =
+            parse_spec_source("executable fn nonempty(xs: &[i32]) -> bool { xs . len() > 0 }")
+                .unwrap();
+
+        assert_eq!(spec.kind, "executable");
+        assert_eq!(spec.fn_info.name, "nonempty");
+        assert!(spec_metadata_json(
+            &spec,
+            "executable fn nonempty(xs: &[i32]) -> bool { xs . len() > 0 }"
+        )
+        .contains("\"item_kind\":\"spec\""));
+    }
+
+    #[test]
+    fn executable_spec_rejects_quantifier() {
+        let err =
+            parse_spec_source("executable fn bad(xs: &[i32]) -> bool { forall(|i: usize| i > 0) }")
+                .unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: quantifiers are not supported in executable preconditions"
+        );
+    }
+
+    #[test]
+    fn proof_metadata_is_erased_and_keeps_contracts() {
+        let proof = parse_proof_source(
+            "fn le_trans(a: i32, b: i32, c: i32) given ghost { a <= b; b <= c; } gives ghost { a <= c; } { assert(a <= c); }",
+        )
+        .unwrap();
+        let metadata = proof_metadata_json(
+            &proof,
+            "fn le_trans(a: i32, b: i32, c: i32) given ghost { a <= b; b <= c; } gives ghost { a <= c; } { assert(a <= c); }",
+        );
+
+        assert_eq!(proof.fn_info.name, "le_trans");
+        assert_eq!(proof.contracts.len(), 3);
+        assert!(metadata.contains("\"item_kind\":\"proof\""));
+        assert!(metadata.contains("\"contracts_original\":[\"a <= b\",\"b <= c\",\"a <= c\"]"));
+    }
+
+    #[test]
+    fn proof_rejects_public_export() {
+        let err = parse_proof_source(
+            "pub fn le_refl(a: i32) gives ghost { a <= a; } { assert(a <= a); }",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: proof functions are erased and cannot be public Rust APIs"
+        );
+    }
+
+    #[test]
+    fn proof_rejects_empty_nontrivial_body() {
+        let err = parse_proof_source("fn le_refl(a: i32) gives ghost { a <= a; } { }").unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: empty proof body cannot prove a nontrivial lemma"
+        );
     }
 
     #[test]

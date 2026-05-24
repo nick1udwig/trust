@@ -1,6 +1,6 @@
 //! User-facing Trust API.
 
-pub use trust_macros::{loop_spec, module, total, trusted_model, TrustModel};
+pub use trust_macros::{loop_spec, module, proof, spec, total, trusted_model, TrustModel};
 pub use trust_model::TrustModel;
 
 #[doc(hidden)]

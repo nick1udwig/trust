@@ -96,6 +96,44 @@ fn pass_loop_countdown_proves_decreases() {
 }
 
 #[test]
+fn pass_executable_spec_builds_as_runtime_rust() {
+    run_fixture("pass_spec_executable", Expected::Pass);
+}
+
+#[test]
+fn pass_ghost_spec_builds_without_runtime_rust() {
+    run_fixture("pass_spec_ghost", Expected::Pass);
+}
+
+#[test]
+fn pass_proof_function_is_erased() {
+    run_fixture("pass_proof_erased", Expected::Pass);
+}
+
+#[test]
+fn fail_public_proof_is_rejected() {
+    let output = run_fixture("fail_public_proof", Expected::Fail);
+
+    output
+        .assert_contains("error[trust]: proof functions are erased and cannot be public Rust APIs");
+}
+
+#[test]
+fn fail_empty_nontrivial_proof_is_rejected() {
+    let output = run_fixture("fail_empty_proof", Expected::Fail);
+
+    output.assert_contains("error[trust]: empty proof body cannot prove a nontrivial lemma");
+}
+
+#[test]
+fn fail_executable_spec_quantifier_is_rejected() {
+    let output = run_fixture("fail_executable_spec_quantifier", Expected::Fail);
+
+    output
+        .assert_contains("error[trust]: quantifiers are not supported in executable preconditions");
+}
+
+#[test]
 fn pass_cache_hit_reuses_proof_cache() {
     let suffix = std::process::id();
     let first_target = format!("pass_cache_hit_first_{suffix}");
