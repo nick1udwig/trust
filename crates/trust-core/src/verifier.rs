@@ -19,6 +19,10 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    PostconditionUnproved {
+        function: String,
+        condition: String,
+    },
 }
 
 impl fmt::Display for VerificationError {
@@ -52,6 +56,10 @@ impl fmt::Display for VerificationError {
                 f,
                 "could not prove integer multiplication cannot overflow in `{function}`: `{expression}`"
             ),
+            VerificationError::PostconditionUnproved {
+                function,
+                condition,
+            } => write!(f, "could not prove postcondition in `{function}`: `{condition}`"),
         }
     }
 }
@@ -64,11 +72,7 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
     }
 
     let source = normalize(&metadata.function_source);
-    let contracts = metadata
-        .contracts_original
-        .iter()
-        .map(|contract| normalize(contract))
-        .collect::<Vec<_>>();
+    let contracts = executable_preconditions(metadata);
     let params = parse_params(&source);
     let body = body(&source);
 
@@ -108,7 +112,22 @@ pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
         }
     }
 
+    for postcondition in postconditions(metadata) {
+        if !postcondition_proved(&postcondition, body) {
+            return Err(VerificationError::PostconditionUnproved {
+                function: metadata.rust_function_path.clone(),
+                condition: postcondition.original,
+            });
+        }
+    }
+
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Contract {
+    original: String,
+    normalized: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +167,29 @@ struct MulObligation {
     expression: String,
 }
 
+fn executable_preconditions(metadata: &TrustMetadata) -> Vec<String> {
+    metadata
+        .contracts_original
+        .iter()
+        .zip(metadata.contract_classes.iter())
+        .filter(|(_contract, class)| class.as_str() == "given executable")
+        .map(|(contract, _class)| normalize(contract))
+        .collect()
+}
+
+fn postconditions(metadata: &TrustMetadata) -> Vec<Contract> {
+    metadata
+        .contracts_original
+        .iter()
+        .zip(metadata.contract_classes.iter())
+        .filter(|(_contract, class)| matches!(class.as_str(), "gives executable" | "gives ghost"))
+        .map(|(contract, _class)| Contract {
+            original: contract.clone(),
+            normalized: normalize(&remove_int_wrappers(contract)),
+        })
+        .collect()
+}
+
 fn parse_params(source: &str) -> Vec<Param> {
     let Some(params_start) = source.find('(') else {
         return Vec::new();
@@ -177,6 +219,22 @@ fn body(source: &str) -> &str {
         return "";
     };
     &source[start + 1..end]
+}
+
+fn return_expression(body: &str) -> String {
+    body.trim()
+        .trim_start_matches("return")
+        .trim_end_matches(';')
+        .to_string()
+}
+
+fn postcondition_proved(postcondition: &Contract, body: &str) -> bool {
+    let return_expression = return_expression(body);
+    let Some((left, right)) = postcondition.normalized.split_once("==") else {
+        return false;
+    };
+
+    (left == "out" && right == return_expression) || (right == "out" && left == return_expression)
 }
 
 fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
@@ -441,6 +499,39 @@ fn looks_unary_minus(tokens: &[String], minus_idx: usize) -> bool {
     )
 }
 
+fn remove_int_wrappers(input: &str) -> String {
+    let mut out = input.to_string();
+
+    while let Some(start) = out.find("int(") {
+        let inner_start = start + "int(".len();
+        let Some(end) = matching_paren(&out, inner_start - 1) else {
+            break;
+        };
+        let inner = out[inner_start..end].to_string();
+        out.replace_range(start..=end, &inner);
+    }
+
+    out
+}
+
+fn matching_paren(input: &str, open_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in input.char_indices().skip_while(|(idx, _)| *idx < open_idx) {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn normalize(input: &str) -> String {
     input.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
@@ -480,6 +571,20 @@ mod tests {
     }
 
     fn metadata_named(name: &str, function_source: &str, contracts: &[&str]) -> TrustMetadata {
+        metadata_named_with_classes(
+            name,
+            function_source,
+            contracts,
+            &vec!["given executable"; contracts.len()],
+        )
+    }
+
+    fn metadata_named_with_classes(
+        name: &str,
+        function_source: &str,
+        contracts: &[&str],
+        classes: &[&str],
+    ) -> TrustMetadata {
         TrustMetadata {
             schema_version: 1,
             item_kind: "total".to_string(),
@@ -489,6 +594,7 @@ mod tests {
                 .iter()
                 .map(|contract| contract.to_string())
                 .collect(),
+            contract_classes: classes.iter().map(|class| class.to_string()).collect(),
             function_source: function_source.to_string(),
         }
     }
@@ -621,5 +727,65 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_executable_identity_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "id_i32",
+            "pub fn id_i32(x: i32) -> i32 { x }",
+            &["out == x"],
+            &["gives executable"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_ghost_arithmetic_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "add_one",
+            "pub fn add_one(x: i32) -> i32 { x + 1 }",
+            &["x < i32::MAX", "int(out) == int(x) + 1"],
+            &["given executable", "gives ghost"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_false_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "zero",
+            "pub fn zero() -> i32 { 0 }",
+            &["out == 1"],
+            &["gives ghost"],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::PostconditionUnproved {
+                function: "zero".to_string(),
+                condition: "out == 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_use_postcondition_as_assumption() {
+        let metadata = metadata_named_with_classes(
+            "add_one",
+            "pub fn add_one(x: i32) -> i32 { x + 1 }",
+            &["out == x + 1"],
+            &["gives executable"],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add_one".to_string(),
+                expression: "x + 1".to_string(),
+            })
+        );
     }
 }

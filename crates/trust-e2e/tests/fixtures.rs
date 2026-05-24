@@ -78,6 +78,22 @@ fn pass_usize_double_precondition_proves_overflow_safety() {
 }
 
 #[test]
+fn pass_id_postcondition_proves_executable_postcondition() {
+    let output = run_fixture("pass_id_postcondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_add_one_postcondition_proves_ghost_arithmetic_postcondition() {
+    let output = run_fixture("pass_add_one_postcondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_missing_wrapper_requires_trust_rustc() {
     let output = run_fixture_without_wrapper("fail_missing_wrapper", Expected::Fail);
 
@@ -162,4 +178,18 @@ fn fail_multiplication_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_multiplication_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer multiplication cannot overflow");
+}
+
+#[test]
+fn fail_postcondition_false_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_postcondition_false", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove postcondition");
+}
+
+#[test]
+fn fail_postcondition_wrong_expression_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_postcondition_wrong_expression", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove postcondition");
 }

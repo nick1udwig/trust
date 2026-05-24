@@ -89,21 +89,48 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
     let mut rest = source.trim();
     let mut contracts = Vec::new();
 
-    loop {
-        let Some(after_given) = strip_keyword(rest, "given") else {
+    while !rest.is_empty() {
+        if let Some(after_given) = strip_keyword(rest, "given") {
+            let Some(after_executable) = strip_keyword(after_given, "executable") else {
+                return Err("error[trust]: only `given executable` preconditions are supported in this Trust MVP slice");
+            };
+            let Some((block, after_block)) = extract_braced(after_executable.trim_start()) else {
+                return Err("error[trust]: `given executable` requires a braced contract block");
+            };
+
+            for expression in split_contract_expressions(block) {
+                validate_executable_contract(&expression)?;
+                contracts.push(Contract {
+                    class: "given executable",
+                    expression_display: normalize_contract_display(&expression),
+                    expression_code: expression,
+                });
+            }
+            rest = after_block.trim_start();
+            continue;
+        }
+
+        let Some(after_gives) = strip_keyword(rest, "gives") else {
             break;
         };
-        let Some(after_executable) = strip_keyword(after_given, "executable") else {
-            return Err("error[trust]: only `given executable` contracts are supported in this Trust MVP slice");
+        let (class, after_kind) =
+            if let Some(after_executable) = strip_keyword(after_gives, "executable") {
+                ("gives executable", after_executable)
+            } else if let Some(after_ghost) = strip_keyword(after_gives, "ghost") {
+                ("gives ghost", after_ghost)
+            } else {
+                return Err("error[trust]: `gives` must be `gives executable` or `gives ghost`");
+            };
+        let Some((_binder, after_binder)) = extract_pipe_binder(after_kind.trim_start()) else {
+            return Err("error[trust]: `gives` requires a result binder like `|out|`");
         };
-        let Some((block, after_block)) = extract_braced(after_executable.trim_start()) else {
-            return Err("error[trust]: `given executable` requires a braced contract block");
+        let Some((block, after_block)) = extract_braced(after_binder.trim_start()) else {
+            return Err("error[trust]: `gives` requires a braced contract block");
         };
 
         for expression in split_contract_expressions(block) {
-            validate_executable_contract(&expression)?;
             contracts.push(Contract {
-                class: "given executable",
+                class,
                 expression_display: normalize_contract_display(&expression),
                 expression_code: expression,
             });
@@ -381,6 +408,17 @@ fn extract_braced(input: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn extract_pipe_binder(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let after_open = input.strip_prefix('|')?;
+    let close_idx = after_open.find('|')?;
+    let binder = after_open[..close_idx].trim();
+    if binder.is_empty() {
+        return None;
+    }
+    Some((binder, &after_open[close_idx + 1..]))
+}
+
 fn split_contract_expressions(block: &str) -> Vec<String> {
     block
         .split(';')
@@ -569,6 +607,20 @@ mod tests {
         assert!(function.contains(
             "::trust::__rt::assert_precondition((i < xs . len()), \"get\", \"i < xs.len()\");"
         ));
+    }
+
+    #[test]
+    fn total_parses_gives_contracts_without_runtime_precondition_assertion() {
+        let total = parse_total_source(
+            "gives executable | out | { out == x; } pub fn id_i32(x: i32) -> i32 { x }",
+        )
+        .unwrap();
+
+        assert_eq!(total.contracts[0].class, "gives executable");
+        assert_eq!(total.contracts[0].expression_display, "out == x");
+
+        let function = render_function(&total);
+        assert!(!function.contains("assert_precondition"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub struct TrustMetadata {
     pub item_id: String,
     pub rust_function_path: String,
     pub contracts_original: Vec<String>,
+    pub contract_classes: Vec<String>,
     pub function_source: String,
 }
 
@@ -49,6 +50,7 @@ pub fn parse_metadata_line(line: &str) -> Result<TrustMetadata, MetadataError> {
         item_id: extract_string(line, "item_id")?,
         rust_function_path: extract_string(line, "rust_function_path")?,
         contracts_original: extract_string_array(line, "contracts_original")?,
+        contract_classes: extract_string_array(line, "contract_classes")?,
         function_source: extract_string(line, "function_source")?,
     })
 }
@@ -179,7 +181,7 @@ mod tests {
     #[test]
     fn parses_total_metadata() {
         let metadata = parse_metadata_line(
-            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":["x < i32::MAX"],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
+            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":["x < i32::MAX"],"contract_classes":["given executable"],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
         )
         .unwrap();
 
@@ -187,13 +189,14 @@ mod tests {
         assert_eq!(metadata.item_kind, "total");
         assert_eq!(metadata.rust_function_path, "id");
         assert_eq!(metadata.contracts_original, ["x < i32::MAX"]);
+        assert_eq!(metadata.contract_classes, ["given executable"]);
         assert_eq!(metadata.function_source, "pub fn id(x: i32) -> i32 { x }");
     }
 
     #[test]
     fn rejects_unknown_schema() {
         let err = parse_metadata_line(
-            r#"{"schema_version":99,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":[],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
+            r#"{"schema_version":99,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":[],"contract_classes":[],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
         )
         .unwrap_err();
 
@@ -203,7 +206,7 @@ mod tests {
     #[test]
     fn parses_empty_string_array() {
         let metadata = parse_metadata_line(
-            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":[],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
+            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":[],"contract_classes":[],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
         )
         .unwrap();
 
