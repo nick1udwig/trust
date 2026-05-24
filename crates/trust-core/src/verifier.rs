@@ -50,6 +50,9 @@ pub enum VerificationError {
         function: String,
         keyword: String,
     },
+    UncheckedUnwrap {
+        function: String,
+    },
     PostconditionUnproved {
         function: String,
         condition: String,
@@ -124,6 +127,10 @@ impl fmt::Display for VerificationError {
                 f,
                 "`{keyword}` is not supported in loops in `{function}`"
             ),
+            VerificationError::UncheckedUnwrap { function: _ } => write!(
+                f,
+                "unchecked unwrap is not supported; prove Some or use match"
+            ),
             VerificationError::PostconditionUnproved {
                 function,
                 condition,
@@ -165,6 +172,12 @@ fn verify_total_with_env(
     let body = body(&source);
     let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?;
     contracts.extend(loop_facts.into_iter().map(|fact| fact.condition));
+
+    if contains_unchecked_unwrap(body) {
+        return Err(VerificationError::UncheckedUnwrap {
+            function: metadata.rust_function_path.clone(),
+        });
+    }
 
     for obligation in field_access_obligations(body, &params) {
         if !model_types
@@ -851,6 +864,15 @@ fn loop_exit_proves_value(body: &str, return_expression: &str, expected: &str) -
             };
             keyword == "while" && variable == return_expression && op == ">" && value == "0"
         })
+}
+
+fn contains_unchecked_unwrap(body: &str) -> bool {
+    tokens(body).windows(4).any(|window| {
+        let [dot, unwrap, open, close] = window else {
+            return false;
+        };
+        dot == "." && unwrap == "unwrap" && open == "(" && close == ")"
+    })
 }
 
 fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
@@ -1684,6 +1706,33 @@ mod tests {
             Err(VerificationError::PostconditionUnproved {
                 function: "withdraw".to_string(),
                 condition: "out.id == old(acct.id)".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_option_match() {
+        let metadata = metadata_named(
+            "unwrap_or_zero",
+            "pub fn unwrap_or_zero(x: Option<i32>) -> i32 { match x { Some(v) => v, None => 0, } }",
+            &[],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unchecked_option_unwrap() {
+        let metadata = metadata_named(
+            "bad_unwrap",
+            "pub fn bad_unwrap(x: Option<i32>) -> i32 { x.unwrap() }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UncheckedUnwrap {
+                function: "bad_unwrap".to_string(),
             })
         );
     }

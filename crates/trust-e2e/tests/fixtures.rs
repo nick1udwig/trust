@@ -56,6 +56,14 @@ fn pass_callee_precondition_proves_trust_to_trust_call() {
 }
 
 #[test]
+fn pass_option_match_builds() {
+    let output = run_fixture("pass_option_match", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_trust_model_struct_allows_field_reasoning() {
     let output = run_fixture("pass_trust_model_struct", Expected::Pass);
 
@@ -231,6 +239,15 @@ fn fail_callee_precondition_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_callee_precondition", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove callee precondition");
+}
+
+#[test]
+fn fail_option_unwrap_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_option_unwrap", Expected::Fail);
+
+    output.assert_contains(
+        "error[trust]: unchecked unwrap is not supported; prove Some or use match",
+    );
 }
 
 #[test]
