@@ -99,6 +99,18 @@ pub fn trusted_model(input: TokenStream) -> TokenStream {
     })
 }
 
+#[proc_macro]
+pub fn loop_spec(input: TokenStream) -> TokenStream {
+    if !wrapper_active() {
+        return compile_error("error[trust]: Trust verification requires trust-rustc");
+    }
+    if input.to_string().trim().is_empty() {
+        return compile_error("error[trust]: trust::loop_spec! requires loop clauses");
+    }
+
+    TokenStream::new()
+}
+
 #[proc_macro_derive(TrustModel)]
 pub fn derive_trust_model(input: TokenStream) -> TokenStream {
     if !wrapper_active() {

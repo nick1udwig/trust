@@ -32,6 +32,24 @@ pub enum VerificationError {
         function: String,
         ty: String,
     },
+    LoopMissingSpec {
+        function: String,
+    },
+    LoopMissingDecreases {
+        function: String,
+    },
+    LoopInvariantNotPreserved {
+        function: String,
+        invariant: String,
+    },
+    LoopDecreasesNotDecreasing {
+        function: String,
+        measure: String,
+    },
+    UnsupportedLoopControl {
+        function: String,
+        keyword: String,
+    },
     PostconditionUnproved {
         function: String,
         condition: String,
@@ -88,6 +106,24 @@ impl fmt::Display for VerificationError {
                 f,
                 "type {ty} must derive TrustModel before Trust may reason about its fields"
             ),
+            VerificationError::LoopMissingSpec { function } => {
+                write!(f, "loop in `{function}` requires loop_spec")
+            }
+            VerificationError::LoopMissingDecreases { function: _ } => {
+                write!(f, "loop in total function requires decreases measure")
+            }
+            VerificationError::LoopInvariantNotPreserved {
+                function: _,
+                invariant: _,
+            } => write!(f, "loop invariant may not be preserved"),
+            VerificationError::LoopDecreasesNotDecreasing {
+                function: _,
+                measure: _,
+            } => write!(f, "loop decreases measure may not strictly decrease"),
+            VerificationError::UnsupportedLoopControl { function, keyword } => write!(
+                f,
+                "`{keyword}` is not supported in loops in `{function}`"
+            ),
             VerificationError::PostconditionUnproved {
                 function,
                 condition,
@@ -122,10 +158,13 @@ fn verify_total_with_env(
     }
 
     let source = normalize(&metadata.function_source);
-    let contracts = executable_preconditions(metadata);
+    let mut contracts = executable_preconditions(metadata);
     let given_contracts = given_preconditions(metadata);
     let params = parse_params(&source);
+    let raw_body = body(&metadata.function_source);
     let body = body(&source);
+    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?;
+    contracts.extend(loop_facts.into_iter().map(|fact| fact.condition));
 
     for obligation in field_access_obligations(body, &params) {
         if !model_types
@@ -195,7 +234,7 @@ fn verify_total_with_env(
     }
 
     for postcondition in postconditions(metadata) {
-        if !postcondition_proved(&postcondition, body) {
+        if !postcondition_proved(&postcondition, body, raw_body) {
             return Err(VerificationError::PostconditionUnproved {
                 function: metadata.rust_function_path.clone(),
                 condition: postcondition.original,
@@ -274,6 +313,17 @@ struct FieldAccessObligation {
     ty: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopFact {
+    condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopSpec {
+    invariant: Option<String>,
+    decreases: Option<String>,
+}
+
 fn function_env(metadata: &[TrustMetadata]) -> Vec<TrustFunctionSummary> {
     metadata
         .iter()
@@ -343,8 +393,10 @@ fn parse_params(source: &str) -> Vec<Param> {
         .split(',')
         .filter_map(|param| {
             let (name, ty) = param.split_once(':')?;
+            let name = name.trim();
+            let name = name.strip_prefix("mut").unwrap_or(name);
             Some(Param {
-                name: name.trim().to_string(),
+                name: name.to_string(),
                 ty: ty.trim().to_string(),
             })
         })
@@ -362,19 +414,29 @@ fn body(source: &str) -> &str {
 }
 
 fn return_expression(body: &str) -> String {
-    body.trim()
+    let trimmed = body
+        .trim()
         .trim_start_matches("return")
-        .trim_end_matches(';')
-        .to_string()
+        .trim_end_matches(';');
+    if let Some(after_last_group) = trimmed.rsplit_once('}').map(|(_head, tail)| tail.trim()) {
+        if !after_last_group.is_empty() {
+            return after_last_group.trim_end_matches(';').to_string();
+        }
+    }
+
+    trimmed.to_string()
 }
 
-fn postcondition_proved(postcondition: &Contract, body: &str) -> bool {
+fn postcondition_proved(postcondition: &Contract, body: &str, raw_body: &str) -> bool {
     let return_expression = return_expression(body);
     let Some((left, right)) = postcondition.normalized.split_once("==") else {
         return false;
     };
 
-    (left == "out" && right == return_expression) || (right == "out" && left == return_expression)
+    (left == "out" && right == return_expression)
+        || (right == "out" && left == return_expression)
+        || (left == "out" && loop_exit_proves_value(raw_body, &return_expression, right))
+        || (right == "out" && loop_exit_proves_value(raw_body, &return_expression, left))
 }
 
 fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
@@ -562,6 +624,188 @@ fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObli
     obligations
 }
 
+fn verify_loops(body: &str, function: &str) -> Result<Vec<LoopFact>, VerificationError> {
+    let tokens = tokens(body);
+    let mut facts = Vec::new();
+    let mut pending_spec = None;
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if let Some(open_idx) = loop_spec_open_idx(&tokens, idx) {
+            let Some(close_idx) = matching_token_group(&tokens, open_idx, "{", "}") else {
+                idx += 1;
+                continue;
+            };
+            pending_spec = Some(parse_loop_spec(&tokens[open_idx + 1..close_idx]));
+            idx = close_idx + 1;
+            continue;
+        }
+
+        if tokens[idx] != "while" {
+            idx += 1;
+            continue;
+        }
+
+        let Some(spec) = pending_spec.take() else {
+            return Err(VerificationError::LoopMissingSpec {
+                function: function.to_string(),
+            });
+        };
+        let Some(body_open_idx) = tokens[idx + 1..]
+            .iter()
+            .position(|token| token == "{")
+            .map(|offset| idx + 1 + offset)
+        else {
+            idx += 1;
+            continue;
+        };
+        let Some(body_close_idx) = matching_token_group(&tokens, body_open_idx, "{", "}") else {
+            idx += 1;
+            continue;
+        };
+
+        let condition = token_expression(&tokens[idx + 1..body_open_idx]);
+        let loop_body = &tokens[body_open_idx + 1..body_close_idx];
+        verify_loop_spec(&spec, &condition, loop_body, function)?;
+        facts.push(LoopFact { condition });
+        idx = body_close_idx + 1;
+    }
+
+    if pending_spec.is_some() {
+        return Err(VerificationError::LoopMissingSpec {
+            function: function.to_string(),
+        });
+    }
+
+    Ok(facts)
+}
+
+fn loop_spec_open_idx(tokens: &[String], idx: usize) -> Option<usize> {
+    if tokens.get(idx) == Some(&"trust".to_string())
+        && tokens.get(idx + 1) == Some(&":".to_string())
+        && tokens.get(idx + 2) == Some(&":".to_string())
+        && tokens.get(idx + 3) == Some(&"loop_spec".to_string())
+        && tokens.get(idx + 4) == Some(&"!".to_string())
+        && tokens.get(idx + 5) == Some(&"{".to_string())
+    {
+        return Some(idx + 5);
+    }
+
+    if tokens.get(idx) == Some(&"loop_spec".to_string())
+        && tokens.get(idx + 1) == Some(&"!".to_string())
+        && tokens.get(idx + 2) == Some(&"{".to_string())
+    {
+        return Some(idx + 2);
+    }
+
+    None
+}
+
+fn parse_loop_spec(tokens: &[String]) -> LoopSpec {
+    let mut spec = LoopSpec {
+        invariant: None,
+        decreases: None,
+    };
+    let mut idx = 0;
+
+    while idx + 2 < tokens.len() {
+        let clause = &tokens[idx];
+        if !matches!(clause.as_str(), "invariant" | "decreases") || tokens[idx + 1] != "(" {
+            idx += 1;
+            continue;
+        }
+        let Some(end) = matching_token_group(tokens, idx + 1, "(", ")") else {
+            idx += 1;
+            continue;
+        };
+        let expression = token_expression(&tokens[idx + 2..end]);
+        if clause == "invariant" {
+            spec.invariant = Some(expression);
+        } else {
+            spec.decreases = Some(expression);
+        }
+        idx = end + 1;
+    }
+
+    spec
+}
+
+fn verify_loop_spec(
+    spec: &LoopSpec,
+    condition: &str,
+    loop_body: &[String],
+    function: &str,
+) -> Result<(), VerificationError> {
+    let Some(measure) = &spec.decreases else {
+        return Err(VerificationError::LoopMissingDecreases {
+            function: function.to_string(),
+        });
+    };
+
+    for keyword in ["break", "continue"] {
+        if loop_body.iter().any(|token| token == keyword) {
+            return Err(VerificationError::UnsupportedLoopControl {
+                function: function.to_string(),
+                keyword: keyword.to_string(),
+            });
+        }
+    }
+
+    if let Some(invariant) = &spec.invariant {
+        if loop_invariant_may_not_be_preserved(invariant, condition, loop_body) {
+            return Err(VerificationError::LoopInvariantNotPreserved {
+                function: function.to_string(),
+                invariant: invariant.clone(),
+            });
+        }
+    }
+
+    if !loop_measure_decreases(measure, loop_body) {
+        return Err(VerificationError::LoopDecreasesNotDecreasing {
+            function: function.to_string(),
+            measure: measure.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn loop_invariant_may_not_be_preserved(
+    invariant: &str,
+    condition: &str,
+    loop_body: &[String],
+) -> bool {
+    let Some((left, right)) = invariant.split_once("<=") else {
+        return false;
+    };
+    if condition != format!("{left}<{right}") {
+        return false;
+    }
+
+    increment_amount(loop_body, left).is_some_and(|amount| amount > 1)
+}
+
+fn loop_measure_decreases(measure: &str, loop_body: &[String]) -> bool {
+    if decrements_variable(loop_body, measure) {
+        return true;
+    }
+
+    let Some((left, right)) = measure.split_once('-') else {
+        return false;
+    };
+    decrements_variable(loop_body, left) || increment_amount(loop_body, right).is_some()
+}
+
+fn loop_exit_proves_value(body: &str, return_expression: &str, expected: &str) -> bool {
+    expected == "0"
+        && tokens(body).windows(4).any(|window| {
+            let [keyword, variable, op, value] = window else {
+                return false;
+            };
+            keyword == "while" && variable == return_expression && op == ">" && value == "0"
+        })
+}
+
 fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
     let tokens = tokens(body);
     let mut obligations = Vec::new();
@@ -638,6 +882,14 @@ fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String
     let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
 
     if obligation.constant == 1 && contracts.iter().any(|contract| contract == &gt_min) {
+        return true;
+    }
+    if obligation.ty == "usize"
+        && obligation.constant == 1
+        && contracts
+            .iter()
+            .any(|contract| contract == &format!("{}>0", obligation.variable))
+    {
         return true;
     }
 
@@ -760,6 +1012,45 @@ fn is_ident(token: &str) -> bool {
         && token
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn decrements_variable(tokens: &[String], variable: &str) -> bool {
+    tokens.windows(5).any(|window| {
+        let [target, equals, source, op, amount] = window else {
+            return false;
+        };
+        target == variable
+            && equals == "="
+            && source == variable
+            && op == "-"
+            && amount.parse::<i128>().is_ok_and(|amount| amount > 0)
+    })
+}
+
+fn increment_amount(tokens: &[String], variable: &str) -> Option<i128> {
+    for window in tokens.windows(5) {
+        let [target, equals, source, op, amount] = window else {
+            continue;
+        };
+        if target == variable && equals == "=" && source == variable && op == "+" {
+            if let Ok(amount) = amount.parse::<i128>() {
+                return Some(amount);
+            }
+        }
+    }
+
+    for window in tokens.windows(4) {
+        let [target, plus, equals, amount] = window else {
+            continue;
+        };
+        if target == variable && plus == "+" && equals == "=" {
+            if let Ok(amount) = amount.parse::<i128>() {
+                return Some(amount);
+            }
+        }
+    }
+
+    None
 }
 
 fn constant_with_type(value: i128, ty: &str) -> String {
@@ -1227,6 +1518,68 @@ mod tests {
             Err(VerificationError::MissingTrustModel {
                 function: "balance".to_string(),
                 ty: "Account".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_countdown_loop_decreases_and_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { invariant(n >= 0); decreases(n); } while n > 0 { n = n - 1; } n }",
+            &["out == 0"],
+            &["gives executable"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_loop_missing_decreases() {
+        let metadata = metadata_named(
+            "count_up",
+            "pub fn count_up(mut i: usize, n: usize) -> usize { trust::loop_spec! { invariant(i <= n); } while i < n { i += 1; } i }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopMissingDecreases {
+                function: "count_up".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_loop_invariant_not_preserved() {
+        let metadata = metadata_named(
+            "count_up",
+            "pub fn count_up(mut i: usize, n: usize) -> usize { trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { i = i + 2; } i }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopInvariantNotPreserved {
+                function: "count_up".to_string(),
+                invariant: "i<=n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_loop_decreases_not_decreasing() {
+        let metadata = metadata_named(
+            "count_up",
+            "pub fn count_up(mut i: usize, n: usize) -> usize { trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { } i }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopDecreasesNotDecreasing {
+                function: "count_up".to_string(),
+                measure: "n-i".to_string(),
             })
         );
     }

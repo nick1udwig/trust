@@ -67,6 +67,14 @@ fn pass_trusted_model_stub_is_accepted_and_ignored() {
 }
 
 #[test]
+fn pass_loop_countdown_proves_decreases() {
+    let output = run_fixture("pass_loop_countdown", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_add_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_add_one_precondition", Expected::Pass);
 
@@ -210,6 +218,20 @@ fn fail_trusted_model_stub_cannot_prove_false() {
     let output = run_fixture("fail_trusted_model_not_axiom", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove postcondition");
+}
+
+#[test]
+fn fail_loop_missing_decreases_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_missing_decreases", Expected::Fail);
+
+    output.assert_contains("error[trust]: loop in total function requires decreases measure");
+}
+
+#[test]
+fn fail_loop_invariant_not_preserved_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_invariant_not_preserved", Expected::Fail);
+
+    output.assert_contains("error[trust]: loop invariant may not be preserved");
 }
 
 #[test]
