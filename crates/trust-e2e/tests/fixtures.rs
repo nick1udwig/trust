@@ -65,3 +65,18 @@ fn fail_multiple_fn_in_total_is_rejected() {
 
     output.assert_contains("error[trust]: trust::total! accepts exactly one Rust fn item");
 }
+
+#[test]
+fn fail_executable_precondition_quantifier_is_rejected() {
+    let output = run_fixture("fail_executable_precondition_quantifier", Expected::Fail);
+
+    output
+        .assert_contains("error[trust]: quantifiers are not supported in executable preconditions");
+}
+
+#[test]
+fn fail_executable_precondition_call_is_rejected() {
+    let output = run_fixture("fail_executable_precondition_call", Expected::Fail);
+
+    output.assert_contains("error[trust]: unsupported function call in executable precondition");
+}

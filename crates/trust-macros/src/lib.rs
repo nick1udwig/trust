@@ -101,6 +101,7 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
         };
 
         for expression in split_contract_expressions(block) {
+            validate_executable_contract(&expression)?;
             contracts.push(Contract {
                 class: "given executable",
                 expression_display: normalize_contract_display(&expression),
@@ -393,6 +394,38 @@ fn normalize_contract_display(expression: &str) -> String {
         .replace(" ]", "]")
 }
 
+fn validate_executable_contract(expression: &str) -> Result<(), &'static str> {
+    let tokens = lex(expression);
+
+    for (idx, token) in tokens.iter().enumerate() {
+        match token {
+            LexToken::Ident(ident) if ident == "forall" || ident == "exists" => {
+                return Err(
+                    "error[trust]: quantifiers are not supported in executable preconditions",
+                );
+            }
+            LexToken::Punct('|') => {
+                return Err("error[trust]: closures are not supported in executable preconditions");
+            }
+            LexToken::Punct('(') if idx > 0 => {
+                let Some(LexToken::Ident(callee)) = tokens.get(idx - 1) else {
+                    continue;
+                };
+                let is_method =
+                    idx >= 2 && matches!(tokens.get(idx - 2), Some(LexToken::Punct('.')));
+                if !is_method || callee != "len" {
+                    return Err(
+                        "error[trust]: unsupported function call in executable precondition",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn json_string_array<'a>(values: impl Iterator<Item = &'a str>) -> String {
     let values = values
         .map(|value| format!("\"{}\"", json_escape(value)))
@@ -530,5 +563,30 @@ mod tests {
         assert!(function.contains(
             "::trust::__rt::assert_precondition((i < xs . len()), \"get\", \"i < xs.len()\");"
         ));
+    }
+
+    #[test]
+    fn executable_given_rejects_quantifier() {
+        let err =
+            parse_total_source("given executable { forall i; } pub fn id_i32(x: i32) -> i32 { x }")
+                .unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: quantifiers are not supported in executable preconditions"
+        );
+    }
+
+    #[test]
+    fn executable_given_rejects_arbitrary_call() {
+        let err = parse_total_source(
+            "given executable { valid_index(i); } pub fn id_i32(x: i32) -> i32 { x }",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: unsupported function call in executable precondition"
+        );
     }
 }
