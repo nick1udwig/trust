@@ -38,6 +38,14 @@ fn pass_get_precondition_proves_slice_bounds() {
 }
 
 #[test]
+fn pass_private_ghost_precondition_builds_without_runtime_assertion() {
+    let output = run_fixture("pass_private_ghost_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_add_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_add_one_precondition", Expected::Pass);
 
@@ -151,6 +159,13 @@ fn fail_executable_precondition_call_is_rejected() {
     let output = run_fixture("fail_executable_precondition_call", Expected::Fail);
 
     output.assert_contains("error[trust]: unsupported function call in executable precondition");
+}
+
+#[test]
+fn fail_public_ghost_precondition_is_rejected() {
+    let output = run_fixture("fail_public_ghost_precondition", Expected::Fail);
+
+    output.assert_contains("error[trust]: public function has ghost-only precondition");
 }
 
 #[test]

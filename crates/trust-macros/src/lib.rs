@@ -91,17 +91,25 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
 
     while !rest.is_empty() {
         if let Some(after_given) = strip_keyword(rest, "given") {
-            let Some(after_executable) = strip_keyword(after_given, "executable") else {
-                return Err("error[trust]: only `given executable` preconditions are supported in this Trust MVP slice");
+            let (class, after_kind) = if let Some(after_executable) =
+                strip_keyword(after_given, "executable")
+            {
+                ("given executable", after_executable)
+            } else if let Some(after_ghost) = strip_keyword(after_given, "ghost") {
+                ("given ghost", after_ghost)
+            } else {
+                return Err("error[trust]: `given` must be `given executable` or `given ghost`");
             };
-            let Some((block, after_block)) = extract_braced(after_executable.trim_start()) else {
-                return Err("error[trust]: `given executable` requires a braced contract block");
+            let Some((block, after_block)) = extract_braced(after_kind.trim_start()) else {
+                return Err("error[trust]: `given` requires a braced contract block");
             };
 
             for expression in split_contract_expressions(block) {
-                validate_executable_contract(&expression)?;
+                if class == "given executable" {
+                    validate_executable_contract(&expression)?;
+                }
                 contracts.push(Contract {
-                    class: "given executable",
+                    class,
                     expression_display: normalize_contract_display(&expression),
                     expression_code: expression,
                 });
@@ -140,6 +148,13 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
 
     let fn_source = rest.to_string();
     let fn_info = inspect_total_fn(&fn_source)?;
+    if fn_info.visibility == "public"
+        && contracts
+            .iter()
+            .any(|contract| contract.class == "given ghost")
+    {
+        return Err("error[trust]: public function has ghost-only precondition");
+    }
 
     Ok(TotalExpansion {
         fn_source,
@@ -638,6 +653,35 @@ mod tests {
         assert!(function.contains(
             "::trust::__rt::assert_precondition((i < xs . len()), \"get\", \"i < xs.len()\");"
         ));
+    }
+
+    #[test]
+    fn total_parses_private_ghost_given_without_runtime_assertion() {
+        let total = parse_total_source(
+            "given ghost { sorted(xs); } fn private_first_sorted(xs: &[i32]) -> i32 { 0 }",
+        )
+        .unwrap();
+
+        assert_eq!(total.fn_info.visibility, "private");
+        assert_eq!(total.contracts[0].class, "given ghost");
+        assert_eq!(total.contracts[0].expression_display, "sorted(xs)");
+
+        let function = render_function(&total);
+        assert!(!function.contains("assert_precondition"));
+        assert!(!function.contains("sorted(xs)"));
+    }
+
+    #[test]
+    fn total_rejects_public_ghost_given() {
+        let err = parse_total_source(
+            "given ghost { sorted(xs); } pub fn first_sorted(xs: &[i32]) -> i32 { xs[0] }",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: public function has ghost-only precondition"
+        );
     }
 
     #[test]
