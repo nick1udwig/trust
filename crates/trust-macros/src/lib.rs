@@ -322,21 +322,39 @@ fn render_function(total: &TotalExpansion) -> String {
     let Some(body_start) = total.fn_source.find('{') else {
         return total.fn_source.clone();
     };
+    let Some(body_end) = total.fn_source.rfind('}') else {
+        return total.fn_source.clone();
+    };
 
-    let mut assertions = String::new();
+    let mut precondition_assertions = String::new();
+    let mut postcondition_assertions = String::new();
     for contract in &total.contracts {
-        if contract.class != "given executable" {
-            continue;
+        if contract.class == "given executable" {
+            precondition_assertions.push_str(&format!(
+                "::trust::__rt::assert_precondition(({}), {:?}, {:?});",
+                contract.expression_code, total.fn_info.name, contract.expression_display
+            ));
+        } else if contract.class == "gives executable" {
+            let expression = replace_result_binder(&contract.expression_code);
+            postcondition_assertions.push_str(&format!(
+                "::trust::__rt::assert_postcondition(({}), {:?}, {:?});",
+                expression, total.fn_info.name, contract.expression_display
+            ));
         }
-        assertions.push_str(&format!(
-            "::trust::__rt::assert_precondition(({}), {:?}, {:?});",
-            contract.expression_code, total.fn_info.name, contract.expression_display
-        ));
     }
 
-    let mut function = total.fn_source.clone();
-    function.insert_str(body_start + 1, &assertions);
-    function
+    if postcondition_assertions.is_empty() {
+        let mut function = total.fn_source.clone();
+        function.insert_str(body_start + 1, &precondition_assertions);
+        return function;
+    }
+
+    let signature = &total.fn_source[..body_start + 1];
+    let body = &total.fn_source[body_start + 1..body_end];
+    let suffix = &total.fn_source[body_end..];
+    format!(
+        "{signature}{precondition_assertions}let __trust_out = {{ {body} }};{postcondition_assertions}__trust_out{suffix}"
+    )
 }
 
 fn metadata_json(
@@ -436,6 +454,19 @@ fn normalize_contract_display(expression: &str) -> String {
         .replace(" )", ")")
         .replace("[ ", "[")
         .replace(" ]", "]")
+}
+
+fn replace_result_binder(expression: &str) -> String {
+    let tokens = lex(expression);
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            LexToken::Ident(ident) if ident == "out" => out.push_str("__trust_out"),
+            LexToken::Ident(ident) => out.push_str(&ident),
+            LexToken::Punct(punct) => out.push(punct),
+        }
+    }
+    out
 }
 
 fn validate_executable_contract(expression: &str) -> Result<(), &'static str> {
@@ -621,6 +652,8 @@ mod tests {
 
         let function = render_function(&total);
         assert!(!function.contains("assert_precondition"));
+        assert!(function.contains("assert_postcondition"));
+        assert!(function.contains("__trust_out==x"));
     }
 
     #[test]
