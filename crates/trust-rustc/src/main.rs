@@ -37,11 +37,16 @@ fn run() -> Result<i32, String> {
     }
 
     let metadata = read_metadata(&metadata_path)?;
-    let cache_stats = verify_metadata(&metadata)?;
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
         .count();
+    let cache_stats = if totals == 0 {
+        CacheStats { hits: 0, misses: 0 }
+    } else {
+        let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args);
+        verify_metadata(&metadata, &cache_context)?
+    };
 
     if deterministic_test_mode() && totals > 0 {
         eprintln!(
@@ -67,7 +72,81 @@ struct CacheStats {
     misses: usize,
 }
 
-fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<CacheStats, String> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheContext {
+    rustc_version: String,
+    target_triple: String,
+    pointer_width: String,
+    endianness: String,
+    target_features: Vec<String>,
+    cargo_features: Vec<String>,
+    solver_name: String,
+    solver_version: String,
+    solver_options: String,
+}
+
+impl CacheContext {
+    fn from_rustc_args(rustc: &OsString, rustc_args: &[OsString]) -> Self {
+        let rustc_version = if deterministic_test_mode() {
+            env::var("TRUST_TEST_RUSTC_VERSION").unwrap_or_else(|_| "rustc-test".to_string())
+        } else {
+            rustc_verbose_version(rustc).unwrap_or_else(|| "unknown-rustc-version".to_string())
+        };
+        let target_triple = if deterministic_test_mode() {
+            env::var("TRUST_TEST_TARGET_TRIPLE").ok()
+        } else {
+            None
+        }
+        .or_else(|| target_arg(rustc_args))
+        .or_else(|| host_target_from_verbose(&rustc_version))
+        .unwrap_or_else(|| "unknown-target".to_string());
+        let target_cfg = if deterministic_test_mode() {
+            TargetCfg {
+                pointer_width: env::var("TRUST_TEST_TARGET_POINTER_WIDTH")
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                endianness: env::var("TRUST_TEST_TARGET_ENDIANNESS")
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                target_features: Vec::new(),
+            }
+        } else {
+            rustc_target_cfg(rustc, &target_triple).unwrap_or_default()
+        };
+
+        let mut target_features = target_cfg.target_features;
+        target_features.extend(target_feature_args(rustc_args));
+        target_features.sort();
+        target_features.dedup();
+
+        let mut cargo_features = cargo_feature_cfgs(rustc_args);
+        cargo_features.sort();
+        cargo_features.dedup();
+
+        Self {
+            rustc_version,
+            target_triple,
+            pointer_width: target_cfg.pointer_width,
+            endianness: target_cfg.endianness,
+            target_features,
+            cargo_features,
+            solver_name: env::var("TRUST_SOLVER").unwrap_or_else(|_| "mock".to_string()),
+            solver_version: env::var("TRUST_SOLVER_VERSION")
+                .unwrap_or_else(|_| "mock-v1".to_string()),
+            solver_options: env::var("TRUST_SOLVER_OPTIONS").unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TargetCfg {
+    pointer_width: String,
+    endianness: String,
+    target_features: Vec<String>,
+}
+
+fn verify_metadata(
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> Result<CacheStats, String> {
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -77,7 +156,7 @@ fn verify_metadata(metadata: &[trust_core::metadata::TrustMetadata]) -> Result<C
     }
     check_mock_solver_status()?;
 
-    if let Some(cache_file) = cache_file(metadata) {
+    if let Some(cache_file) = cache_file(metadata, cache_context) {
         if matches!(
             fs::read_to_string(&cache_file),
             Ok(contents) if contents == "status=proved\n"
@@ -114,6 +193,54 @@ fn check_mock_solver_status() -> Result<(), String> {
     }
 }
 
+fn rustc_verbose_version(rustc: &OsString) -> Option<String> {
+    let output = Command::new(rustc).arg("-vV").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn host_target_from_verbose(version: &str) -> Option<String> {
+    version.lines().find_map(|line| {
+        line.strip_prefix("host: ")
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn rustc_target_cfg(rustc: &OsString, target_triple: &str) -> Option<TargetCfg> {
+    let output = Command::new(rustc)
+        .args(["--print", "cfg", "--target", target_triple])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut cfg = TargetCfg::default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(width) = quoted_cfg_value(line, "target_pointer_width") {
+            cfg.pointer_width = width;
+        } else if let Some(endian) = quoted_cfg_value(line, "target_endian") {
+            cfg.endianness = endian;
+        } else if let Some(feature) = quoted_cfg_value(line, "target_feature") {
+            cfg.target_features.push(feature);
+        }
+    }
+
+    Some(cfg)
+}
+
+fn quoted_cfg_value(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=\"");
+    line.strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix('"'))
+        .map(str::to_string)
+}
+
 fn split_rustc_args(args: Vec<OsString>) -> (OsString, Vec<OsString>) {
     let mut args = args;
     if let Some(first) = args.first() {
@@ -136,6 +263,78 @@ fn file_name_contains_rustc(arg: &OsString) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.contains("rustc"))
+}
+
+fn target_arg(rustc_args: &[OsString]) -> Option<String> {
+    let mut args = rustc_args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "--target" {
+            return args
+                .next()
+                .map(|target| target.to_string_lossy().to_string());
+        }
+        if let Some(target) = arg.strip_prefix("--target=") {
+            return Some(target.to_string());
+        }
+    }
+
+    None
+}
+
+fn target_feature_args(rustc_args: &[OsString]) -> Vec<String> {
+    let mut features = Vec::new();
+    let mut args = rustc_args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "-C" {
+            if let Some(value) = args.next().and_then(|value| value.to_str()) {
+                collect_codegen_target_arg(value, &mut features);
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-C") {
+            collect_codegen_target_arg(value, &mut features);
+        }
+    }
+
+    features
+}
+
+fn collect_codegen_target_arg(value: &str, features: &mut Vec<String>) {
+    if let Some(target_feature) = value.strip_prefix("target-feature=") {
+        features.push(format!("arg:target-feature={target_feature}"));
+    } else if let Some(target_cpu) = value.strip_prefix("target-cpu=") {
+        features.push(format!("arg:target-cpu={target_cpu}"));
+    }
+}
+
+fn cargo_feature_cfgs(rustc_args: &[OsString]) -> Vec<String> {
+    let mut features = Vec::new();
+    let mut args = rustc_args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "--cfg" {
+            if let Some(value) = args.next().and_then(|value| value.to_str()) {
+                collect_feature_cfg(value, &mut features);
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--cfg=") {
+            collect_feature_cfg(value, &mut features);
+        }
+    }
+
+    features
+}
+
+fn collect_feature_cfg(value: &str, features: &mut Vec<String>) {
+    if let Some(feature) = value
+        .strip_prefix("feature=\"")
+        .and_then(|feature| feature.strip_suffix('"'))
+    {
+        features.push(feature.to_string());
+    }
 }
 
 fn read_metadata(path: &PathBuf) -> Result<Vec<trust_core::metadata::TrustMetadata>, String> {
@@ -175,17 +374,23 @@ fn deterministic_test_mode() -> bool {
     env::var("TRUST_TEST_DETERMINISTIC").as_deref() == Ok("1")
 }
 
-fn cache_file(metadata: &[trust_core::metadata::TrustMetadata]) -> Option<PathBuf> {
+fn cache_file(
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> Option<PathBuf> {
     let cache_dir = env::var_os("TRUST_CACHE_DIR").map(PathBuf::from)?;
+    Some(cache_path(&cache_dir, metadata, cache_context))
+}
+
+fn cache_path(
+    cache_dir: &PathBuf,
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     "trust-proof-cache-v1".hash(&mut hasher);
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
-    env::var("TRUST_SOLVER")
-        .unwrap_or_else(|_| "mock".to_string())
-        .hash(&mut hasher);
-    env::var("TRUST_SOLVER_STATUS")
-        .unwrap_or_else(|_| "proved".to_string())
-        .hash(&mut hasher);
+    cache_context.hash(&mut hasher);
     for item in metadata {
         item.schema_version.hash(&mut hasher);
         item.item_kind.hash(&mut hasher);
@@ -196,7 +401,7 @@ fn cache_file(metadata: &[trust_core::metadata::TrustMetadata]) -> Option<PathBu
         item.function_source.hash(&mut hasher);
     }
 
-    Some(cache_dir.join(format!("{:016x}.proof", hasher.finish())))
+    cache_dir.join(format!("{:016x}.proof", hasher.finish()))
 }
 
 fn write_cache_entry(cache_file: &PathBuf) -> Result<(), String> {

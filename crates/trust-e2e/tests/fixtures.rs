@@ -1,5 +1,7 @@
+use std::fs;
 use trust_test_support::{
-    run_fixture, run_fixture_with_cache, run_fixture_with_solver_status,
+    fixture_cache_dir, run_fixture, run_fixture_with_cache, run_fixture_with_cache_and_env,
+    run_fixture_with_cache_and_solver_status, run_fixture_with_solver_status,
     run_fixture_without_wrapper, Expected,
 };
 
@@ -150,6 +152,166 @@ fn pass_cache_misses_when_contract_changes() {
 
     first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
     second.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+}
+
+#[test]
+fn pass_cache_misses_when_solver_version_changes() {
+    let suffix = std::process::id();
+    let cache_name = format!("pass_cache_solver_version_changed_shared_{suffix}");
+    let first_target = format!("pass_cache_solver_version_changed_first_{suffix}");
+    let second_target = format!("pass_cache_solver_version_changed_second_{suffix}");
+    let third_target = format!("pass_cache_solver_version_changed_third_{suffix}");
+
+    let first = run_fixture_with_cache_and_env(
+        "pass_cache_hit",
+        Expected::Pass,
+        &first_target,
+        &cache_name,
+        &[("TRUST_SOLVER_VERSION", "mock-solver-v1")],
+    );
+    let second = run_fixture_with_cache_and_env(
+        "pass_cache_hit",
+        Expected::Pass,
+        &second_target,
+        &cache_name,
+        &[("TRUST_SOLVER_VERSION", "mock-solver-v1")],
+    );
+    let third = run_fixture_with_cache_and_env(
+        "pass_cache_hit",
+        Expected::Pass,
+        &third_target,
+        &cache_name,
+        &[("TRUST_SOLVER_VERSION", "mock-solver-v2")],
+    );
+
+    first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    second.assert_contains("trust: verified 1 function; cache hits 1; cache misses 0");
+    third.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+}
+
+#[test]
+fn pass_cache_misses_when_target_changes() {
+    let suffix = std::process::id();
+    let cache_name = format!("pass_cache_target_changed_shared_{suffix}");
+    let first_target = format!("pass_cache_target_changed_first_{suffix}");
+    let second_target = format!("pass_cache_target_changed_second_{suffix}");
+    let third_target = format!("pass_cache_target_changed_third_{suffix}");
+
+    let target_a = [
+        ("TRUST_TEST_TARGET_TRIPLE", "trust-test-target-a"),
+        ("TRUST_TEST_TARGET_POINTER_WIDTH", "64"),
+        ("TRUST_TEST_TARGET_ENDIANNESS", "little"),
+    ];
+    let target_b = [
+        ("TRUST_TEST_TARGET_TRIPLE", "trust-test-target-b"),
+        ("TRUST_TEST_TARGET_POINTER_WIDTH", "32"),
+        ("TRUST_TEST_TARGET_ENDIANNESS", "big"),
+    ];
+
+    let first = run_fixture_with_cache_and_env(
+        "pass_cache_hit",
+        Expected::Pass,
+        &first_target,
+        &cache_name,
+        &target_a,
+    );
+    let second = run_fixture_with_cache_and_env(
+        "pass_cache_hit",
+        Expected::Pass,
+        &second_target,
+        &cache_name,
+        &target_a,
+    );
+    let third = run_fixture_with_cache_and_env(
+        "pass_cache_hit",
+        Expected::Pass,
+        &third_target,
+        &cache_name,
+        &target_b,
+    );
+
+    first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    second.assert_contains("trust: verified 1 function; cache hits 1; cache misses 0");
+    third.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+}
+
+#[test]
+fn pass_cache_corrupt_entry_is_recomputed() {
+    let suffix = std::process::id();
+    let cache_name = format!("pass_cache_corrupt_recomputed_shared_{suffix}");
+    let first_target = format!("pass_cache_corrupt_recomputed_first_{suffix}");
+    let second_target = format!("pass_cache_corrupt_recomputed_second_{suffix}");
+    let third_target = format!("pass_cache_corrupt_recomputed_third_{suffix}");
+
+    let first =
+        run_fixture_with_cache("pass_cache_hit", Expected::Pass, &first_target, &cache_name);
+    first.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+
+    let proof_entries = proof_cache_entries(&cache_name);
+    assert_eq!(proof_entries.len(), 1, "expected one proof cache entry");
+    fs::write(&proof_entries[0], "status=partial\n").expect("corrupt proof cache entry");
+
+    let second = run_fixture_with_cache(
+        "pass_cache_hit",
+        Expected::Pass,
+        &second_target,
+        &cache_name,
+    );
+    let third =
+        run_fixture_with_cache("pass_cache_hit", Expected::Pass, &third_target, &cache_name);
+
+    second.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    third.assert_contains("trust: verified 1 function; cache hits 1; cache misses 0");
+}
+
+#[test]
+fn fail_cache_timeout_is_not_reused_as_proof() {
+    let suffix = std::process::id();
+    let cache_name = format!("fail_cache_timeout_not_reused_shared_{suffix}");
+    let timeout_target = format!("fail_cache_timeout_not_reused_timeout_{suffix}");
+    let proved_target = format!("fail_cache_timeout_not_reused_proved_{suffix}");
+    let repeat_target = format!("fail_cache_timeout_not_reused_repeat_{suffix}");
+
+    let timeout = run_fixture_with_cache_and_solver_status(
+        "pass_cache_hit",
+        Expected::Fail,
+        &timeout_target,
+        &cache_name,
+        "timeout",
+    );
+    timeout.assert_contains("error[trust]: solver timed out");
+    assert!(
+        proof_cache_entries(&cache_name).is_empty(),
+        "timeout result should not write a proof cache entry"
+    );
+
+    let proved = run_fixture_with_cache(
+        "pass_cache_hit",
+        Expected::Pass,
+        &proved_target,
+        &cache_name,
+    );
+    let repeat = run_fixture_with_cache(
+        "pass_cache_hit",
+        Expected::Pass,
+        &repeat_target,
+        &cache_name,
+    );
+
+    proved.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    repeat.assert_contains("trust: verified 1 function; cache hits 1; cache misses 0");
+}
+
+fn proof_cache_entries(cache_name: &str) -> Vec<std::path::PathBuf> {
+    let cache_dir = fixture_cache_dir(cache_name);
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .map(|entry| entry.expect("read proof cache entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("proof"))
+        .collect()
 }
 
 #[test]

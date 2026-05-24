@@ -58,7 +58,7 @@ impl FixtureOutput {
 
 pub fn run_fixture(name: &str, expected: Expected) -> FixtureOutput {
     let wrapper = build_trust_rustc();
-    run_fixture_inner(name, expected, Some(&wrapper), name, name, None)
+    run_fixture_inner(name, expected, Some(&wrapper), name, name, None, &[])
 }
 
 pub fn run_fixture_with_cache(
@@ -66,6 +66,16 @@ pub fn run_fixture_with_cache(
     expected: Expected,
     target_name: &str,
     cache_name: &str,
+) -> FixtureOutput {
+    run_fixture_with_cache_and_env(name, expected, target_name, cache_name, &[])
+}
+
+pub fn run_fixture_with_cache_and_env(
+    name: &str,
+    expected: Expected,
+    target_name: &str,
+    cache_name: &str,
+    extra_env: &[(&str, &str)],
 ) -> FixtureOutput {
     let wrapper = build_trust_rustc();
     run_fixture_inner(
@@ -75,6 +85,7 @@ pub fn run_fixture_with_cache(
         target_name,
         cache_name,
         None,
+        extra_env,
     )
 }
 
@@ -94,11 +105,38 @@ pub fn run_fixture_with_solver_status(
         &target_name,
         &cache_name,
         Some(solver_status),
+        &[],
+    )
+}
+
+pub fn run_fixture_with_cache_and_solver_status(
+    name: &str,
+    expected: Expected,
+    target_name: &str,
+    cache_name: &str,
+    solver_status: &str,
+) -> FixtureOutput {
+    let wrapper = build_trust_rustc();
+    run_fixture_inner(
+        name,
+        expected,
+        Some(&wrapper),
+        target_name,
+        cache_name,
+        Some(solver_status),
+        &[],
     )
 }
 
 pub fn run_fixture_without_wrapper(name: &str, expected: Expected) -> FixtureOutput {
-    run_fixture_inner(name, expected, None, name, name, None)
+    run_fixture_inner(name, expected, None, name, name, None, &[])
+}
+
+pub fn fixture_cache_dir(cache_name: &str) -> PathBuf {
+    workspace_root()
+        .join("target")
+        .join("trust-cache-tests")
+        .join(cache_name)
 }
 
 fn run_fixture_inner(
@@ -108,6 +146,7 @@ fn run_fixture_inner(
     target_name: &str,
     cache_name: &str,
     solver_status: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> FixtureOutput {
     let root = workspace_root();
     let manifest = root
@@ -127,12 +166,7 @@ fn run_fixture_inner(
         .env("TRUST_TEST_MODE", "1")
         .env("TRUST_TEST_DETERMINISTIC", "1")
         .env("TRUST_SOLVER", "mock")
-        .env(
-            "TRUST_CACHE_DIR",
-            root.join("target")
-                .join("trust-cache-tests")
-                .join(cache_name),
-        )
+        .env("TRUST_CACHE_DIR", fixture_cache_dir(cache_name))
         .env_remove("TRUST_MACRO_UNIT_TEST")
         .env_remove("TRUST_RUSTC_ACTIVE")
         .env_remove("TRUST_METADATA_OUT");
@@ -146,6 +180,9 @@ fn run_fixture_inner(
         command.env("TRUST_SOLVER_STATUS", solver_status);
     } else {
         command.env_remove("TRUST_SOLVER_STATUS");
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
 
     let output = command.output().unwrap_or_else(|err| {
