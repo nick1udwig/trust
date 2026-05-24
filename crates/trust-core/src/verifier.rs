@@ -661,7 +661,21 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
         let left = &tokens[idx];
         let op = &tokens[idx + 1];
         let right = &tokens[idx + 2];
-        if op != "+" || !is_value_operand(left) || !is_value_operand(right) {
+        if op != "+" {
+            continue;
+        }
+        if let Some(expression) = complex_binary_expression(&tokens, idx + 1) {
+            obligations.push(AddObligation {
+                variable: left.clone(),
+                ty: param_type(left, params)
+                    .or_else(|| param_type(right, params))
+                    .map(|ty| ty.to_string()),
+                constant: None,
+                expression,
+            });
+            continue;
+        }
+        if !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
 
@@ -703,7 +717,20 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
         let left = &tokens[idx];
         let op = &tokens[idx + 1];
         let right = &tokens[idx + 2];
-        if op != "-" || !is_value_operand(left) || !is_value_operand(right) {
+        if op != "-" {
+            continue;
+        }
+        if let Some(expression) = complex_binary_expression(&tokens, idx + 1) {
+            obligations.push(SubObligation {
+                variable: left.clone(),
+                ty: param_type(left, params).map(|ty| ty.to_string()),
+                constant: None,
+                rhs: Some(right.clone()),
+                expression,
+            });
+            continue;
+        }
+        if !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
 
@@ -770,7 +797,21 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
         let left = &tokens[idx];
         let op = &tokens[idx + 1];
         let right = &tokens[idx + 2];
-        if op != "*" || !is_value_operand(left) || !is_value_operand(right) {
+        if op != "*" {
+            continue;
+        }
+        if let Some(expression) = complex_binary_expression(&tokens, idx + 1) {
+            obligations.push(MulObligation {
+                variable: left.clone(),
+                ty: param_type(left, params)
+                    .or_else(|| param_type(right, params))
+                    .map(|ty| ty.to_string()),
+                constant: None,
+                expression,
+            });
+            continue;
+        }
+        if !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
 
@@ -824,7 +865,19 @@ fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<Denomi
         let left = &tokens[idx];
         let operator = &tokens[idx + 1];
         let right = &tokens[idx + 2];
-        if operator != op || !is_value_operand(left) || !is_value_operand(right) {
+        if operator != op {
+            continue;
+        }
+        if let Some((denominator, expression)) =
+            complex_denominator_expression(&tokens, idx + 1, op)
+        {
+            obligations.push(DenominatorObligation {
+                denominator,
+                expression,
+            });
+            continue;
+        }
+        if !is_value_operand(left) || !is_value_operand(right) {
             continue;
         }
         if right.parse::<i128>().is_ok_and(|value| value != 0) {
@@ -1565,6 +1618,48 @@ fn field_expression_before(tokens: &[String], op_idx: usize) -> Option<String> {
     Some(format!("{base}.{field}"))
 }
 
+fn complex_binary_expression(tokens: &[String], op_idx: usize) -> Option<String> {
+    let op = tokens.get(op_idx)?;
+    if tokens.get(op_idx + 1) == Some(&"(".to_string()) {
+        let close_idx = matching_token_group(tokens, op_idx + 1, "(", ")")?;
+        let right = token_expression(&tokens[op_idx + 2..close_idx]);
+        if !is_value_operand(&right) {
+            let left = tokens.get(op_idx.checked_sub(1)?)?;
+            return Some(format!("{left} {op} ({right})"));
+        }
+    }
+
+    if op_idx > 0 && tokens.get(op_idx - 1) == Some(&")".to_string()) {
+        let open_idx = matching_open_token_group(tokens, op_idx - 1, "(", ")")?;
+        let left = token_expression(&tokens[open_idx + 1..op_idx - 1]);
+        if !is_value_operand(&left) {
+            let right = tokens.get(op_idx + 1)?;
+            return Some(format!("({left}) {op} {right}"));
+        }
+    }
+
+    None
+}
+
+fn complex_denominator_expression(
+    tokens: &[String],
+    op_idx: usize,
+    op: &str,
+) -> Option<(String, String)> {
+    if tokens.get(op_idx + 1) != Some(&"(".to_string()) {
+        return None;
+    }
+
+    let close_idx = matching_token_group(tokens, op_idx + 1, "(", ")")?;
+    let denominator = token_expression(&tokens[op_idx + 2..close_idx]);
+    if is_value_operand(&denominator) {
+        return None;
+    }
+
+    let left = tokens.get(op_idx.checked_sub(1)?)?;
+    Some((denominator.clone(), format!("{left} {op} ({denominator})")))
+}
+
 fn is_supported_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64" | "usize")
 }
@@ -1737,6 +1832,27 @@ fn matching_token_group(
         if token == open {
             depth += 1;
         } else if token == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+
+    None
+}
+
+fn matching_open_token_group(
+    tokens: &[String],
+    close_idx: usize,
+    open: &str,
+    close: &str,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().take(close_idx + 1).rev() {
+        if token == close {
+            depth += 1;
+        } else if token == open {
             depth -= 1;
             if depth == 0 {
                 return Some(idx);
@@ -2018,6 +2134,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_complex_parenthesized_addition_operand() {
+        let metadata = metadata_named(
+            "add",
+            "pub fn add(x: i32, y: i32) -> i32 { x + (y + 1) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add".to_string(),
+                expression: "x + (y+1)".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn ignores_non_arithmetic_identity() {
         let metadata = metadata("pub fn id_i32(x: i32) -> i32 { x }", &[]);
 
@@ -2198,6 +2331,23 @@ mod tests {
             Err(VerificationError::IntegerDivisionByZero {
                 function: "div".to_string(),
                 expression: "x / y".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_complex_parenthesized_integer_division_denominator() {
+        let metadata = metadata_named(
+            "div",
+            "pub fn div(x: i32, y: i32) -> i32 { x / (y & 1) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionByZero {
+                function: "div".to_string(),
+                expression: "x / (y&1)".to_string(),
             })
         );
     }
