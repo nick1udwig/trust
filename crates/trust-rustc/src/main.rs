@@ -14,6 +14,8 @@ use trust_core::{
 };
 use z3::{ast::Bool, Config, SatResult, Solver};
 
+mod semantic;
+
 fn main() {
     cleanup_z3_trace_file();
     let code = match run() {
@@ -49,6 +51,9 @@ fn run() -> Result<i32, String> {
 
     let metadata = read_metadata(&metadata_path)?;
     emit_config_warnings(&metadata, &config);
+    if metadata_has_verification_item(&metadata) {
+        semantic::maybe_extract_semantic_views(&rustc, &rustc_args, &metadata)?;
+    }
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")

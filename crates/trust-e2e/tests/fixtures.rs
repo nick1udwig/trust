@@ -19,6 +19,60 @@ fn pass_total_identity_builds_and_metadata_is_discovered() {
 }
 
 #[test]
+fn pass_total_identity_writes_hir_mir_semantic_dumps_when_requested() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "pass_total_identity",
+        Expected::Pass,
+        &format!("pass_total_identity_semantic_dump_{suffix}"),
+        &format!("pass_total_identity_semantic_dump_{suffix}"),
+        &[("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str)],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+
+    let dumps = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries");
+    let dump_paths = dumps.iter().map(|entry| entry.path()).collect::<Vec<_>>();
+    let hir_path = dump_paths
+        .iter()
+        .find(|path| path.to_string_lossy().ends_with(".hir-tree.txt"))
+        .expect("expected HIR tree dump");
+    let mir_path = dump_paths
+        .iter()
+        .find(|path| path.to_string_lossy().ends_with(".mir.txt"))
+        .expect("expected MIR dump");
+    let summary_path = dump_paths
+        .iter()
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+
+    let hir = fs::read_to_string(hir_path).expect("read HIR dump");
+    let mir = fs::read_to_string(mir_path).expect("read MIR dump");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(hir.contains("ident: id_i32#"));
+    assert!(mir.contains("fn id_i32("));
+    assert!(summary.contains("format=trust-semantic-dump-v1"));
+    assert!(summary.contains("rustc_version=rustc-test"));
+    assert!(summary.contains("item kind=total"));
+    assert!(summary.contains("path=id_i32"));
+    assert!(summary.contains("hir_match=true"));
+    assert!(summary.contains("mir_match=true"));
+    assert!(summary.contains("mir_function path=id_i32"));
+    assert!(summary.contains("args=_1: i32"));
+    assert!(summary.contains("return_type=i32"));
+    assert!(summary.contains("debug_locals=x"));
+    assert!(summary.contains("return_expr=copy _1"));
+}
+
+#[test]
 fn pass_is_zero_builds_and_metadata_is_discovered() {
     let output = run_fixture("pass_is_zero", Expected::Pass);
 
