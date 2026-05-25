@@ -9,8 +9,8 @@ use std::process::Command;
 use trust_core::{
     metadata::TrustMetadata,
     verifier::{
-        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticParam, SemanticSliceIndex,
-        TrustFunctionSemantics,
+        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticCall, SemanticParam,
+        SemanticSliceIndex, TrustFunctionSemantics,
     },
 };
 
@@ -194,6 +194,7 @@ fn verifier_semantics(item_matches: &[SemanticItemMatch]) -> Vec<TrustFunctionSe
                 return_expression: mir_function.normalized_return_expression(),
                 arithmetic_operations: mir_function.semantic_arithmetic_operations(),
                 slice_indexes: mir_function.semantic_slice_indexes(),
+                calls: mir_function.semantic_calls(),
             })
         })
         .collect()
@@ -413,6 +414,22 @@ impl MirFunctionSummary {
             })
             .collect()
     }
+
+    fn semantic_calls(&self) -> Vec<SemanticCall> {
+        self.assignments
+            .iter()
+            .filter_map(|assignment| {
+                let (callee, args) = mir_call(&assignment.expression)?;
+                Some(SemanticCall {
+                    callee: callee.to_string(),
+                    args: args
+                        .iter()
+                        .map(|arg| self.normalized_mir_expression(arg))
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +569,13 @@ fn mir_slice_base_place(base: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+fn mir_call(expr: &str) -> Option<(&str, Vec<String>)> {
+    let (call, _target) = expr.split_once(" -> ")?;
+    let (callee, args) = call.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    Some((callee.trim(), parse_mir_call_args(args)))
+}
+
 fn parse_mir_call_args(input: &str) -> Vec<String> {
     parse_comma_separated(input)
 }
@@ -677,8 +701,14 @@ fn semantic_summary(
                 .map(|index| index.expression.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
+            let calls = mir_function
+                .semantic_calls()
+                .iter()
+                .map(|call| format!("{}({})", call.callee, call.args.join(",")))
+                .collect::<Vec<_>>()
+                .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={}\n",
                 item.rust_function_path,
                 mir_function
                     .args
@@ -696,6 +726,7 @@ fn semantic_summary(
                 return_expr,
                 arithmetic_ops,
                 slice_indexes,
+                calls,
             ));
         }
     }
@@ -900,6 +931,34 @@ fn verified::get(_1: &[i32], _2: usize) -> i32 {
                 base: "xs".to_string(),
                 index: "i".to_string(),
                 expression: "xs[i]".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_module_qualified_call_summary() {
+        let mir = r#"
+fn verified::caller(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = verified::inc(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "caller").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "verified::inc".to_string(),
+                args: vec!["x".to_string()],
             }]
         );
     }

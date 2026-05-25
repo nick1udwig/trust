@@ -12,6 +12,7 @@ pub struct TrustFunctionSemantics {
     pub return_expression: Option<String>,
     pub arithmetic_operations: Vec<SemanticArithmeticOperation>,
     pub slice_indexes: Vec<SemanticSliceIndex>,
+    pub calls: Vec<SemanticCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,6 +44,12 @@ pub struct SemanticSliceIndex {
     pub base: String,
     pub index: String,
     pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticCall {
+    pub callee: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,7 +504,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in call_obligations(body, env) {
+    for obligation in verification_call_obligations(body, env, semantics) {
         if !callee_precondition_proved(&obligation.condition, &given_contracts, &params, options) {
             return Err(VerificationError::CalleePreconditionUnproved {
                 function: metadata.rust_function_path.clone(),
@@ -1784,6 +1791,59 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
     }
 
     obligations
+}
+
+fn verification_call_obligations(
+    body: &str,
+    env: &[TrustFunctionSummary],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<CallObligation> {
+    let semantic_obligations = semantic_call_obligations(semantics, env);
+    if semantic_obligations.is_empty() {
+        call_obligations(body, env)
+    } else {
+        semantic_obligations
+    }
+}
+
+fn semantic_call_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    env: &[TrustFunctionSummary],
+) -> Vec<CallObligation> {
+    semantics
+        .into_iter()
+        .flat_map(|semantics| semantics.calls.iter())
+        .filter_map(|call| {
+            let callee = env
+                .iter()
+                .find(|function| function_name_matches_call(&function.name, &call.callee))?;
+            if call.args.len() != callee.params.len() {
+                return None;
+            }
+            Some(
+                callee
+                    .preconditions
+                    .iter()
+                    .map(|precondition| CallObligation {
+                        callee: callee.name.clone(),
+                        condition: substitute_params(precondition, &callee.params, &call.args),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+fn function_name_matches_call(function: &str, call: &str) -> bool {
+    function == call || function_leaf_name(call) == function
+}
+
+fn function_leaf_name(path: &str) -> &str {
+    path.rsplit("::")
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
 }
 
 fn addition_obligation_proved(
@@ -3446,6 +3506,7 @@ mod tests {
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
+            calls: Vec::new(),
         };
 
         assert!(matches!(
@@ -3480,6 +3541,7 @@ mod tests {
                 expression: "x + 1".to_string(),
             }],
             slice_indexes: Vec::new(),
+            calls: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3520,6 +3582,7 @@ mod tests {
                 expression: "x / y".to_string(),
             }],
             slice_indexes: Vec::new(),
+            calls: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3560,6 +3623,7 @@ mod tests {
                 expression: "x / y".to_string(),
             }],
             slice_indexes: Vec::new(),
+            calls: Vec::new(),
         };
 
         assert_eq!(
@@ -3595,6 +3659,7 @@ mod tests {
                 index: "i".to_string(),
                 expression: "xs[i]".to_string(),
             }],
+            calls: Vec::new(),
         };
 
         assert!(matches!(
@@ -3603,6 +3668,48 @@ mod tests {
         ));
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_call_proves_block_argument_callee_precondition() {
+        let inc = metadata_named(
+            "inc",
+            "pub fn inc(x: i32) -> i32 { x + 1 }",
+            &["x < i32::MAX"],
+        );
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(x: i32) -> i32 { inc({ x }) }",
+            &["x < i32::MAX"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "caller".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: Some("inc(x)".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "inc".to_string(),
+                args: vec!["x".to_string()],
+            }],
+        };
+
+        assert!(matches!(
+            verify_totals(&[inc.clone(), caller.clone()]),
+            Err(VerificationError::CalleePreconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[inc, caller],
+                &[semantics],
+                VerificationOptions::default()
+            ),
             Ok(())
         );
     }
