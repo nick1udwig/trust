@@ -1,0 +1,17 @@
+[package]
+name = "pass_semantic_field_branch_guard_subtraction"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
+
+[package.metadata.trust]
+assertions = "always"
+solver = "mock"
+

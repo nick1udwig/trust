@@ -494,17 +494,30 @@ impl MirFunctionSummary {
         }
     }
 
-    fn normalized_mir_predicate(&self, expr: &str) -> Option<String> {
-        self.normalized_mir_predicate_with_depth(expr, 0)
+    fn normalized_mir_predicate_with_models(
+        &self,
+        expr: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        self.normalized_mir_predicate_with_depth(expr, 0, model_fields)
     }
 
-    fn normalized_mir_predicate_with_depth(&self, expr: &str, depth: usize) -> Option<String> {
+    fn normalized_mir_predicate_with_depth(
+        &self,
+        expr: &str,
+        depth: usize,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
         if depth > 8 {
             return None;
         }
         let expr = strip_mir_move_or_copy(expr.trim());
         if let Some(assignment) = self.assignment_for_place(expr) {
-            return self.normalized_mir_predicate_with_depth(&assignment.expression, depth + 1);
+            return self.normalized_mir_predicate_with_depth(
+                &assignment.expression,
+                depth + 1,
+                model_fields,
+            );
         }
 
         let (op, args) = expr.split_once('(')?;
@@ -517,16 +530,25 @@ impl MirFunctionSummary {
 
         Some(format!(
             "{} {operator} {}",
-            self.normalized_mir_expression_with_depth(left, depth + 1, &[])?,
-            self.normalized_mir_expression_with_depth(right, depth + 1, &[])?
+            self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
+            self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
         ))
     }
 
-    fn guards_for_block(&self, block: &str) -> Vec<String> {
-        self.guards_for_block_with_seen(block, &mut Vec::new())
+    fn guards_for_block_with_models(
+        &self,
+        block: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<String> {
+        self.guards_for_block_with_seen(block, &mut Vec::new(), model_fields)
     }
 
-    fn guards_for_block_with_seen(&self, block: &str, seen: &mut Vec<String>) -> Vec<String> {
+    fn guards_for_block_with_seen(
+        &self,
+        block: &str,
+        seen: &mut Vec<String>,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<String> {
         if seen.iter().any(|seen_block| seen_block == block) {
             return Vec::new();
         }
@@ -549,7 +571,7 @@ impl MirFunctionSummary {
                                 condition,
                                 &target.value,
                                 &explicit_values,
-                                &[],
+                                model_fields,
                             )
                         })
                         .collect::<Vec<_>>(),
@@ -564,7 +586,7 @@ impl MirFunctionSummary {
                 .any(|target| target == block)
             {
                 if let Some(predecessor) = terminator.block.as_deref() {
-                    guards.extend(self.guards_for_block_with_seen(predecessor, seen));
+                    guards.extend(self.guards_for_block_with_seen(predecessor, seen, model_fields));
                 }
             }
         }
@@ -614,7 +636,7 @@ impl MirFunctionSummary {
                             guards: assignment
                                 .block
                                 .as_deref()
-                                .map(|block| self.guards_for_block(block))
+                                .map(|block| self.guards_for_block_with_models(block, model_fields))
                                 .unwrap_or_default(),
                         })
                     }
@@ -629,7 +651,7 @@ impl MirFunctionSummary {
                             guards: assignment
                                 .block
                                 .as_deref()
-                                .map(|block| self.guards_for_block(block))
+                                .map(|block| self.guards_for_block_with_models(block, model_fields))
                                 .unwrap_or_default(),
                         })
                     }
@@ -662,7 +684,7 @@ impl MirFunctionSummary {
                     guards: assignment
                         .block
                         .as_deref()
-                        .map(|block| self.guards_for_block(block))
+                        .map(|block| self.guards_for_block_with_models(block, model_fields))
                         .unwrap_or_default(),
                 })
             })
@@ -688,7 +710,7 @@ impl MirFunctionSummary {
                     guards: assignment
                         .block
                         .as_deref()
-                        .map(|block| self.guards_for_block(block))
+                        .map(|block| self.guards_for_block_with_models(block, model_fields))
                         .unwrap_or_default(),
                 })
             })
@@ -787,7 +809,8 @@ impl MirFunctionSummary {
             .iter()
             .filter_map(|terminator| {
                 let (switch_condition, targets) = mir_switch(&terminator.expression)?;
-                let predicate = self.normalized_mir_predicate(switch_condition);
+                let predicate =
+                    self.normalized_mir_predicate_with_models(switch_condition, model_fields);
                 let condition_expression =
                     self.normalized_mir_expression_with_models(switch_condition, model_fields);
                 let condition = predicate.clone().or(condition_expression)?;
@@ -825,7 +848,8 @@ impl MirFunctionSummary {
         explicit_values: &[String],
         model_fields: &[ModelFieldMap],
     ) -> Option<String> {
-        if let Some(predicate) = self.normalized_mir_predicate(condition) {
+        if let Some(predicate) = self.normalized_mir_predicate_with_models(condition, model_fields)
+        {
             return mir_boolean_branch_guard(&predicate, target_value);
         }
 
@@ -2050,6 +2074,64 @@ fn add_if_safe(_1: i32) -> i32 {
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
                 guards: vec!["x < i32::MAX".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_mir_branch_guard_for_model_field_arithmetic() {
+        let mir = r#"
+fn withdraw_if_safe(_1: Account, _2: i64) -> i64 {
+    debug acct => _1;
+    debug amount => _2;
+    let mut _0: i64;
+    let mut _3: i64;
+    let mut _4: bool;
+    let mut _5: (i64, bool);
+
+    bb0: {
+        _3 = copy (_1.0: i64);
+        _4 = Ge(copy _3, copy _2);
+        switchInt(move _4) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _5 = SubWithOverflow(copy _3, copy _2);
+        assert(!move (_5.1: bool), "overflow", copy _3, copy _2) -> [success: bb3, unwind continue];
+    }
+
+    bb2: {
+        _0 = copy _3;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = move (_5.0: i64);
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+        let fields = vec![ModelFieldMap {
+            ty: "Account".to_string(),
+            fields: vec![ModelField {
+                name: "balance".to_string(),
+                ty: "i64".to_string(),
+            }],
+        }];
+        let summary = extract_mir_function_summary(mir, "withdraw_if_safe").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_arithmetic_operations_with_models(&fields),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                left: "acct.balance".to_string(),
+                right: Some("amount".to_string()),
+                expression: "acct.balance - amount".to_string(),
+                guards: vec!["acct.balance >= amount".to_string()],
             }]
         );
     }
