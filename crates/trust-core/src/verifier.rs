@@ -324,7 +324,7 @@ fn verify_total_with_env(
     }
 
     for obligation in subtraction_obligations(body, &params) {
-        if !subtraction_obligation_proved(&obligation, &contracts) {
+        if !subtraction_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerSubtractionOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -333,7 +333,7 @@ fn verify_total_with_env(
     }
 
     for obligation in negation_obligations(body, &params) {
-        if !negation_obligation_proved(&obligation, &contracts) {
+        if !negation_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerNegationOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -342,7 +342,7 @@ fn verify_total_with_env(
     }
 
     for obligation in multiplication_obligations(body, &params) {
-        if !multiplication_obligation_proved(&obligation, &contracts) {
+        if !multiplication_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -351,7 +351,7 @@ fn verify_total_with_env(
     }
 
     for obligation in division_obligations(body, &params) {
-        if !denominator_nonzero(&obligation.denominator, &contracts) {
+        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
             return Err(VerificationError::IntegerDivisionByZero {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -360,7 +360,7 @@ fn verify_total_with_env(
     }
 
     for obligation in remainder_obligations(body, &params) {
-        if !denominator_nonzero(&obligation.denominator, &contracts) {
+        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
             return Err(VerificationError::IntegerRemainderByZero {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -1447,7 +1447,12 @@ fn addition_obligation_proved(
         .any(|contract| contract == &le_required || contract == &le_unqualified)
 }
 
-fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String]) -> bool {
+fn subtraction_obligation_proved(
+    obligation: &SubObligation,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
     if let Some(constant) = obligation.constant {
         if constant == 0 {
             return true;
@@ -1466,6 +1471,12 @@ fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String
             min_bound_with_type(required_bound, ty)
         );
         let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
+
+        if z3_proves_conclusion(&ge_unqualified, contracts, params, options)
+            .is_some_and(|proved| proved)
+        {
+            return true;
+        }
 
         if constant == 1 && contracts.iter().any(|contract| contract == &gt_min) {
             return true;
@@ -1489,13 +1500,26 @@ fn subtraction_obligation_proved(obligation: &SubObligation, contracts: &[String
     };
     let ge_rhs = format!("{}>={rhs}", obligation.variable);
     let rhs_nonnegative = format!("{rhs}>=0");
+
+    if z3_proves_conclusion(&ge_rhs, contracts, params, options).is_some_and(|proved| proved)
+        && z3_proves_conclusion(&rhs_nonnegative, contracts, params, options)
+            .is_some_and(|proved| proved)
+    {
+        return true;
+    }
+
     contracts.iter().any(|contract| contract == &ge_rhs)
         && contracts
             .iter()
             .any(|contract| contract == &rhs_nonnegative)
 }
 
-fn negation_obligation_proved(obligation: &NegObligation, contracts: &[String]) -> bool {
+fn negation_obligation_proved(
+    obligation: &NegObligation,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
     let Some(min) = min_value(&obligation.ty) else {
         return false;
     };
@@ -1508,12 +1532,23 @@ fn negation_obligation_proved(obligation: &NegObligation, contracts: &[String]) 
     );
     let ge_unqualified = format!("{}>={required_bound}", obligation.variable);
 
+    if z3_proves_conclusion(&ge_unqualified, contracts, params, options)
+        .is_some_and(|proved| proved)
+    {
+        return true;
+    }
+
     contracts.iter().any(|contract| {
         contract == &gt_min || contract == &ge_required || contract == &ge_unqualified
     })
 }
 
-fn multiplication_obligation_proved(obligation: &MulObligation, contracts: &[String]) -> bool {
+fn multiplication_obligation_proved(
+    obligation: &MulObligation,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
     let Some(constant) = obligation.constant else {
         return false;
     };
@@ -1531,9 +1566,11 @@ fn multiplication_obligation_proved(obligation: &MulObligation, contracts: &[Str
     let upper_proved = contracts
         .iter()
         .any(|contract| contract == &upper_symbolic || contract == &upper_numeric);
+    let z3_upper_proved = z3_proves_conclusion(&upper_numeric, contracts, params, options)
+        .is_some_and(|proved| proved);
 
     if ty == "usize" {
-        return upper_proved;
+        return z3_upper_proved || upper_proved;
     }
 
     let Some(min) = min_value(ty) else {
@@ -1544,11 +1581,18 @@ fn multiplication_obligation_proved(obligation: &MulObligation, contracts: &[Str
     let lower_proved = contracts
         .iter()
         .any(|contract| contract == &lower_symbolic || contract == &lower_numeric);
+    let z3_lower_proved = z3_proves_conclusion(&lower_numeric, contracts, params, options)
+        .is_some_and(|proved| proved);
 
-    upper_proved && lower_proved
+    (z3_upper_proved && z3_lower_proved) || (upper_proved && lower_proved)
 }
 
-fn denominator_nonzero(denominator: &str, contracts: &[String]) -> bool {
+fn denominator_nonzero(
+    denominator: &str,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
     if denominator.parse::<i128>().is_ok_and(|value| value != 0) {
         return true;
     }
@@ -1557,9 +1601,34 @@ fn denominator_nonzero(denominator: &str, contracts: &[String]) -> bool {
     let zero_ne = format!("0!={denominator}");
     let gt_zero = format!("{denominator}>0");
     let lt_zero = format!("{denominator}<0");
+    if z3_proves_conclusion(&ne_zero, contracts, params, options).is_some_and(|proved| proved) {
+        return true;
+    }
     contracts.iter().any(|contract| {
         contract == &ne_zero || contract == &zero_ne || contract == &gt_zero || contract == &lt_zero
     })
+}
+
+fn z3_proves_conclusion(
+    conclusion: &str,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> Option<bool> {
+    if options.solver != SolverBackend::Z3 {
+        return None;
+    }
+
+    let params = params
+        .iter()
+        .filter(|param| is_supported_integer(&param.ty))
+        .map(|param| (param.name.clone(), param.ty.clone()))
+        .collect::<Vec<_>>();
+    match solver::prove_integer_predicate(contracts, conclusion, &params, options.timeout_ms) {
+        ProofResult::Proved => Some(true),
+        ProofResult::Unproved => Some(false),
+        ProofResult::Unsupported => None,
+    }
 }
 
 fn slice_index_obligation_proved(obligation: &SliceIndexObligation, contracts: &[String]) -> bool {
@@ -2232,6 +2301,24 @@ mod tests {
     }
 
     #[test]
+    fn z3_proves_i32_sub_one_from_strict_numeric_min() {
+        let metadata = metadata_named(
+            "sub_one",
+            "pub fn sub_one(x: i32) -> i32 { x - 1 }",
+            &["x > -2147483648"],
+        );
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerSubtractionOverflow { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn proves_field_subtraction_from_nonnegative_bound() {
         let account = model_metadata("Account");
         let withdraw = metadata_named(
@@ -2329,6 +2416,24 @@ mod tests {
     }
 
     #[test]
+    fn z3_proves_i32_mul_two_from_strict_numeric_upper_bound() {
+        let metadata = metadata_named(
+            "double",
+            "pub fn double(x: i32) -> i32 { x * 2 }",
+            &["x < 1073741824", "x >= -1073741824"],
+        );
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerMultiplicationOverflow { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn rejects_unproved_variable_multiplication() {
         let metadata = metadata_named("mul", "pub fn mul(x: i32, y: i32) -> i32 { x * y }", &[]);
 
@@ -2361,6 +2466,24 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn z3_proves_integer_division_denominator_from_positive_lower_bound() {
+        let metadata = metadata_named(
+            "div",
+            "pub fn div(x: i32, y: i32) -> i32 { x / y }",
+            &["y >= 1"],
+        );
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionByZero { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
+            Ok(())
+        );
     }
 
     #[test]

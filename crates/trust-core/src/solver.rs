@@ -72,6 +72,19 @@ pub fn prove_addition_overflow_safety(
     )
 }
 
+pub fn prove_integer_predicate(
+    assumptions: &[String],
+    conclusion: &str,
+    params: &[(String, String)],
+    timeout_ms: u64,
+) -> ProofResult {
+    let Some(conclusion) = parse_predicate(conclusion) else {
+        return ProofResult::Unsupported;
+    };
+
+    prove_integer_implication(assumptions, &conclusion, params, timeout_ms)
+}
+
 fn prove_integer_implication(
     assumptions: &[String],
     conclusion: &Predicate,
@@ -377,6 +390,16 @@ mod tests {
         assert_eq!(
             prove_addition_overflow_safety("x", "i32", 1, &[], &i32_param("x"), 5000),
             ProofResult::Unproved
+        );
+    }
+
+    #[test]
+    fn z3_proves_nonzero_from_positive_lower_bound() {
+        let contracts = vec!["y>=1".to_string()];
+
+        assert_eq!(
+            prove_integer_predicate(&contracts, "y!=0", &i32_param("y"), 5000),
+            ProofResult::Proved
         );
     }
 }
