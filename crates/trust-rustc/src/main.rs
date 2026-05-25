@@ -580,17 +580,11 @@ fn cache_path(
     cache_context: &CacheContext,
 ) -> PathBuf {
     let mut hasher = DefaultHasher::new();
-    "trust-proof-cache-v1".hash(&mut hasher);
+    "trust-proof-cache-v2".hash(&mut hasher);
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
     cache_context.hash(&mut hasher);
     for item in metadata {
-        item.schema_version.hash(&mut hasher);
-        item.item_kind.hash(&mut hasher);
-        item.item_id.hash(&mut hasher);
-        item.rust_function_path.hash(&mut hasher);
-        item.contracts_original.hash(&mut hasher);
-        item.contract_classes.hash(&mut hasher);
-        item.function_source.hash(&mut hasher);
+        hash_metadata_item(item, &mut hasher);
     }
 
     cache_dir.join(format!("{:016x}.proof", hasher.finish()))
@@ -619,15 +613,27 @@ fn cache_entry_fingerprint(
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
     cache_context.hash(&mut hasher);
     for item in metadata {
-        item.schema_version.hash(&mut hasher);
-        item.item_kind.hash(&mut hasher);
-        item.item_id.hash(&mut hasher);
-        item.rust_function_path.hash(&mut hasher);
-        item.contracts_original.hash(&mut hasher);
-        item.contract_classes.hash(&mut hasher);
-        item.function_source.hash(&mut hasher);
+        hash_metadata_item(item, &mut hasher);
     }
     hasher.finish()
+}
+
+fn hash_metadata_item(item: &trust_core::metadata::TrustMetadata, hasher: &mut DefaultHasher) {
+    item.schema_version.hash(hasher);
+    item.trust_macro_version.hash(hasher);
+    item.module_id.hash(hasher);
+    item.item_kind.hash(hasher);
+    item.item_id.hash(hasher);
+    item.source_span.hash(hasher);
+    item.rust_function_path.hash(hasher);
+    item.visibility.hash(hasher);
+    item.contracts_original.hash(hasher);
+    item.contracts_normalized.hash(hasher);
+    item.contract_classes.hash(hasher);
+    item.assertion_policy.hash(hasher);
+    item.function_source.hash(hasher);
+    item.body_hash_placeholder.hash(hasher);
+    item.trust_model_dependencies.hash(hasher);
 }
 
 fn cache_entry_contents(

@@ -5,12 +5,20 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustMetadata {
     pub schema_version: u32,
+    pub trust_macro_version: String,
+    pub module_id: String,
     pub item_kind: String,
     pub item_id: String,
+    pub source_span: String,
     pub rust_function_path: String,
+    pub visibility: String,
     pub contracts_original: Vec<String>,
+    pub contracts_normalized: Vec<String>,
     pub contract_classes: Vec<String>,
+    pub assertion_policy: String,
     pub function_source: String,
+    pub body_hash_placeholder: String,
+    pub trust_model_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,12 +54,20 @@ pub fn parse_metadata_line(line: &str) -> Result<TrustMetadata, MetadataError> {
 
     Ok(TrustMetadata {
         schema_version,
+        trust_macro_version: extract_string(line, "trust_macro_version")?,
+        module_id: extract_string(line, "module_id")?,
         item_kind: extract_string(line, "item_kind")?,
         item_id: extract_string(line, "item_id")?,
+        source_span: extract_string(line, "source_span")?,
         rust_function_path: extract_string(line, "rust_function_path")?,
+        visibility: extract_string(line, "visibility")?,
         contracts_original: extract_string_array(line, "contracts_original")?,
+        contracts_normalized: extract_string_array(line, "contracts_normalized")?,
         contract_classes: extract_string_array(line, "contract_classes")?,
+        assertion_policy: extract_string(line, "assertion_policy")?,
         function_source: extract_string(line, "function_source")?,
+        body_hash_placeholder: extract_string(line, "body_hash_placeholder")?,
+        trust_model_dependencies: extract_string_array(line, "trust_model_dependencies")?,
     })
 }
 
@@ -178,19 +194,28 @@ fn after_field_colon<'a>(input: &'a str, field: &'static str) -> Result<&'a str,
 mod tests {
     use super::*;
 
+    const TOTAL_METADATA_JSON: &str = r#"{"schema_version":1,"trust_macro_version":"0.1.0","module_id":"unknown","item_id":"total:id:abc","item_kind":"total","source_span":"unknown","rust_function_path":"id","visibility":"public","contracts_original":["x < i32::MAX"],"contracts_normalized":["x < i32::MAX"],"contract_classes":["given executable"],"assertion_policy":"always","function_source":"pub fn id(x: i32) -> i32 { x }","body_hash_placeholder":"abc","trust_model_dependencies":["Model"]}"#;
+    const EMPTY_ARRAY_METADATA_JSON: &str = r#"{"schema_version":1,"trust_macro_version":"0.1.0","module_id":"unknown","item_id":"total:id:abc","item_kind":"total","source_span":"unknown","rust_function_path":"id","visibility":"public","contracts_original":[],"contracts_normalized":[],"contract_classes":[],"assertion_policy":"always","function_source":"pub fn id(x: i32) -> i32 { x }","body_hash_placeholder":"abc","trust_model_dependencies":[]}"#;
+
     #[test]
     fn parses_total_metadata() {
-        let metadata = parse_metadata_line(
-            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":["x < i32::MAX"],"contract_classes":["given executable"],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
-        )
-        .unwrap();
+        let metadata = parse_metadata_line(TOTAL_METADATA_JSON).unwrap();
 
         assert_eq!(metadata.schema_version, 1);
+        assert_eq!(metadata.trust_macro_version, "0.1.0");
+        assert_eq!(metadata.module_id, "unknown");
+        assert_eq!(metadata.item_id, "total:id:abc");
         assert_eq!(metadata.item_kind, "total");
+        assert_eq!(metadata.source_span, "unknown");
         assert_eq!(metadata.rust_function_path, "id");
+        assert_eq!(metadata.visibility, "public");
         assert_eq!(metadata.contracts_original, ["x < i32::MAX"]);
+        assert_eq!(metadata.contracts_normalized, ["x < i32::MAX"]);
         assert_eq!(metadata.contract_classes, ["given executable"]);
+        assert_eq!(metadata.assertion_policy, "always");
         assert_eq!(metadata.function_source, "pub fn id(x: i32) -> i32 { x }");
+        assert_eq!(metadata.body_hash_placeholder, "abc");
+        assert_eq!(metadata.trust_model_dependencies, ["Model"]);
     }
 
     #[test]
@@ -205,11 +230,21 @@ mod tests {
 
     #[test]
     fn parses_empty_string_array() {
-        let metadata = parse_metadata_line(
-            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":[],"contract_classes":[],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
-        )
-        .unwrap();
+        let metadata = parse_metadata_line(EMPTY_ARRAY_METADATA_JSON).unwrap();
 
         assert!(metadata.contracts_original.is_empty());
+        assert!(metadata.contracts_normalized.is_empty());
+        assert!(metadata.contract_classes.is_empty());
+        assert!(metadata.trust_model_dependencies.is_empty());
+    }
+
+    #[test]
+    fn rejects_incomplete_metadata() {
+        let err = parse_metadata_line(
+            r#"{"schema_version":1,"item_id":"total:id:abc","item_kind":"total","rust_function_path":"id","contracts_original":[],"contract_classes":[],"function_source":"pub fn id(x: i32) -> i32 { x }"}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, MetadataError::MissingField("trust_macro_version"));
     }
 }

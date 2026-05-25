@@ -2106,42 +2106,72 @@ mod tests {
     ) -> TrustMetadata {
         TrustMetadata {
             schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "test-module".to_string(),
             item_kind: "total".to_string(),
-            item_id: "total:add_one:test".to_string(),
+            item_id: format!("total:{name}:test"),
+            source_span: "test-span".to_string(),
             rust_function_path: name.to_string(),
+            visibility: "public".to_string(),
             contracts_original: contracts
                 .iter()
                 .map(|contract| contract.to_string())
                 .collect(),
+            contracts_normalized: contracts
+                .iter()
+                .map(|contract| contract.to_string())
+                .collect(),
             contract_classes: classes.iter().map(|class| class.to_string()).collect(),
+            assertion_policy: "always".to_string(),
             function_source: function_source.to_string(),
+            body_hash_placeholder: format!("{name}-hash"),
+            trust_model_dependencies: Vec::new(),
         }
     }
 
     fn model_metadata(name: &str) -> TrustMetadata {
         TrustMetadata {
             schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "test-module".to_string(),
             item_kind: "trust_model".to_string(),
             item_id: format!("model:{name}:test"),
+            source_span: "test-span".to_string(),
             rust_function_path: name.to_string(),
+            visibility: "public".to_string(),
             contracts_original: Vec::new(),
+            contracts_normalized: Vec::new(),
             contract_classes: Vec::new(),
+            assertion_policy: "always".to_string(),
             function_source: format!("pub struct {name} {{ pub balance: i64 }}"),
+            body_hash_placeholder: format!("{name}-hash"),
+            trust_model_dependencies: Vec::new(),
         }
     }
 
     fn proof_metadata(name: &str, function_source: &str, contracts: &[&str]) -> TrustMetadata {
         TrustMetadata {
             schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "test-module".to_string(),
             item_kind: "proof".to_string(),
             item_id: format!("proof:{name}:test"),
+            source_span: "test-span".to_string(),
             rust_function_path: name.to_string(),
+            visibility: "private".to_string(),
             contracts_original: contracts
                 .iter()
                 .map(|contract| contract.to_string())
                 .collect(),
+            contracts_normalized: contracts
+                .iter()
+                .map(|contract| contract.to_string())
+                .collect(),
             contract_classes: vec!["gives ghost".to_string(); contracts.len()],
+            assertion_policy: "always".to_string(),
             function_source: function_source.to_string(),
+            body_hash_placeholder: format!("{name}-hash"),
+            trust_model_dependencies: Vec::new(),
         }
     }
 
