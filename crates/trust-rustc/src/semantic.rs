@@ -8,7 +8,9 @@ use std::process::Command;
 
 use trust_core::{
     metadata::TrustMetadata,
-    verifier::{SemanticParam, TrustFunctionSemantics},
+    verifier::{
+        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticParam, TrustFunctionSemantics,
+    },
 };
 
 use crate::{deterministic_test_mode, exit_code, metadata_path, plural, rustc_verbose_version};
@@ -189,6 +191,7 @@ fn verifier_semantics(item_matches: &[SemanticItemMatch]) -> Vec<TrustFunctionSe
                     .collect(),
                 return_type: mir_function.return_type.clone(),
                 return_expression: mir_function.normalized_return_expression(),
+                arithmetic_operations: mir_function.semantic_arithmetic_operations(),
             })
         })
         .collect()
@@ -332,6 +335,43 @@ impl MirFunctionSummary {
             .rev()
             .find(|assignment| assignment.place == place)
     }
+
+    fn semantic_arithmetic_operations(&self) -> Vec<SemanticArithmeticOperation> {
+        self.assignments
+            .iter()
+            .filter_map(|assignment| {
+                let (kind, args) = mir_checked_arithmetic_operation(&assignment.expression)?;
+                match (kind, args.as_slice()) {
+                    (
+                        SemanticArithmeticKind::Add
+                        | SemanticArithmeticKind::Sub
+                        | SemanticArithmeticKind::Mul,
+                        [left, right],
+                    ) => {
+                        let left = self.normalized_mir_expression(left)?;
+                        let right = self.normalized_mir_expression(right)?;
+                        let operator = semantic_arithmetic_operator(kind);
+                        Some(SemanticArithmeticOperation {
+                            kind,
+                            expression: format!("{left} {operator} {right}"),
+                            left,
+                            right: Some(right),
+                        })
+                    }
+                    (SemanticArithmeticKind::Neg, [value]) => {
+                        let value = self.normalized_mir_expression(value)?;
+                        Some(SemanticArithmeticOperation {
+                            kind,
+                            expression: format!("-{value}"),
+                            left: value,
+                            right: None,
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +492,28 @@ fn parse_mir_call_args(input: &str) -> Vec<String> {
     parse_comma_separated(input)
 }
 
+fn mir_checked_arithmetic_operation(expr: &str) -> Option<(SemanticArithmeticKind, Vec<String>)> {
+    let (op, args) = expr.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    let kind = match op.trim() {
+        "AddWithOverflow" => SemanticArithmeticKind::Add,
+        "SubWithOverflow" => SemanticArithmeticKind::Sub,
+        "MulWithOverflow" => SemanticArithmeticKind::Mul,
+        "NegWithOverflow" => SemanticArithmeticKind::Neg,
+        _ => return None,
+    };
+    Some((kind, parse_mir_call_args(args)))
+}
+
+fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
+    match kind {
+        SemanticArithmeticKind::Add => "+",
+        SemanticArithmeticKind::Sub => "-",
+        SemanticArithmeticKind::Mul => "*",
+        SemanticArithmeticKind::Neg => "-",
+    }
+}
+
 fn semantic_dump_base(metadata: &[TrustMetadata], rustc_args: &[OsString]) -> String {
     let crate_name = crate_name_arg(rustc_args).unwrap_or_else(|| "crate".to_string());
     let mut hasher = DefaultHasher::new();
@@ -535,8 +597,14 @@ fn semantic_summary(
                 .normalized_return_expression()
                 .or_else(|| mir_function.return_expr.clone())
                 .unwrap_or_else(|| "none".to_string());
+            let arithmetic_ops = mir_function
+                .semantic_arithmetic_operations()
+                .iter()
+                .map(|operation| operation.expression.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={}\n",
                 item.rust_function_path,
                 mir_function
                     .args
@@ -551,7 +619,8 @@ fn semantic_summary(
                     .map(|local| local.name.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
-                return_expr
+                return_expr,
+                arithmetic_ops,
             ));
         }
     }
@@ -632,6 +701,15 @@ fn add_one(_1: i32) -> i32 {
             summary.normalized_return_expression(),
             Some("x + 1".to_string())
         );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -658,6 +736,15 @@ fn add_one(_1: i32) -> i32 {
         assert_eq!(
             summary.normalized_return_expression(),
             Some("x + 1".to_string())
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+            }]
         );
     }
 

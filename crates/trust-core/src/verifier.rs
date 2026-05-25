@@ -10,12 +10,29 @@ pub struct TrustFunctionSemantics {
     pub params: Vec<SemanticParam>,
     pub return_type: String,
     pub return_expression: Option<String>,
+    pub arithmetic_operations: Vec<SemanticArithmeticOperation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticParam {
     pub name: String,
     pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticArithmeticOperation {
+    pub kind: SemanticArithmeticKind,
+    pub left: String,
+    pub right: Option<String>,
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticArithmeticKind {
+    Add,
+    Sub,
+    Mul,
+    Neg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,7 +372,25 @@ fn verify_total_with_env(
         }
     }
 
+    for obligation in semantic_addition_obligations(semantics, &params) {
+        if !addition_obligation_proved(&obligation, &contracts, &params, options) {
+            return Err(VerificationError::IntegerAdditionOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     for obligation in subtraction_obligations(body, &params) {
+        if !subtraction_obligation_proved(&obligation, &contracts, &params, options) {
+            return Err(VerificationError::IntegerSubtractionOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    for obligation in semantic_subtraction_obligations(semantics, &params) {
         if !subtraction_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerSubtractionOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -373,7 +408,25 @@ fn verify_total_with_env(
         }
     }
 
+    for obligation in semantic_negation_obligations(semantics, &params) {
+        if !negation_obligation_proved(&obligation, &contracts, &params, options) {
+            return Err(VerificationError::IntegerNegationOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     for obligation in multiplication_obligations(body, &params) {
+        if !multiplication_obligation_proved(&obligation, &contracts, &params, options) {
+            return Err(VerificationError::IntegerMultiplicationOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    for obligation in semantic_multiplication_obligations(semantics, &params) {
         if !multiplication_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -946,6 +999,178 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
     }
 
     obligations
+}
+
+fn semantic_addition_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    params: &[Param],
+) -> Vec<AddObligation> {
+    semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Add)
+        .filter_map(|operation| {
+            let right = operation.right.as_ref()?;
+            semantic_addition_obligation(&operation.left, right, &operation.expression, params)
+        })
+        .collect()
+}
+
+fn semantic_subtraction_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    params: &[Param],
+) -> Vec<SubObligation> {
+    semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Sub)
+        .filter_map(|operation| {
+            let right = operation.right.as_ref()?;
+            semantic_subtraction_obligation(&operation.left, right, &operation.expression, params)
+        })
+        .collect()
+}
+
+fn semantic_negation_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    params: &[Param],
+) -> Vec<NegObligation> {
+    semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Neg)
+        .filter_map(|operation| {
+            let param = params
+                .iter()
+                .find(|param| param.name == operation.left && is_signed_integer(&param.ty))?;
+            Some(NegObligation {
+                variable: operation.left.clone(),
+                ty: param.ty.clone(),
+                expression: operation.expression.clone(),
+            })
+        })
+        .collect()
+}
+
+fn semantic_multiplication_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    params: &[Param],
+) -> Vec<MulObligation> {
+    semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Mul)
+        .filter_map(|operation| {
+            let right = operation.right.as_ref()?;
+            semantic_multiplication_obligation(
+                &operation.left,
+                right,
+                &operation.expression,
+                params,
+            )
+        })
+        .collect()
+}
+
+fn semantic_arithmetic_operations(
+    semantics: Option<&TrustFunctionSemantics>,
+    kind: SemanticArithmeticKind,
+) -> impl Iterator<Item = &SemanticArithmeticOperation> {
+    semantics
+        .into_iter()
+        .flat_map(|semantics| semantics.arithmetic_operations.iter())
+        .filter(move |operation| operation.kind == kind)
+}
+
+fn semantic_addition_obligation(
+    left: &str,
+    right: &str,
+    expression: &str,
+    params: &[Param],
+) -> Option<AddObligation> {
+    if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+        return Some(AddObligation {
+            variable: left.to_string(),
+            ty: Some(ty.to_string()),
+            constant: Some(constant),
+            expression: expression.to_string(),
+        });
+    }
+    if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
+        return Some(AddObligation {
+            variable: right.to_string(),
+            ty: Some(ty.to_string()),
+            constant: Some(constant),
+            expression: expression.to_string(),
+        });
+    }
+    if expression_needs_integer_proof(left, right, params) {
+        return Some(AddObligation {
+            variable: left.to_string(),
+            ty: param_type(left, params)
+                .or_else(|| param_type(right, params))
+                .map(str::to_string),
+            constant: None,
+            expression: expression.to_string(),
+        });
+    }
+
+    None
+}
+
+fn semantic_subtraction_obligation(
+    left: &str,
+    right: &str,
+    expression: &str,
+    params: &[Param],
+) -> Option<SubObligation> {
+    if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+        if constant > 0 {
+            return Some(SubObligation {
+                variable: left.to_string(),
+                ty: Some(ty.to_string()),
+                constant: Some(constant),
+                rhs: None,
+                expression: expression.to_string(),
+            });
+        }
+    } else if expression_needs_integer_proof(left, right, params) {
+        return Some(SubObligation {
+            variable: left.to_string(),
+            ty: param_type(left, params).map(str::to_string),
+            constant: None,
+            rhs: Some(right.to_string()),
+            expression: expression.to_string(),
+        });
+    }
+
+    None
+}
+
+fn semantic_multiplication_obligation(
+    left: &str,
+    right: &str,
+    expression: &str,
+    params: &[Param],
+) -> Option<MulObligation> {
+    if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+        if constant > 1 {
+            return Some(MulObligation {
+                variable: left.to_string(),
+                ty: Some(ty.to_string()),
+                constant: Some(constant),
+                expression: expression.to_string(),
+            });
+        }
+    } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
+        if constant > 1 {
+            return Some(MulObligation {
+                variable: right.to_string(),
+                ty: Some(ty.to_string()),
+                constant: Some(constant),
+                expression: expression.to_string(),
+            });
+        }
+    } else if expression_needs_integer_proof(left, right, params) {
+        return Some(MulObligation {
+            variable: left.to_string(),
+            ty: param_type(left, params)
+                .or_else(|| param_type(right, params))
+                .map(str::to_string),
+            constant: None,
+            expression: expression.to_string(),
+        });
+    }
+
+    None
 }
 
 fn division_obligations(body: &str, params: &[Param]) -> Vec<DenominatorObligation> {
@@ -3137,6 +3362,7 @@ mod tests {
             }],
             return_type: "i32".to_string(),
             return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
         };
 
         assert!(matches!(
@@ -3146,6 +3372,39 @@ mod tests {
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_catches_block_addition_overflow() {
+        let metadata = metadata_named(
+            "add_one",
+            "pub fn add_one(x: i32) -> i32 { x + { 1 } }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "add_one".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: Some("x + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+            }],
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add_one".to_string(),
+                expression: "x + 1".to_string(),
+            })
         );
     }
 
