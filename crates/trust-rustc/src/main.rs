@@ -48,6 +48,7 @@ fn run() -> Result<i32, String> {
     }
 
     let metadata = read_metadata(&metadata_path)?;
+    emit_config_warnings(&metadata, &config);
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -93,6 +94,7 @@ struct TrustConfig {
     solver: String,
     timeout_ms: u64,
     cache: String,
+    silence_assume_warning: bool,
     fingerprint: String,
 }
 
@@ -103,6 +105,7 @@ impl TrustConfig {
             solver: env::var("TRUST_SOLVER").unwrap_or_else(|_| "mock".to_string()),
             timeout_ms: 5000,
             cache: "local".to_string(),
+            silence_assume_warning: false,
             fingerprint: "missing-config".to_string(),
         };
 
@@ -142,6 +145,9 @@ impl TrustConfig {
                 "solver" => config.solver = parse_config_string(value, key)?,
                 "timeout_ms" => config.timeout_ms = parse_timeout_ms(value)?,
                 "cache" => config.cache = parse_config_string(value, key)?,
+                "silence_assume_warning" => {
+                    config.silence_assume_warning = parse_config_bool(value, key)?
+                }
                 _ => {}
             }
         }
@@ -183,6 +189,34 @@ fn parse_timeout_ms(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("invalid timeout_ms `{value}`"))
+}
+
+fn parse_config_bool(value: &str, key: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("Trust config `{key}` must be a boolean")),
+    }
+}
+
+fn emit_config_warnings(metadata: &[trust_core::metadata::TrustMetadata], config: &TrustConfig) {
+    if config.assertions == "assume"
+        && !config.silence_assume_warning
+        && metadata_has_verification_item(metadata)
+    {
+        eprintln!(
+            "warning[trust]: assertions = \"assume\" disables runtime checks for executable Trust contracts"
+        );
+        eprintln!(
+            "help[trust]: set `silence_assume_warning = true` in [package.metadata.trust] if this is intentional"
+        );
+    }
+}
+
+fn metadata_has_verification_item(metadata: &[trust_core::metadata::TrustMetadata]) -> bool {
+    metadata
+        .iter()
+        .any(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

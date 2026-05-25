@@ -1,0 +1,17 @@
+[package]
+name = "pass_config_assume_warning_silenced"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
+
+[package.metadata.trust]
+assertions = "assume"
+solver = "mock"
+silence_assume_warning = true

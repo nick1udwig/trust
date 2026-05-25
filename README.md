@@ -75,6 +75,8 @@ assertions = "always"
 solver = "z3"
 timeout_ms = 5000
 cache = "local"
+# Optional: silence the warning for assertions = "assume".
+silence_assume_warning = false
 ```
 
 Then normal Cargo commands verify Trust code:

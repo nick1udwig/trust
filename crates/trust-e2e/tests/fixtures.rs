@@ -182,7 +182,34 @@ fn pass_missing_config_uses_defaults() {
 
 #[test]
 fn pass_assume_config_omits_runtime_precondition_assertion() {
-    run_fixture("pass_config_assume_no_runtime_assertion", Expected::Pass);
+    let suffix = std::process::id();
+    let target_name = format!("pass_config_assume_warning_{suffix}");
+    let cache_name = format!("pass_config_assume_warning_{suffix}");
+    let output = run_fixture_with_cache(
+        "pass_config_assume_no_runtime_assertion",
+        Expected::Pass,
+        &target_name,
+        &cache_name,
+    );
+
+    output.assert_contains(
+        "warning[trust]: assertions = \"assume\" disables runtime checks for executable Trust contracts",
+    );
+}
+
+#[test]
+fn pass_assume_config_warning_can_be_silenced() {
+    let suffix = std::process::id();
+    let target_name = format!("pass_config_assume_warning_silenced_{suffix}");
+    let cache_name = format!("pass_config_assume_warning_silenced_{suffix}");
+    let output = run_fixture_with_cache(
+        "pass_config_assume_warning_silenced",
+        Expected::Pass,
+        &target_name,
+        &cache_name,
+    );
+
+    output.assert_not_contains("warning[trust]: assertions = \"assume\"");
 }
 
 #[test]

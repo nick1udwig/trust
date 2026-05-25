@@ -29,6 +29,15 @@ impl FixtureOutput {
         );
     }
 
+    pub fn assert_not_contains(&self, needle: &str) {
+        let combined = self.combined();
+        assert!(
+            !combined.contains(needle),
+            "expected fixture output not to contain `{needle}`\n\n{}",
+            normalize_paths(&combined)
+        );
+    }
+
     pub fn trust_diagnostics(&self) -> Vec<String> {
         let mut diagnostics = Vec::new();
         for line in self.combined().lines() {
