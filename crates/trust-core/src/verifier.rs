@@ -27,6 +27,7 @@ pub struct SemanticArithmeticOperation {
     pub left: String,
     pub right: Option<String>,
     pub expression: String,
+    pub guards: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -380,7 +381,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in addition_obligations(body, &params) {
+    for obligation in verification_addition_obligations(body, &params, semantics) {
         if !addition_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerAdditionOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -389,16 +390,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in semantic_addition_obligations(semantics, &params) {
-        if !addition_obligation_proved(&obligation, &contracts, &params, options) {
-            return Err(VerificationError::IntegerAdditionOverflow {
-                function: metadata.rust_function_path.clone(),
-                expression: obligation.expression,
-            });
-        }
-    }
-
-    for obligation in subtraction_obligations(body, &params) {
+    for obligation in verification_subtraction_obligations(body, &params, semantics) {
         if !subtraction_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerSubtractionOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -407,16 +399,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in semantic_subtraction_obligations(semantics, &params) {
-        if !subtraction_obligation_proved(&obligation, &contracts, &params, options) {
-            return Err(VerificationError::IntegerSubtractionOverflow {
-                function: metadata.rust_function_path.clone(),
-                expression: obligation.expression,
-            });
-        }
-    }
-
-    for obligation in negation_obligations(body, &params) {
+    for obligation in verification_negation_obligations(body, &params, semantics) {
         if !negation_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerNegationOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -425,16 +408,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in semantic_negation_obligations(semantics, &params) {
-        if !negation_obligation_proved(&obligation, &contracts, &params, options) {
-            return Err(VerificationError::IntegerNegationOverflow {
-                function: metadata.rust_function_path.clone(),
-                expression: obligation.expression,
-            });
-        }
-    }
-
-    for obligation in multiplication_obligations(body, &params) {
+    for obligation in verification_multiplication_obligations(body, &params, semantics) {
         if !multiplication_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -443,16 +417,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in semantic_multiplication_obligations(semantics, &params) {
-        if !multiplication_obligation_proved(&obligation, &contracts, &params, options) {
-            return Err(VerificationError::IntegerMultiplicationOverflow {
-                function: metadata.rust_function_path.clone(),
-                expression: obligation.expression,
-            });
-        }
-    }
-
-    for obligation in division_obligations(body, &params) {
+    for obligation in verification_division_obligations(body, &params, semantics) {
+        let contracts = contracts_with_assumptions(&contracts, &obligation.assumptions);
         if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
             return Err(VerificationError::IntegerDivisionByZero {
                 function: metadata.rust_function_path.clone(),
@@ -461,25 +427,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in semantic_division_obligations(semantics) {
-        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
-            return Err(VerificationError::IntegerDivisionByZero {
-                function: metadata.rust_function_path.clone(),
-                expression: obligation.expression,
-            });
-        }
-    }
-
-    for obligation in remainder_obligations(body, &params) {
-        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
-            return Err(VerificationError::IntegerRemainderByZero {
-                function: metadata.rust_function_path.clone(),
-                expression: obligation.expression,
-            });
-        }
-    }
-
-    for obligation in semantic_remainder_obligations(semantics) {
+    for obligation in verification_remainder_obligations(body, &params, semantics) {
+        let contracts = contracts_with_assumptions(&contracts, &obligation.assumptions);
         if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
             return Err(VerificationError::IntegerRemainderByZero {
                 function: metadata.rust_function_path.clone(),
@@ -556,6 +505,7 @@ struct AddObligation {
     ty: Option<String>,
     constant: Option<i128>,
     expression: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +515,7 @@ struct SubObligation {
     constant: Option<i128>,
     rhs: Option<String>,
     expression: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,6 +523,7 @@ struct NegObligation {
     variable: String,
     ty: String,
     expression: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,12 +532,14 @@ struct MulObligation {
     ty: Option<String>,
     constant: Option<i128>,
     expression: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DenominatorObligation {
     denominator: String,
     expression: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,6 +813,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
+                assumptions: Vec::new(),
             });
             continue;
         }
@@ -873,6 +828,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                 ty: Some(ty.to_string()),
                 constant: Some(constant),
                 expression,
+                assumptions: Vec::new(),
             });
         } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
             obligations.push(AddObligation {
@@ -880,6 +836,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                 ty: Some(ty.to_string()),
                 constant: Some(constant),
                 expression,
+                assumptions: Vec::new(),
             });
         } else if expression_needs_integer_proof(left, right, params) {
             obligations.push(AddObligation {
@@ -889,6 +846,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
+                assumptions: Vec::new(),
             });
         }
     }
@@ -914,6 +872,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
                 constant: None,
                 rhs: Some(right.clone()),
                 expression,
+                assumptions: Vec::new(),
             });
             continue;
         }
@@ -931,6 +890,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
                     constant: Some(constant),
                     rhs: None,
                     expression,
+                    assumptions: Vec::new(),
                 });
             }
         } else if expression_needs_integer_proof(left, right, params)
@@ -942,6 +902,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
                 constant: None,
                 rhs: Some(right.clone()),
                 expression,
+                assumptions: Vec::new(),
             });
         }
     }
@@ -970,6 +931,7 @@ fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
             variable: variable.clone(),
             ty: param.ty.clone(),
             expression: format!("-{variable}"),
+            assumptions: Vec::new(),
         });
     }
 
@@ -995,6 +957,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
+                assumptions: Vec::new(),
             });
             continue;
         }
@@ -1010,6 +973,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     ty: Some(ty.to_string()),
                     constant: Some(constant),
                     expression,
+                    assumptions: Vec::new(),
                 });
             }
         } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
@@ -1019,6 +983,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     ty: Some(ty.to_string()),
                     constant: Some(constant),
                     expression,
+                    assumptions: Vec::new(),
                 });
             }
         } else if expression_needs_integer_proof(left, right, params) {
@@ -1029,11 +994,25 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
+                assumptions: Vec::new(),
             });
         }
     }
 
     obligations
+}
+
+fn verification_addition_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<AddObligation> {
+    let semantic_obligations = semantic_addition_obligations(semantics, params);
+    if semantic_obligations.is_empty() {
+        addition_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
 }
 
 fn semantic_addition_obligations(
@@ -1043,9 +1022,27 @@ fn semantic_addition_obligations(
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Add)
         .filter_map(|operation| {
             let right = operation.right.as_ref()?;
-            semantic_addition_obligation(&operation.left, right, &operation.expression, params)
+            semantic_addition_obligation(&operation.left, right, &operation.expression, params).map(
+                |mut obligation| {
+                    obligation.assumptions = semantic_guard_assumptions(operation);
+                    obligation
+                },
+            )
         })
         .collect()
+}
+
+fn verification_subtraction_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<SubObligation> {
+    let semantic_obligations = semantic_subtraction_obligations(semantics, params);
+    if semantic_obligations.is_empty() {
+        subtraction_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
 }
 
 fn semantic_subtraction_obligations(
@@ -1056,8 +1053,25 @@ fn semantic_subtraction_obligations(
         .filter_map(|operation| {
             let right = operation.right.as_ref()?;
             semantic_subtraction_obligation(&operation.left, right, &operation.expression, params)
+                .map(|mut obligation| {
+                    obligation.assumptions = semantic_guard_assumptions(operation);
+                    obligation
+                })
         })
         .collect()
+}
+
+fn verification_negation_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<NegObligation> {
+    let semantic_obligations = semantic_negation_obligations(semantics, params);
+    if semantic_obligations.is_empty() {
+        negation_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
 }
 
 fn semantic_negation_obligations(
@@ -1073,9 +1087,23 @@ fn semantic_negation_obligations(
                 variable: operation.left.clone(),
                 ty: param.ty.clone(),
                 expression: operation.expression.clone(),
+                assumptions: semantic_guard_assumptions(operation),
             })
         })
         .collect()
+}
+
+fn verification_multiplication_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<MulObligation> {
+    let semantic_obligations = semantic_multiplication_obligations(semantics, params);
+    if semantic_obligations.is_empty() {
+        multiplication_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
 }
 
 fn semantic_multiplication_obligations(
@@ -1091,6 +1119,10 @@ fn semantic_multiplication_obligations(
                 &operation.expression,
                 params,
             )
+            .map(|mut obligation| {
+                obligation.assumptions = semantic_guard_assumptions(operation);
+                obligation
+            })
         })
         .collect()
 }
@@ -1107,6 +1139,32 @@ fn semantic_remainder_obligations(
     semantic_denominator_obligations(semantics, SemanticArithmeticKind::Rem)
 }
 
+fn verification_division_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<DenominatorObligation> {
+    let semantic_obligations = semantic_division_obligations(semantics);
+    if semantic_obligations.is_empty() {
+        division_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
+}
+
+fn verification_remainder_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<DenominatorObligation> {
+    let semantic_obligations = semantic_remainder_obligations(semantics);
+    if semantic_obligations.is_empty() {
+        remainder_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
+}
+
 fn semantic_arithmetic_operations(
     semantics: Option<&TrustFunctionSemantics>,
     kind: SemanticArithmeticKind,
@@ -1115,6 +1173,14 @@ fn semantic_arithmetic_operations(
         .into_iter()
         .flat_map(|semantics| semantics.arithmetic_operations.iter())
         .filter(move |operation| operation.kind == kind)
+}
+
+fn semantic_guard_assumptions(operation: &SemanticArithmeticOperation) -> Vec<String> {
+    operation
+        .guards
+        .iter()
+        .map(|guard| normalize(guard))
+        .collect()
 }
 
 fn semantic_denominator_obligations(
@@ -1127,6 +1193,7 @@ fn semantic_denominator_obligations(
             Some(DenominatorObligation {
                 denominator: denominator.clone(),
                 expression: operation.expression.clone(),
+                assumptions: semantic_guard_assumptions(operation),
             })
         })
         .collect()
@@ -1144,6 +1211,7 @@ fn semantic_addition_obligation(
             ty: Some(ty.to_string()),
             constant: Some(constant),
             expression: expression.to_string(),
+            assumptions: Vec::new(),
         });
     }
     if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
@@ -1152,6 +1220,7 @@ fn semantic_addition_obligation(
             ty: Some(ty.to_string()),
             constant: Some(constant),
             expression: expression.to_string(),
+            assumptions: Vec::new(),
         });
     }
     if expression_needs_integer_proof(left, right, params) {
@@ -1162,6 +1231,7 @@ fn semantic_addition_obligation(
                 .map(str::to_string),
             constant: None,
             expression: expression.to_string(),
+            assumptions: Vec::new(),
         });
     }
 
@@ -1182,6 +1252,7 @@ fn semantic_subtraction_obligation(
                 constant: Some(constant),
                 rhs: None,
                 expression: expression.to_string(),
+                assumptions: Vec::new(),
             });
         }
     } else if expression_needs_integer_proof(left, right, params) {
@@ -1191,6 +1262,7 @@ fn semantic_subtraction_obligation(
             constant: None,
             rhs: Some(right.to_string()),
             expression: expression.to_string(),
+            assumptions: Vec::new(),
         });
     }
 
@@ -1210,6 +1282,7 @@ fn semantic_multiplication_obligation(
                 ty: Some(ty.to_string()),
                 constant: Some(constant),
                 expression: expression.to_string(),
+                assumptions: Vec::new(),
             });
         }
     } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
@@ -1219,6 +1292,7 @@ fn semantic_multiplication_obligation(
                 ty: Some(ty.to_string()),
                 constant: Some(constant),
                 expression: expression.to_string(),
+                assumptions: Vec::new(),
             });
         }
     } else if expression_needs_integer_proof(left, right, params) {
@@ -1229,6 +1303,7 @@ fn semantic_multiplication_obligation(
                 .map(str::to_string),
             constant: None,
             expression: expression.to_string(),
+            assumptions: Vec::new(),
         });
     }
 
@@ -1260,6 +1335,7 @@ fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<Denomi
             obligations.push(DenominatorObligation {
                 denominator,
                 expression,
+                assumptions: Vec::new(),
             });
             continue;
         }
@@ -1276,6 +1352,7 @@ fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<Denomi
             obligations.push(DenominatorObligation {
                 denominator: right.clone(),
                 expression: format!("{left} {op} {right}"),
+                assumptions: Vec::new(),
             });
         }
     }
@@ -1846,12 +1923,20 @@ fn function_leaf_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+fn contracts_with_assumptions(contracts: &[String], assumptions: &[String]) -> Vec<String> {
+    let mut combined = contracts.to_vec();
+    combined.extend(assumptions.iter().cloned());
+    combined
+}
+
 fn addition_obligation_proved(
     obligation: &AddObligation,
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
 ) -> bool {
+    let contracts = contracts_with_assumptions(contracts, &obligation.assumptions);
+    let contracts = contracts.as_slice();
     let Some(constant) = obligation.constant else {
         return false;
     };
@@ -1908,6 +1993,8 @@ fn subtraction_obligation_proved(
     params: &[Param],
     options: VerificationOptions,
 ) -> bool {
+    let contracts = contracts_with_assumptions(contracts, &obligation.assumptions);
+    let contracts = contracts.as_slice();
     if let Some(constant) = obligation.constant {
         if constant == 0 {
             return true;
@@ -1975,6 +2062,8 @@ fn negation_obligation_proved(
     params: &[Param],
     options: VerificationOptions,
 ) -> bool {
+    let contracts = contracts_with_assumptions(contracts, &obligation.assumptions);
+    let contracts = contracts.as_slice();
     let Some(min) = min_value(&obligation.ty) else {
         return false;
     };
@@ -2004,6 +2093,8 @@ fn multiplication_obligation_proved(
     params: &[Param],
     options: VerificationOptions,
 ) -> bool {
+    let contracts = contracts_with_assumptions(contracts, &obligation.assumptions);
+    let contracts = contracts.as_slice();
     let Some(constant) = obligation.constant else {
         return false;
     };
@@ -3539,6 +3630,7 @@ mod tests {
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
+                guards: Vec::new(),
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
@@ -3551,6 +3643,42 @@ mod tests {
                 function: "add_one".to_string(),
                 expression: "x + 1".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn semantic_branch_guard_proves_checked_addition() {
+        let metadata = metadata_named(
+            "add_if_safe",
+            "pub fn add_if_safe(x: i32) -> i32 { if x < i32::MAX { x + 1 } else { x } }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "add_if_safe".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+                guards: vec!["x < i32::MAX".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
         );
     }
 
@@ -3580,6 +3708,7 @@ mod tests {
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
+                guards: Vec::new(),
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
@@ -3621,6 +3750,7 @@ mod tests {
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
+                guards: Vec::new(),
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),

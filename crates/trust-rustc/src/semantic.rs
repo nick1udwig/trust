@@ -33,6 +33,7 @@ struct MirFunctionSummary {
     return_type: String,
     debug_locals: Vec<MirDebugLocal>,
     assignments: Vec<MirAssignment>,
+    terminators: Vec<MirTerminator>,
     return_expr: Option<String>,
 }
 
@@ -50,8 +51,20 @@ struct MirDebugLocal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirAssignment {
+    block: Option<String>,
     place: String,
     expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirTerminator {
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirSwitchTarget {
+    value: String,
+    block: String,
 }
 
 pub(crate) fn maybe_extract_semantic_views(
@@ -245,6 +258,7 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
         return_type: signature.return_type,
         debug_locals: extract_mir_debug_locals(function_lines),
         assignments: extract_mir_assignments(function_lines),
+        terminators: extract_mir_terminators(function_lines),
         return_expr: extract_mir_return_expr(function_lines),
     })
 }
@@ -352,6 +366,60 @@ impl MirFunctionSummary {
         }
     }
 
+    fn normalized_mir_predicate(&self, expr: &str) -> Option<String> {
+        self.normalized_mir_predicate_with_depth(expr, 0)
+    }
+
+    fn normalized_mir_predicate_with_depth(&self, expr: &str, depth: usize) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        let expr = strip_mir_move_or_copy(expr.trim());
+        if let Some(assignment) = self.assignment_for_place(expr) {
+            return self.normalized_mir_predicate_with_depth(&assignment.expression, depth + 1);
+        }
+
+        let (op, args) = expr.split_once('(')?;
+        let args = args.strip_suffix(')')?;
+        let args = parse_mir_call_args(args);
+        let operator = mir_comparison_operator(op.trim())?;
+        let [left, right] = args.as_slice() else {
+            return None;
+        };
+
+        Some(format!(
+            "{} {operator} {}",
+            self.normalized_mir_expression_with_depth(left, depth + 1)?,
+            self.normalized_mir_expression_with_depth(right, depth + 1)?
+        ))
+    }
+
+    fn guards_for_block(&self, block: &str) -> Vec<String> {
+        self.terminators
+            .iter()
+            .filter_map(|terminator| {
+                let (condition, targets) = mir_switch(&terminator.expression)?;
+                let predicate = self.normalized_mir_predicate(condition)?;
+                Some(
+                    targets
+                        .into_iter()
+                        .filter_map(|target| {
+                            if target.block != block {
+                                return None;
+                            }
+                            match target.value.as_str() {
+                                "otherwise" | "1" | "true" => Some(predicate.clone()),
+                                "0" | "false" => negate_predicate(&predicate),
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
     fn assignment_for_place(&self, place: &str) -> Option<&MirAssignment> {
         self.assignments
             .iter()
@@ -381,6 +449,11 @@ impl MirFunctionSummary {
                             expression: format!("{left} {operator} {right}"),
                             left,
                             right: Some(right),
+                            guards: assignment
+                                .block
+                                .as_deref()
+                                .map(|block| self.guards_for_block(block))
+                                .unwrap_or_default(),
                         })
                     }
                     (SemanticArithmeticKind::Neg, [value]) => {
@@ -390,6 +463,11 @@ impl MirFunctionSummary {
                             expression: format!("-{value}"),
                             left: value,
                             right: None,
+                            guards: assignment
+                                .block
+                                .as_deref()
+                                .map(|block| self.guards_for_block(block))
+                                .unwrap_or_default(),
                         })
                     }
                     _ => None,
@@ -502,20 +580,55 @@ fn extract_mir_debug_locals(lines: &[&str]) -> Vec<MirDebugLocal> {
 }
 
 fn extract_mir_assignments(lines: &[&str]) -> Vec<MirAssignment> {
-    lines
-        .iter()
-        .filter_map(|line| {
-            let line = line.trim();
-            if !line.starts_with('_') {
-                return None;
-            }
-            let (place, expression) = line.split_once(" = ")?;
-            Some(MirAssignment {
+    let mut assignments = Vec::new();
+    let mut current_block = None;
+
+    for line in lines {
+        let line = line.trim();
+        if let Some(block) = mir_block_header(line) {
+            current_block = Some(block.to_string());
+            continue;
+        }
+        if !line.starts_with('_') {
+            continue;
+        }
+        if let Some((place, expression)) = line.split_once(" = ") {
+            assignments.push(MirAssignment {
+                block: current_block.clone(),
                 place: place.trim().to_string(),
                 expression: expression.trim_end_matches(';').trim().to_string(),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    assignments
+}
+
+fn extract_mir_terminators(lines: &[&str]) -> Vec<MirTerminator> {
+    let mut terminators = Vec::new();
+
+    for line in lines {
+        let line = line.trim();
+        if mir_block_header(line).is_some() {
+            continue;
+        }
+        if line.starts_with("switchInt(") {
+            terminators.push(MirTerminator {
+                expression: line.trim_end_matches(';').trim().to_string(),
+            });
+        }
+    }
+
+    terminators
+}
+
+fn mir_block_header(line: &str) -> Option<&str> {
+    let (block, rest) = line.split_once(':')?;
+    if block.starts_with("bb") && rest.trim() == "{" {
+        Some(block)
+    } else {
+        None
+    }
 }
 
 fn extract_mir_return_expr(lines: &[&str]) -> Option<String> {
@@ -538,6 +651,9 @@ fn strip_mir_move_or_copy(expr: &str) -> &str {
 
 fn mir_const_value(expr: &str) -> Option<String> {
     let value = expr.strip_prefix("const ")?;
+    if let Some(bound) = mir_integer_bound(value) {
+        return Some(bound);
+    }
     let value = value
         .split_once('_')
         .map(|(value, _ty)| value)
@@ -547,6 +663,25 @@ fn mir_const_value(expr: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn mir_integer_bound(value: &str) -> Option<String> {
+    let value = value.trim();
+    for bound in ["MAX", "MIN"] {
+        let suffix = format!(">::{bound}");
+        if let Some(before_bound) = value.strip_suffix(&suffix) {
+            if let Some(ty) = before_bound.rsplit_once("<impl ").map(|(_prefix, ty)| ty) {
+                return Some(format!("{ty}::{bound}"));
+            }
+        }
+        for ty in ["i32", "i64", "u32", "u64", "usize"] {
+            if value == format!("{ty}::{bound}") || value == format!("core::{ty}::{bound}") {
+                return Some(format!("{ty}::{bound}"));
+            }
+        }
+    }
+
+    None
 }
 
 fn mir_projection(expr: &str) -> Option<(&str, &str, &str)> {
@@ -593,6 +728,56 @@ fn mir_checked_arithmetic_operation(expr: &str) -> Option<(SemanticArithmeticKin
         _ => return None,
     };
     Some((kind, parse_mir_call_args(args)))
+}
+
+fn mir_comparison_operator(op: &str) -> Option<&'static str> {
+    match op {
+        "Lt" => Some("<"),
+        "Le" => Some("<="),
+        "Gt" => Some(">"),
+        "Ge" => Some(">="),
+        "Eq" => Some("=="),
+        "Ne" => Some("!="),
+        _ => None,
+    }
+}
+
+fn mir_switch(expr: &str) -> Option<(&str, Vec<MirSwitchTarget>)> {
+    let rest = expr.strip_prefix("switchInt(")?;
+    let (condition, targets) = rest.split_once(") -> [")?;
+    let targets = targets.strip_suffix(']')?;
+    Some((condition.trim(), parse_mir_switch_targets(targets)))
+}
+
+fn parse_mir_switch_targets(input: &str) -> Vec<MirSwitchTarget> {
+    parse_comma_separated(input)
+        .into_iter()
+        .filter_map(|target| {
+            let (value, block) = target.split_once(':')?;
+            Some(MirSwitchTarget {
+                value: value.trim().to_string(),
+                block: block.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn negate_predicate(predicate: &str) -> Option<String> {
+    for (op, negated) in [
+        ("<=", ">"),
+        (">=", "<"),
+        ("!=", "=="),
+        ("==", "!="),
+        ("<", ">="),
+        (">", "<="),
+    ] {
+        let Some((left, right)) = predicate.split_once(op) else {
+            continue;
+        };
+        return Some(format!("{} {negated} {}", left.trim(), right.trim()));
+    }
+
+    None
 }
 
 fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
@@ -692,7 +877,17 @@ fn semantic_summary(
             let arithmetic_ops = mir_function
                 .semantic_arithmetic_operations()
                 .iter()
-                .map(|operation| operation.expression.as_str())
+                .map(|operation| {
+                    if operation.guards.is_empty() {
+                        operation.expression.clone()
+                    } else {
+                        format!(
+                            "{} guarded_by {}",
+                            operation.expression,
+                            operation.guards.join("&")
+                        )
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             let slice_indexes = mir_function
@@ -773,9 +968,11 @@ fn id_i32(_1: i32) -> i32 {
                     place: "_1".to_string(),
                 }],
                 assignments: vec![MirAssignment {
+                    block: Some("bb0".to_string()),
                     place: "_0".to_string(),
                     expression: "copy _1".to_string(),
                 }],
+                terminators: Vec::new(),
                 return_expr: Some("copy _1".to_string()),
             })
         );
@@ -814,6 +1011,7 @@ fn add_one(_1: i32) -> i32 {
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
+                guards: Vec::new(),
             }]
         );
     }
@@ -850,6 +1048,56 @@ fn add_one(_1: i32) -> i32 {
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
+                guards: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_mir_branch_guard_for_arithmetic_operation() {
+        let mir = r#"
+fn add_if_safe(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: bool;
+    let mut _3: (i32, bool);
+
+    bb0: {
+        _2 = Lt(copy _1, const core::num::<impl i32>::MAX);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = AddWithOverflow(copy _1, const 1_i32);
+        assert(!move (_3.1: bool), "overflow", copy _1, const 1_i32) -> [success: bb3, unwind continue];
+    }
+
+    bb2: {
+        _0 = copy _1;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = move (_3.0: i32);
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "add_if_safe").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+                guards: vec!["x < i32::MAX".to_string()],
             }]
         );
     }
@@ -885,12 +1133,14 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                     left: "x".to_string(),
                     right: Some("y".to_string()),
                     expression: "x % y".to_string(),
+                    guards: Vec::new(),
                 },
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Div,
                     left: "x".to_string(),
                     right: Some("y".to_string()),
                     expression: "x / y".to_string(),
+                    guards: Vec::new(),
                 },
             ]
         );

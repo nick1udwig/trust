@@ -926,6 +926,21 @@ fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn pass_semantic_branch_guard_add_uses_mir_path_condition() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_branch_guard_add",
+        Expected::Pass,
+        &format!("pass_semantic_branch_guard_add_{suffix}"),
+        &format!("pass_semantic_branch_guard_add_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_semantic_block_slice_precondition_uses_mir_index_fact() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(
