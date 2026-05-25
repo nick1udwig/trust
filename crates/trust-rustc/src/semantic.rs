@@ -6,7 +6,10 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 
-use trust_core::metadata::TrustMetadata;
+use trust_core::{
+    metadata::TrustMetadata,
+    verifier::{SemanticParam, TrustFunctionSemantics},
+};
 
 use crate::{deterministic_test_mode, exit_code, metadata_path, plural, rustc_verbose_version};
 
@@ -23,45 +26,71 @@ struct SemanticItemMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirFunctionSummary {
-    args: Vec<String>,
+    args: Vec<MirArg>,
     return_type: String,
-    debug_locals: Vec<String>,
+    debug_locals: Vec<MirDebugLocal>,
+    assignments: Vec<MirAssignment>,
     return_expr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirArg {
+    place: String,
+    ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirDebugLocal {
+    name: String,
+    place: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirAssignment {
+    place: String,
+    expression: String,
 }
 
 pub(crate) fn maybe_extract_semantic_views(
     rustc: &OsString,
     rustc_args: &[OsString],
     metadata: &[TrustMetadata],
-) -> Result<(), String> {
-    let Some(dump_dir) = env::var_os("TRUST_SEMANTIC_DUMP_DIR").map(PathBuf::from) else {
-        return Ok(());
-    };
+) -> Result<Vec<TrustFunctionSemantics>, String> {
+    let dump_dir = env::var_os("TRUST_SEMANTIC_DUMP_DIR").map(PathBuf::from);
+    if dump_dir.is_none() && !semantic_verify_enabled() {
+        return Ok(Vec::new());
+    }
 
     extract_semantic_views(rustc, rustc_args, metadata, dump_dir)
+}
+
+fn semantic_verify_enabled() -> bool {
+    env::var("TRUST_SEMANTIC_VERIFY").as_deref() == Ok("1")
 }
 
 fn extract_semantic_views(
     rustc: &OsString,
     rustc_args: &[OsString],
     metadata: &[TrustMetadata],
-    dump_dir: PathBuf,
-) -> Result<(), String> {
+    dump_dir: Option<PathBuf>,
+) -> Result<Vec<TrustFunctionSemantics>, String> {
     let hir = run_rustc_unpretty(rustc, rustc_args, "hir-tree")?;
     let mir = run_rustc_unpretty(rustc, rustc_args, "mir")?;
     let item_matches = semantic_item_matches(metadata, &hir, &mir);
     reject_unmatched_total_items(&item_matches)?;
     let rustc_version = semantic_rustc_version(rustc);
 
-    fs::create_dir_all(&dump_dir)
-        .map_err(|err| format!("failed to create Trust semantic dump directory: {err}"))?;
-    let base = semantic_dump_base(metadata, rustc_args);
-    write_semantic_dump(&dump_dir.join(format!("{base}.hir-tree.txt")), &hir)?;
-    write_semantic_dump(&dump_dir.join(format!("{base}.mir.txt")), &mir)?;
-    write_semantic_dump(
-        &dump_dir.join(format!("{base}.trust-semantic.txt")),
-        &semantic_summary(metadata, rustc_args, &item_matches, &rustc_version),
-    )?;
+    if let Some(dump_dir) = dump_dir {
+        fs::create_dir_all(&dump_dir)
+            .map_err(|err| format!("failed to create Trust semantic dump directory: {err}"))?;
+        let base = semantic_dump_base(metadata, rustc_args);
+        write_semantic_dump(&dump_dir.join(format!("{base}.hir-tree.txt")), &hir)?;
+        write_semantic_dump(&dump_dir.join(format!("{base}.mir.txt")), &mir)?;
+        write_semantic_dump(
+            &dump_dir.join(format!("{base}.trust-semantic.txt")),
+            &semantic_summary(metadata, rustc_args, &item_matches, &rustc_version),
+        )?;
+    }
 
     if deterministic_test_mode() {
         let total_matches = item_matches
@@ -74,7 +103,7 @@ fn extract_semantic_views(
         );
     }
 
-    Ok(())
+    Ok(verifier_semantics(&item_matches))
 }
 
 fn run_rustc_unpretty(
@@ -139,6 +168,32 @@ fn semantic_item_matches(
         .collect()
 }
 
+fn verifier_semantics(item_matches: &[SemanticItemMatch]) -> Vec<TrustFunctionSemantics> {
+    item_matches
+        .iter()
+        .filter(|item| item.item_kind == "total" && item.hir_match)
+        .filter_map(|item| {
+            let mir_function = item.mir_function.as_ref()?;
+            Some(TrustFunctionSemantics {
+                rust_function_path: item.rust_function_path.clone(),
+                params: mir_function
+                    .args
+                    .iter()
+                    .map(|arg| SemanticParam {
+                        name: mir_function
+                            .local_name_for_place(&arg.place)
+                            .unwrap_or(&arg.place)
+                            .to_string(),
+                        ty: arg.ty.clone(),
+                    })
+                    .collect(),
+                return_type: mir_function.return_type.clone(),
+                return_expression: mir_function.normalized_return_expression(),
+            })
+        })
+        .collect()
+}
+
 fn reject_unmatched_total_items(item_matches: &[SemanticItemMatch]) -> Result<(), String> {
     let missing: Vec<_> = item_matches
         .iter()
@@ -176,26 +231,112 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
         .iter()
         .position(|line| line.trim_start().starts_with(&format!("fn {name}(")))?;
     let signature = parse_mir_signature(lines[signature_idx].trim(), name)?;
-    let function_end = lines
-        .iter()
-        .enumerate()
-        .skip(signature_idx + 1)
-        .find(|(_, line)| line.trim_start().starts_with("fn "))
-        .map(|(idx, _)| idx)
-        .unwrap_or(lines.len());
+    let function_end = mir_function_end(&lines, signature_idx).unwrap_or(lines.len());
     let function_lines = &lines[signature_idx + 1..function_end];
 
     Some(MirFunctionSummary {
         args: signature.args,
         return_type: signature.return_type,
         debug_locals: extract_mir_debug_locals(function_lines),
+        assignments: extract_mir_assignments(function_lines),
         return_expr: extract_mir_return_expr(function_lines),
     })
 }
 
+fn mir_function_end(lines: &[&str], signature_idx: usize) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(signature_idx + 1)
+        .find(|(_, line)| line.trim() == "}" && line.starts_with('}'))
+        .map(|(idx, _)| idx)
+}
+
+impl MirFunctionSummary {
+    fn local_name_for_place(&self, place: &str) -> Option<&str> {
+        self.debug_locals
+            .iter()
+            .find(|local| local.place == place)
+            .map(|local| local.name.as_str())
+    }
+
+    fn normalized_return_expression(&self) -> Option<String> {
+        self.return_expr
+            .as_deref()
+            .and_then(|expr| self.normalized_mir_expression(expr))
+    }
+
+    fn normalized_mir_expression(&self, expr: &str) -> Option<String> {
+        self.normalized_mir_expression_with_depth(expr, 0)
+    }
+
+    fn normalized_mir_expression_with_depth(&self, expr: &str, depth: usize) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        let expr = strip_mir_move_or_copy(expr.trim());
+        if let Some(assignment) = self.assignment_for_place(expr) {
+            if let Some(normalized) =
+                self.normalized_mir_expression_with_depth(&assignment.expression, depth + 1)
+            {
+                return Some(normalized);
+            }
+        }
+        if let Some(source_name) = self.local_name_for_place(expr) {
+            return Some(source_name.to_string());
+        }
+        if let Some(constant) = mir_const_value(expr) {
+            return Some(constant);
+        }
+        if let Some((place, field, _ty)) = mir_projection(expr) {
+            if field == "0" {
+                let assignment = self.assignment_for_place(place)?;
+                return self.normalized_mir_operation(&assignment.expression, depth + 1);
+            }
+        }
+
+        None
+    }
+
+    fn normalized_mir_operation(&self, expr: &str, depth: usize) -> Option<String> {
+        let (op, args) = expr.split_once('(')?;
+        let args = args.strip_suffix(')')?;
+        let args = parse_mir_call_args(args);
+        match (op.trim(), args.as_slice()) {
+            ("AddWithOverflow", [left, right]) => Some(format!(
+                "{} + {}",
+                self.normalized_mir_expression_with_depth(left, depth + 1)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1)?
+            )),
+            ("SubWithOverflow", [left, right]) => Some(format!(
+                "{} - {}",
+                self.normalized_mir_expression_with_depth(left, depth + 1)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1)?
+            )),
+            ("MulWithOverflow", [left, right]) => Some(format!(
+                "{} * {}",
+                self.normalized_mir_expression_with_depth(left, depth + 1)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1)?
+            )),
+            ("NegWithOverflow", [value]) => Some(format!(
+                "-{}",
+                self.normalized_mir_expression_with_depth(value, depth + 1)?
+            )),
+            _ => None,
+        }
+    }
+
+    fn assignment_for_place(&self, place: &str) -> Option<&MirAssignment> {
+        self.assignments
+            .iter()
+            .rev()
+            .find(|assignment| assignment.place == place)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirSignature {
-    args: Vec<String>,
+    args: Vec<MirArg>,
     return_type: String,
 }
 
@@ -210,9 +351,22 @@ fn parse_mir_signature(line: &str, name: &str) -> Option<MirSignature> {
         .trim()
         .to_string();
     Some(MirSignature {
-        args: parse_comma_separated(args),
+        args: parse_mir_args(args),
         return_type,
     })
+}
+
+fn parse_mir_args(input: &str) -> Vec<MirArg> {
+    parse_comma_separated(input)
+        .into_iter()
+        .filter_map(|arg| {
+            let (place, ty) = arg.split_once(':')?;
+            Some(MirArg {
+                place: place.trim().to_string(),
+                ty: ty.trim().to_string(),
+            })
+        })
+        .collect()
 }
 
 fn parse_comma_separated(input: &str) -> Vec<String> {
@@ -224,14 +378,34 @@ fn parse_comma_separated(input: &str) -> Vec<String> {
         .collect()
 }
 
-fn extract_mir_debug_locals(lines: &[&str]) -> Vec<String> {
+fn extract_mir_debug_locals(lines: &[&str]) -> Vec<MirDebugLocal> {
     lines
         .iter()
         .filter_map(|line| {
             line.trim()
                 .strip_prefix("debug ")
                 .and_then(|line| line.split_once(" => "))
-                .map(|(name, _)| name.trim().to_string())
+                .map(|(name, place)| MirDebugLocal {
+                    name: name.trim().to_string(),
+                    place: place.trim_end_matches(';').trim().to_string(),
+                })
+        })
+        .collect()
+}
+
+fn extract_mir_assignments(lines: &[&str]) -> Vec<MirAssignment> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('_') {
+                return None;
+            }
+            let (place, expression) = line.split_once(" = ")?;
+            Some(MirAssignment {
+                place: place.trim().to_string(),
+                expression: expression.trim_end_matches(';').trim().to_string(),
+            })
         })
         .collect()
 }
@@ -245,6 +419,37 @@ fn extract_mir_return_expr(lines: &[&str]) -> Option<String> {
             .filter(|expr| !expr.is_empty())
             .map(str::to_string)
     })
+}
+
+fn strip_mir_move_or_copy(expr: &str) -> &str {
+    expr.strip_prefix("copy ")
+        .or_else(|| expr.strip_prefix("move "))
+        .unwrap_or(expr)
+        .trim()
+}
+
+fn mir_const_value(expr: &str) -> Option<String> {
+    let value = expr.strip_prefix("const ")?;
+    let value = value
+        .split_once('_')
+        .map(|(value, _ty)| value)
+        .unwrap_or(value);
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+fn mir_projection(expr: &str) -> Option<(&str, &str, &str)> {
+    let expr = expr.strip_prefix('(')?.strip_suffix(')')?;
+    let (projection, ty) = expr.split_once(':')?;
+    let (place, field) = projection.trim().split_once('.')?;
+    Some((place.trim(), field.trim(), ty.trim()))
+}
+
+fn parse_mir_call_args(input: &str) -> Vec<String> {
+    parse_comma_separated(input)
 }
 
 fn semantic_dump_base(metadata: &[TrustMetadata], rustc_args: &[OsString]) -> String {
@@ -326,13 +531,27 @@ fn semantic_summary(
             item.mir_match
         ));
         if let Some(mir_function) = &item.mir_function {
+            let return_expr = mir_function
+                .normalized_return_expression()
+                .or_else(|| mir_function.return_expr.clone())
+                .unwrap_or_else(|| "none".to_string());
             summary.push_str(&format!(
                 "mir_function path={} args={} return_type={} debug_locals={} return_expr={}\n",
                 item.rust_function_path,
-                mir_function.args.join(","),
+                mir_function
+                    .args
+                    .iter()
+                    .map(|arg| format!("{}: {}", arg.place, arg.ty))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 mir_function.return_type,
-                mir_function.debug_locals.join(","),
-                mir_function.return_expr.as_deref().unwrap_or("none")
+                mir_function
+                    .debug_locals
+                    .iter()
+                    .map(|local| local.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                return_expr
             ));
         }
     }
@@ -369,11 +588,163 @@ fn id_i32(_1: i32) -> i32 {
         assert_eq!(
             extract_mir_function_summary(mir, "id_i32"),
             Some(MirFunctionSummary {
-                args: vec!["_1: i32".to_string()],
+                args: vec![MirArg {
+                    place: "_1".to_string(),
+                    ty: "i32".to_string(),
+                }],
                 return_type: "i32".to_string(),
-                debug_locals: vec!["x".to_string()],
+                debug_locals: vec![MirDebugLocal {
+                    name: "x".to_string(),
+                    place: "_1".to_string(),
+                }],
+                assignments: vec![MirAssignment {
+                    place: "_0".to_string(),
+                    expression: "copy _1".to_string(),
+                }],
                 return_expr: Some("copy _1".to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn normalizes_mir_overflow_add_return_expression() {
+        let mir = r#"
+fn add_one(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: (i32, bool);
+
+    bb0: {
+        _2 = AddWithOverflow(copy _1, const 1_i32);
+        assert(!move (_2.1: bool), "overflow") -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move (_2.0: i32);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "add_one").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x + 1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalizes_mir_return_through_local_assignment() {
+        let mir = r#"
+fn add_one(_1: i32) -> i32 {
+    debug x => _1;
+    debug y => _3;
+    let mut _0: i32;
+    let mut _2: (i32, bool);
+    let _3: i32;
+
+    bb0: {
+        _2 = AddWithOverflow(copy _1, const 1_i32);
+        _3 = move (_2.0: i32);
+        _0 = copy _3;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "add_one").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x + 1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalizes_mir_return_after_runtime_precondition() {
+        let mir = r#"
+fn add_one(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let _2: ();
+    let mut _3: bool;
+    let mut _4: &str;
+    let mut _5: &str;
+    let mut _6: (i32, bool);
+    scope 1 {
+        debug y => _0;
+    }
+
+    bb0: {
+        _3 = Lt(copy _1, const core::num::<impl i32>::MAX);
+        _4 = const "add_one";
+        _5 = const "x < i32::MAX";
+        _2 = assert_precondition(move _3, move _4, move _5) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _6 = AddWithOverflow(copy _1, const 1_i32);
+        assert(!move (_6.1: bool), "overflow", copy _1, const 1_i32) -> [success: bb2, unwind continue];
+    }
+
+    bb2: {
+        _0 = move (_6.0: i32);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "add_one").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x + 1".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_assignments_after_mir_function_end() {
+        let mir = r#"
+fn add_one(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: (i32, bool);
+
+    bb0: {
+        _2 = AddWithOverflow(copy _1, const 1_i32);
+        _0 = move (_2.0: i32);
+        return;
+    }
+}
+
+const __TRUST_META_add_one: &str = {
+    let mut _0: &str;
+
+    bb0: {
+        _0 = const "{\"function_source\":\"pub fn add_one(x: i32) -> i32 { x + 1 }\"}";
+        return;
+    }
+}
+
+fn unrelated() -> () {
+    let mut _0: ();
+    let mut _2: (i32, bool);
+
+    bb0: {
+        _2 = StaticTestFn(move _0);
+        _0 = const ();
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "add_one").expect("MIR summary");
+
+        assert_eq!(summary.assignments.len(), 2);
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x + 1".to_string())
         );
     }
 

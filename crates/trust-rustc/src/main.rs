@@ -10,7 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use trust_core::{
     metadata::{parse_metadata_line, TrustMetadata},
     solver::VerificationOptions,
-    verifier::{verify_totals, verify_totals_with_options, VerificationError},
+    verifier::{
+        verify_totals, verify_totals_with_options, verify_totals_with_semantics,
+        TrustFunctionSemantics, VerificationError,
+    },
 };
 use z3::{ast::Bool, Config, SatResult, Solver};
 
@@ -51,9 +54,11 @@ fn run() -> Result<i32, String> {
 
     let metadata = read_metadata(&metadata_path)?;
     emit_config_warnings(&metadata, &config);
-    if metadata_has_verification_item(&metadata) {
-        semantic::maybe_extract_semantic_views(&rustc, &rustc_args, &metadata)?;
-    }
+    let semantics = if metadata_has_verification_item(&metadata) {
+        semantic::maybe_extract_semantic_views(&rustc, &rustc_args, &metadata)?
+    } else {
+        Vec::new()
+    };
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -66,7 +71,7 @@ fn run() -> Result<i32, String> {
         CacheStats { hits: 0, misses: 0 }
     } else {
         let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args, &config)?;
-        verify_metadata(&metadata, &cache_context, &config)?
+        verify_metadata(&metadata, &semantics, &cache_context, &config)?
     };
 
     if deterministic_test_mode() && totals > 0 {
@@ -306,6 +311,7 @@ struct TargetCfg {
 
 fn verify_metadata(
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
     config: &TrustConfig,
 ) -> Result<CacheStats, String> {
@@ -318,10 +324,10 @@ fn verify_metadata(
     }
     check_solver_status(config)?;
 
-    if let Some(cache_file) = cache_file(metadata, cache_context) {
+    if let Some(cache_file) = cache_file(metadata, semantics, cache_context) {
         if matches!(
             fs::read_to_string(&cache_file),
-            Ok(contents) if cache_entry_proved(&contents, metadata, cache_context)
+            Ok(contents) if cache_entry_proved(&contents, metadata, semantics, cache_context)
         ) {
             return Ok(CacheStats {
                 hits: verification_items,
@@ -329,15 +335,15 @@ fn verify_metadata(
             });
         }
 
-        verify_all(metadata, config)?;
-        write_cache_entry(&cache_file, metadata, cache_context)?;
+        verify_all(metadata, semantics, config)?;
+        write_cache_entry(&cache_file, metadata, semantics, cache_context)?;
         return Ok(CacheStats {
             hits: 0,
             misses: verification_items,
         });
     }
 
-    verify_all(metadata, config)?;
+    verify_all(metadata, semantics, config)?;
     Ok(CacheStats {
         hits: 0,
         misses: verification_items,
@@ -346,11 +352,20 @@ fn verify_metadata(
 
 fn verify_all(
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     config: &TrustConfig,
 ) -> Result<(), String> {
     let result = match config.solver.as_str() {
-        "mock" => verify_totals(metadata),
-        "z3" => verify_totals_with_options(metadata, VerificationOptions::z3(config.timeout_ms)),
+        "mock" if semantics.is_empty() => verify_totals(metadata),
+        "mock" => verify_totals_with_semantics(metadata, semantics, VerificationOptions::default()),
+        "z3" if semantics.is_empty() => {
+            verify_totals_with_options(metadata, VerificationOptions::z3(config.timeout_ms))
+        }
+        "z3" => verify_totals_with_semantics(
+            metadata,
+            semantics,
+            VerificationOptions::z3(config.timeout_ms),
+        ),
         solver => return Err(format!("unsupported solver `{solver}`")),
     };
 
@@ -767,15 +782,17 @@ fn deterministic_test_mode() -> bool {
 
 fn cache_file(
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> Option<PathBuf> {
     let cache_dir = env::var_os("TRUST_CACHE_DIR").map(PathBuf::from)?;
-    Some(cache_path(&cache_dir, metadata, cache_context))
+    Some(cache_path(&cache_dir, metadata, semantics, cache_context))
 }
 
 fn cache_path(
     cache_dir: &PathBuf,
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> PathBuf {
     let mut hasher = DefaultHasher::new();
@@ -785,6 +802,7 @@ fn cache_path(
     for item in metadata {
         hash_metadata_item(item, &mut hasher);
     }
+    hash_semantics_if_present(semantics, &mut hasher);
 
     cache_dir.join(format!("{:016x}.proof", hasher.finish()))
 }
@@ -792,19 +810,21 @@ fn cache_path(
 fn cache_entry_proved(
     contents: &str,
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> bool {
     contents.lines().any(|line| line == "status=proved")
         && contents.lines().any(|line| {
             line == format!(
                 "entry_fingerprint={:016x}",
-                cache_entry_fingerprint(metadata, cache_context)
+                cache_entry_fingerprint(metadata, semantics, cache_context)
             )
         })
 }
 
 fn cache_entry_fingerprint(
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -814,6 +834,7 @@ fn cache_entry_fingerprint(
     for item in metadata {
         hash_metadata_item(item, &mut hasher);
     }
+    hash_semantics_if_present(semantics, &mut hasher);
     hasher.finish()
 }
 
@@ -837,17 +858,19 @@ fn hash_metadata_item(item: &trust_core::metadata::TrustMetadata, hasher: &mut D
 
 fn vc_fingerprints(
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> Vec<String> {
     metadata
         .iter()
         .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
-        .map(|item| vc_fingerprint(item, cache_context))
+        .map(|item| vc_fingerprint(item, semantics, cache_context))
         .collect()
 }
 
 fn vc_fingerprint(
     item: &trust_core::metadata::TrustMetadata,
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> String {
     let mut hasher = DefaultHasher::new();
@@ -855,6 +878,7 @@ fn vc_fingerprint(
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
     hash_verification_model_context(cache_context, &mut hasher);
     hash_metadata_item(item, &mut hasher);
+    hash_semantics_if_present(semantics, &mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -879,6 +903,27 @@ fn generated_rust_fingerprint(metadata: &[trust_core::metadata::TrustMetadata]) 
     format!("{:016x}", hasher.finish())
 }
 
+fn semantic_fingerprint(semantics: &[TrustFunctionSemantics]) -> String {
+    if semantics.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut hasher = DefaultHasher::new();
+    hash_semantics_if_present(semantics, &mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn hash_semantics_if_present(semantics: &[TrustFunctionSemantics], hasher: &mut DefaultHasher) {
+    if semantics.is_empty() {
+        return;
+    }
+
+    "trust-semantic-verification-v1".hash(hasher);
+    for item in semantics {
+        item.hash(hasher);
+    }
+}
+
 fn solver_transcript_path() -> String {
     env::var("TRUST_SOLVER_TRANSCRIPT_PATH")
         .or_else(|_| env::var("TRUST_SMT_DUMP_DIR"))
@@ -887,18 +932,20 @@ fn solver_transcript_path() -> String {
 
 fn cache_entry_contents(
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> String {
     let verification_items = metadata
         .iter()
         .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
         .count();
-    let vc_fingerprints = vc_fingerprints(metadata, cache_context).join(",");
+    let vc_fingerprints = vc_fingerprints(metadata, semantics, cache_context).join(",");
     let generated_rust_fingerprint = generated_rust_fingerprint(metadata);
+    let semantic_fingerprint = semantic_fingerprint(semantics);
     let solver_transcript_path = solver_transcript_path();
     format!(
-        "format=trust-proof-cache-v2\nstatus=proved\nentry_fingerprint={:016x}\nverified_items={verification_items}\nsolver={}\nvc_fingerprints={vc_fingerprints}\ngenerated_rust_fingerprint={generated_rust_fingerprint}\ndiagnostics_summary=none\nsolver_transcript_path={solver_transcript_path}\n",
-        cache_entry_fingerprint(metadata, cache_context),
+        "format=trust-proof-cache-v2\nstatus=proved\nentry_fingerprint={:016x}\nverified_items={verification_items}\nsolver={}\nvc_fingerprints={vc_fingerprints}\ngenerated_rust_fingerprint={generated_rust_fingerprint}\nsemantic_fingerprint={semantic_fingerprint}\ndiagnostics_summary=none\nsolver_transcript_path={solver_transcript_path}\n",
+        cache_entry_fingerprint(metadata, semantics, cache_context),
         cache_context.solver_name,
     )
 }
@@ -906,6 +953,7 @@ fn cache_entry_contents(
 fn write_cache_entry(
     cache_file: &PathBuf,
     metadata: &[trust_core::metadata::TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
     cache_context: &CacheContext,
 ) -> Result<(), String> {
     if let Some(parent) = cache_file.parent() {
@@ -917,7 +965,7 @@ fn write_cache_entry(
     {
         let mut file = fs::File::create(&temp_file)
             .map_err(|err| format!("failed to write Trust cache entry: {err}"))?;
-        file.write_all(cache_entry_contents(metadata, cache_context).as_bytes())
+        file.write_all(cache_entry_contents(metadata, semantics, cache_context).as_bytes())
             .map_err(|err| format!("failed to write Trust cache entry: {err}"))?;
         file.sync_all()
             .map_err(|err| format!("failed to persist Trust cache entry: {err}"))?;

@@ -4,6 +4,20 @@ use crate::{
 };
 use std::fmt;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TrustFunctionSemantics {
+    pub rust_function_path: String,
+    pub params: Vec<SemanticParam>,
+    pub return_type: String,
+    pub return_expression: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticParam {
+    pub name: String,
+    pub ty: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
     IntegerAdditionOverflow {
@@ -216,7 +230,7 @@ impl fmt::Display for VerificationError {
 impl std::error::Error for VerificationError {}
 
 pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
-    verify_total_with_env(metadata, &[], &[], VerificationOptions::default())
+    verify_total_with_env(metadata, None, &[], &[], VerificationOptions::default())
 }
 
 pub fn verify_totals(metadata: &[TrustMetadata]) -> Result<(), VerificationError> {
@@ -227,10 +241,24 @@ pub fn verify_totals_with_options(
     metadata: &[TrustMetadata],
     options: VerificationOptions,
 ) -> Result<(), VerificationError> {
-    let env = function_env(metadata);
+    verify_totals_with_semantics(metadata, &[], options)
+}
+
+pub fn verify_totals_with_semantics(
+    metadata: &[TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
+    options: VerificationOptions,
+) -> Result<(), VerificationError> {
+    let env = function_env(metadata, semantics);
     let model_types = model_env(metadata);
     for item in metadata {
-        verify_total_with_env(item, &env, &model_types, options)?;
+        verify_total_with_env(
+            item,
+            semantic_for(item, semantics),
+            &env,
+            &model_types,
+            options,
+        )?;
         verify_proof(item)?;
     }
 
@@ -263,6 +291,7 @@ fn verify_proof(metadata: &TrustMetadata) -> Result<(), VerificationError> {
 
 fn verify_total_with_env(
     metadata: &TrustMetadata,
+    semantics: Option<&TrustFunctionSemantics>,
     env: &[TrustFunctionSummary],
     model_types: &[String],
     options: VerificationOptions,
@@ -274,9 +303,12 @@ fn verify_total_with_env(
     let source = normalize(&metadata.function_source);
     let mut contracts = executable_preconditions(metadata);
     let given_contracts = given_preconditions(metadata);
-    let params = parse_params(&source);
+    let params = verification_params(&source, semantics);
     let raw_body = body(&metadata.function_source);
     let body = body(&source);
+    let semantic_return_expression = semantics
+        .and_then(|semantics| semantics.return_expression.as_deref())
+        .map(normalize);
     let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?;
     contracts.extend(loop_facts.into_iter().map(|fact| fact.condition));
 
@@ -395,7 +427,12 @@ fn verify_total_with_env(
     }
 
     for postcondition in postconditions(metadata) {
-        if !postcondition_proved(&postcondition, body, raw_body) {
+        if !postcondition_proved(
+            &postcondition,
+            body,
+            raw_body,
+            semantic_return_expression.as_deref(),
+        ) {
             return Err(VerificationError::PostconditionUnproved {
                 function: metadata.rust_function_path.clone(),
                 condition: postcondition.original,
@@ -492,7 +529,19 @@ struct LoopSpec {
     decreases: Option<String>,
 }
 
-fn function_env(metadata: &[TrustMetadata]) -> Vec<TrustFunctionSummary> {
+fn semantic_for<'a>(
+    metadata: &TrustMetadata,
+    semantics: &'a [TrustFunctionSemantics],
+) -> Option<&'a TrustFunctionSemantics> {
+    semantics
+        .iter()
+        .find(|semantics| semantics.rust_function_path == metadata.rust_function_path)
+}
+
+fn function_env(
+    metadata: &[TrustMetadata],
+    semantics: &[TrustFunctionSemantics],
+) -> Vec<TrustFunctionSummary> {
     metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -500,7 +549,7 @@ fn function_env(metadata: &[TrustMetadata]) -> Vec<TrustFunctionSummary> {
             let source = normalize(&item.function_source);
             TrustFunctionSummary {
                 name: item.rust_function_path.clone(),
-                params: parse_params(&source),
+                params: verification_params(&source, semantic_for(item, semantics)),
                 preconditions: given_preconditions(item),
             }
         })
@@ -581,6 +630,26 @@ fn parse_params(source: &str) -> Vec<Param> {
         .collect()
 }
 
+fn verification_params(source: &str, semantics: Option<&TrustFunctionSemantics>) -> Vec<Param> {
+    let semantic_params = semantics
+        .map(|semantics| {
+            semantics
+                .params
+                .iter()
+                .map(|param| Param {
+                    name: param.name.clone(),
+                    ty: param.ty.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if semantic_params.is_empty() {
+        parse_params(source)
+    } else {
+        semantic_params
+    }
+}
+
 fn body(source: &str) -> &str {
     let Some(start) = source.find('{') else {
         return "";
@@ -605,8 +674,27 @@ fn return_expression(body: &str) -> String {
     trimmed.to_string()
 }
 
-fn postcondition_proved(postcondition: &Contract, body: &str, raw_body: &str) -> bool {
+fn postcondition_proved(
+    postcondition: &Contract,
+    body: &str,
+    raw_body: &str,
+    semantic_return_expression: Option<&str>,
+) -> bool {
     let return_expression = return_expression(body);
+    if semantic_return_expression.is_some_and(|return_expression| {
+        postcondition_proved_by_return_expression(postcondition, raw_body, return_expression)
+    }) {
+        return true;
+    }
+
+    postcondition_proved_by_return_expression(postcondition, raw_body, &return_expression)
+}
+
+fn postcondition_proved_by_return_expression(
+    postcondition: &Contract,
+    raw_body: &str,
+    return_expression: &str,
+) -> bool {
     let Some((left, right)) = postcondition.normalized.split_once("==") else {
         return false;
     };
@@ -3031,6 +3119,34 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn semantic_return_expression_can_prove_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "id_i32",
+            "pub fn id_i32(x: i32) -> i32 { 0 }",
+            &["out == x"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "id_i32".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: Some("x".to_string()),
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
     }
 
     #[test]

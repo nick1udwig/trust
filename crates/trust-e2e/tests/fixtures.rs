@@ -69,7 +69,22 @@ fn pass_total_identity_writes_hir_mir_semantic_dumps_when_requested() {
     assert!(summary.contains("args=_1: i32"));
     assert!(summary.contains("return_type=i32"));
     assert!(summary.contains("debug_locals=x"));
-    assert!(summary.contains("return_expr=copy _1"));
+    assert!(summary.contains("return_expr=x"));
+}
+
+#[test]
+fn pass_semantic_let_return_postcondition_uses_mir_return_expression() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_let_return_postcondition",
+        Expected::Pass,
+        &format!("pass_semantic_let_return_postcondition_{suffix}"),
+        &format!("pass_semantic_let_return_postcondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
 }
 
 #[test]
