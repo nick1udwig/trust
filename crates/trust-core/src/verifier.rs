@@ -13,6 +13,7 @@ pub struct TrustFunctionSemantics {
     pub arithmetic_operations: Vec<SemanticArithmeticOperation>,
     pub slice_indexes: Vec<SemanticSliceIndex>,
     pub calls: Vec<SemanticCall>,
+    pub field_accesses: Vec<SemanticFieldAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,6 +54,15 @@ pub struct SemanticCall {
     pub callee: String,
     pub args: Vec<String>,
     pub guards: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticFieldAccess {
+    pub base: String,
+    pub field: String,
+    pub owner_type: String,
+    pub field_type: String,
+    pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,7 +381,7 @@ fn verify_total_with_env(
         });
     }
 
-    for obligation in field_access_obligations(body, &params) {
+    for obligation in verification_field_access_obligations(body, &params, semantics) {
         if !model_types
             .iter()
             .any(|model_type| model_type == &type_name_tail(&obligation.ty))
@@ -1487,6 +1497,31 @@ fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObli
     }
 
     obligations
+}
+
+fn verification_field_access_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<FieldAccessObligation> {
+    let semantic_obligations = semantic_field_access_obligations(semantics);
+    if semantic_obligations.is_empty() {
+        field_access_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
+}
+
+fn semantic_field_access_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<FieldAccessObligation> {
+    semantics
+        .into_iter()
+        .flat_map(|semantics| semantics.field_accesses.iter())
+        .map(|field| FieldAccessObligation {
+            ty: field.owner_type.clone(),
+        })
+        .collect()
 }
 
 fn verify_loops(body: &str, function: &str) -> Result<Vec<LoopFact>, VerificationError> {
@@ -3609,6 +3644,7 @@ mod tests {
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert!(matches!(
@@ -3617,6 +3653,49 @@ mod tests {
         ));
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_field_return_expression_can_prove_postcondition() {
+        let account = model_metadata("Account");
+        let metadata = metadata_named_with_classes(
+            "balance",
+            "pub fn balance(acct: Account) -> i64 { let out = acct.balance; out }",
+            &["out == acct.balance"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "balance".to_string(),
+            params: vec![SemanticParam {
+                name: "acct".to_string(),
+                ty: "Account".to_string(),
+            }],
+            return_type: "i64".to_string(),
+            return_expression: Some("acct.balance".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: vec![SemanticFieldAccess {
+                base: "acct".to_string(),
+                field: "balance".to_string(),
+                owner_type: "Account".to_string(),
+                field_type: "i64".to_string(),
+                expression: "acct.balance".to_string(),
+            }],
+        };
+
+        assert!(matches!(
+            verify_totals(&[account.clone(), metadata.clone()]),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[account, metadata],
+                &[semantics],
+                VerificationOptions::default()
+            ),
             Ok(())
         );
     }
@@ -3645,6 +3724,7 @@ mod tests {
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3681,6 +3761,7 @@ mod tests {
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert!(matches!(
@@ -3723,6 +3804,7 @@ mod tests {
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3765,6 +3847,7 @@ mod tests {
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert_eq!(
@@ -3802,6 +3885,7 @@ mod tests {
                 guards: Vec::new(),
             }],
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert!(matches!(
@@ -3843,6 +3927,7 @@ mod tests {
                 guards: vec!["i < xs.len()".to_string()],
             }],
             calls: Vec::new(),
+            field_accesses: Vec::new(),
         };
 
         assert!(matches!(
@@ -3882,6 +3967,7 @@ mod tests {
                 args: vec!["x".to_string()],
                 guards: Vec::new(),
             }],
+            field_accesses: Vec::new(),
         };
 
         assert!(matches!(
@@ -3925,6 +4011,7 @@ mod tests {
                 args: vec!["x".to_string()],
                 guards: vec!["x < i32::MAX".to_string()],
             }],
+            field_accesses: Vec::new(),
         };
 
         assert!(matches!(

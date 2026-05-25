@@ -9,8 +9,8 @@ use std::process::Command;
 use trust_core::{
     metadata::TrustMetadata,
     verifier::{
-        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticCall, SemanticParam,
-        SemanticSliceIndex, TrustFunctionSemantics,
+        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticCall, SemanticFieldAccess,
+        SemanticParam, SemanticSliceIndex, TrustFunctionSemantics,
     },
 };
 
@@ -68,6 +68,18 @@ struct MirSwitchTarget {
     block: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelFieldMap {
+    ty: String,
+    fields: Vec<ModelField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelField {
+    name: String,
+    ty: String,
+}
+
 pub(crate) fn maybe_extract_semantic_views(
     rustc: &OsString,
     rustc_args: &[OsString],
@@ -120,7 +132,7 @@ fn extract_semantic_views(
         );
     }
 
-    Ok(verifier_semantics(&item_matches))
+    Ok(verifier_semantics(metadata, &item_matches))
 }
 
 fn run_rustc_unpretty(
@@ -185,7 +197,11 @@ fn semantic_item_matches(
         .collect()
 }
 
-fn verifier_semantics(item_matches: &[SemanticItemMatch]) -> Vec<TrustFunctionSemantics> {
+fn verifier_semantics(
+    metadata: &[TrustMetadata],
+    item_matches: &[SemanticItemMatch],
+) -> Vec<TrustFunctionSemantics> {
+    let model_fields = model_field_maps(metadata);
     item_matches
         .iter()
         .filter(|item| item.item_kind == "total" && item.hir_match)
@@ -205,10 +221,13 @@ fn verifier_semantics(item_matches: &[SemanticItemMatch]) -> Vec<TrustFunctionSe
                     })
                     .collect(),
                 return_type: mir_function.return_type.clone(),
-                return_expression: mir_function.normalized_return_expression(),
-                arithmetic_operations: mir_function.semantic_arithmetic_operations(),
-                slice_indexes: mir_function.semantic_slice_indexes(),
-                calls: mir_function.semantic_calls(),
+                return_expression: mir_function
+                    .normalized_return_expression_with_models(&model_fields),
+                arithmetic_operations: mir_function
+                    .semantic_arithmetic_operations_with_models(&model_fields),
+                slice_indexes: mir_function.semantic_slice_indexes_with_models(&model_fields),
+                calls: mir_function.semantic_calls_with_models(&model_fields),
+                field_accesses: mir_function.semantic_field_accesses(&model_fields),
             })
         })
         .collect()
@@ -239,6 +258,55 @@ fn function_leaf_name(path: &str) -> &str {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or(path)
+}
+
+fn model_field_maps(metadata: &[TrustMetadata]) -> Vec<ModelFieldMap> {
+    metadata
+        .iter()
+        .filter(|item| item.item_kind == "trust_model")
+        .filter_map(|item| {
+            let fields = parse_model_fields(&item.function_source);
+            if fields.is_empty() {
+                return None;
+            }
+            Some(ModelFieldMap {
+                ty: function_leaf_name(&item.rust_function_path).to_string(),
+                fields,
+            })
+        })
+        .collect()
+}
+
+fn parse_model_fields(source: &str) -> Vec<ModelField> {
+    let Some(open) = source.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = source.rfind('}') else {
+        return Vec::new();
+    };
+
+    parse_comma_separated(&source[open + 1..close])
+        .into_iter()
+        .filter_map(|field| {
+            let field = field.trim().strip_prefix("pub ").unwrap_or(field.trim());
+            let (name, ty) = field.split_once(':')?;
+            Some(ModelField {
+                name: name.trim().to_string(),
+                ty: ty.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn type_name_tail(ty: &str) -> String {
+    ty.trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .rsplit("::")
+        .next()
+        .unwrap_or(ty)
+        .trim()
+        .to_string()
 }
 
 fn hir_contains_function(hir: &str, name: &str) -> bool {
@@ -281,25 +349,44 @@ impl MirFunctionSummary {
             .map(|local| local.name.as_str())
     }
 
+    #[cfg(test)]
     fn normalized_return_expression(&self) -> Option<String> {
+        self.normalized_return_expression_with_models(&[])
+    }
+
+    fn normalized_return_expression_with_models(
+        &self,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
         self.return_expr
             .as_deref()
-            .and_then(|expr| self.normalized_mir_expression(expr))
+            .and_then(|expr| self.normalized_mir_expression_with_models(expr, model_fields))
     }
 
-    fn normalized_mir_expression(&self, expr: &str) -> Option<String> {
-        self.normalized_mir_expression_with_depth(expr, 0)
+    fn normalized_mir_expression_with_models(
+        &self,
+        expr: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        self.normalized_mir_expression_with_depth(expr, 0, model_fields)
     }
 
-    fn normalized_mir_expression_with_depth(&self, expr: &str, depth: usize) -> Option<String> {
+    fn normalized_mir_expression_with_depth(
+        &self,
+        expr: &str,
+        depth: usize,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
         if depth > 8 {
             return None;
         }
         let expr = strip_mir_move_or_copy(expr.trim());
         if let Some(assignment) = self.assignment_for_place(expr) {
-            if let Some(normalized) =
-                self.normalized_mir_expression_with_depth(&assignment.expression, depth + 1)
-            {
+            if let Some(normalized) = self.normalized_mir_expression_with_depth(
+                &assignment.expression,
+                depth + 1,
+                model_fields,
+            ) {
                 return Some(normalized);
             }
         }
@@ -309,63 +396,75 @@ impl MirFunctionSummary {
         if let Some(constant) = mir_const_value(expr) {
             return Some(constant);
         }
-        if let Some(operation) = self.normalized_mir_operation(expr, depth + 1) {
+        if let Some(operation) = self.normalized_mir_operation(expr, depth + 1, model_fields) {
             return Some(operation);
         }
         if let Some((base, index)) = mir_slice_index(expr) {
             return Some(format!(
                 "{}[{}]",
-                self.normalized_mir_expression_with_depth(base, depth + 1)?,
-                self.normalized_mir_expression_with_depth(index, depth + 1)?
+                self.normalized_mir_expression_with_depth(base, depth + 1, model_fields)?,
+                self.normalized_mir_expression_with_depth(index, depth + 1, model_fields)?
             ));
         }
         if let Some((place, field, _ty)) = mir_projection(expr) {
+            if let Some(field_access) = self.semantic_field_access(place, field, model_fields) {
+                return Some(field_access.expression);
+            }
             if field == "0" {
                 let assignment = self.assignment_for_place(place)?;
-                return self.normalized_mir_operation(&assignment.expression, depth + 1);
+                return self.normalized_mir_operation(
+                    &assignment.expression,
+                    depth + 1,
+                    model_fields,
+                );
             }
         }
 
         None
     }
 
-    fn normalized_mir_operation(&self, expr: &str, depth: usize) -> Option<String> {
+    fn normalized_mir_operation(
+        &self,
+        expr: &str,
+        depth: usize,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
         let (op, args) = expr.split_once('(')?;
         let args = args.strip_suffix(')')?;
         let args = parse_mir_call_args(args);
         match (op.trim(), args.as_slice()) {
             ("AddWithOverflow", [left, right]) => Some(format!(
                 "{} + {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1)?
+                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
             ("SubWithOverflow", [left, right]) => Some(format!(
                 "{} - {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1)?
+                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
             ("MulWithOverflow", [left, right]) => Some(format!(
                 "{} * {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1)?
+                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
             ("Div", [left, right]) => Some(format!(
                 "{} / {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1)?
+                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
             ("Rem", [left, right]) => Some(format!(
                 "{} % {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1)?
+                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
             ("NegWithOverflow", [value]) => Some(format!(
                 "-{}",
-                self.normalized_mir_expression_with_depth(value, depth + 1)?
+                self.normalized_mir_expression_with_depth(value, depth + 1, model_fields)?
             )),
             ("PtrMetadata", [base]) => Some(format!(
                 "{}.len()",
-                self.normalized_mir_expression_with_depth(base, depth + 1)?
+                self.normalized_mir_expression_with_depth(base, depth + 1, model_fields)?
             )),
             _ => None,
         }
@@ -394,8 +493,8 @@ impl MirFunctionSummary {
 
         Some(format!(
             "{} {operator} {}",
-            self.normalized_mir_expression_with_depth(left, depth + 1)?,
-            self.normalized_mir_expression_with_depth(right, depth + 1)?
+            self.normalized_mir_expression_with_depth(left, depth + 1, &[])?,
+            self.normalized_mir_expression_with_depth(right, depth + 1, &[])?
         ))
     }
 
@@ -455,7 +554,15 @@ impl MirFunctionSummary {
             .find(|assignment| assignment.place == place)
     }
 
+    #[cfg(test)]
     fn semantic_arithmetic_operations(&self) -> Vec<SemanticArithmeticOperation> {
+        self.semantic_arithmetic_operations_with_models(&[])
+    }
+
+    fn semantic_arithmetic_operations_with_models(
+        &self,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<SemanticArithmeticOperation> {
         self.assignments
             .iter()
             .filter_map(|assignment| {
@@ -469,8 +576,10 @@ impl MirFunctionSummary {
                         | SemanticArithmeticKind::Rem,
                         [left, right],
                     ) => {
-                        let left = self.normalized_mir_expression(left)?;
-                        let right = self.normalized_mir_expression(right)?;
+                        let left =
+                            self.normalized_mir_expression_with_models(left, model_fields)?;
+                        let right =
+                            self.normalized_mir_expression_with_models(right, model_fields)?;
                         let operator = semantic_arithmetic_operator(kind);
                         Some(SemanticArithmeticOperation {
                             kind,
@@ -485,7 +594,8 @@ impl MirFunctionSummary {
                         })
                     }
                     (SemanticArithmeticKind::Neg, [value]) => {
-                        let value = self.normalized_mir_expression(value)?;
+                        let value =
+                            self.normalized_mir_expression_with_models(value, model_fields)?;
                         Some(SemanticArithmeticOperation {
                             kind,
                             expression: format!("-{value}"),
@@ -504,14 +614,22 @@ impl MirFunctionSummary {
             .collect()
     }
 
+    #[cfg(test)]
     fn semantic_slice_indexes(&self) -> Vec<SemanticSliceIndex> {
+        self.semantic_slice_indexes_with_models(&[])
+    }
+
+    fn semantic_slice_indexes_with_models(
+        &self,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<SemanticSliceIndex> {
         self.assignments
             .iter()
             .filter_map(|assignment| {
                 let expr = strip_mir_move_or_copy(&assignment.expression);
                 let (base, index) = mir_slice_index(expr)?;
-                let base = self.normalized_mir_expression(base)?;
-                let index = self.normalized_mir_expression(index)?;
+                let base = self.normalized_mir_expression_with_models(base, model_fields)?;
+                let index = self.normalized_mir_expression_with_models(index, model_fields)?;
                 Some(SemanticSliceIndex {
                     expression: format!("{base}[{index}]"),
                     base,
@@ -526,7 +644,12 @@ impl MirFunctionSummary {
             .collect()
     }
 
+    #[cfg(test)]
     fn semantic_calls(&self) -> Vec<SemanticCall> {
+        self.semantic_calls_with_models(&[])
+    }
+
+    fn semantic_calls_with_models(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticCall> {
         self.assignments
             .iter()
             .filter_map(|assignment| {
@@ -535,7 +658,7 @@ impl MirFunctionSummary {
                     callee: callee.to_string(),
                     args: args
                         .iter()
-                        .map(|arg| self.normalized_mir_expression(arg))
+                        .map(|arg| self.normalized_mir_expression_with_models(arg, model_fields))
                         .collect::<Option<Vec<_>>>()?,
                     guards: assignment
                         .block
@@ -545,6 +668,41 @@ impl MirFunctionSummary {
                 })
             })
             .collect()
+    }
+
+    fn semantic_field_accesses(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticFieldAccess> {
+        self.assignments
+            .iter()
+            .filter_map(|assignment| {
+                let expr = strip_mir_move_or_copy(&assignment.expression);
+                let (place, field, _ty) = mir_projection(expr)?;
+                self.semantic_field_access(place, field, model_fields)
+            })
+            .collect()
+    }
+
+    fn semantic_field_access(
+        &self,
+        place: &str,
+        field: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<SemanticFieldAccess> {
+        let field_idx = field.parse::<usize>().ok()?;
+        let arg = self.args.iter().find(|arg| arg.place == place)?;
+        let owner_type = type_name_tail(&arg.ty);
+        let model = model_fields.iter().find(|model| model.ty == owner_type)?;
+        let model_field = model.fields.get(field_idx)?;
+        let base = self
+            .local_name_for_place(place)
+            .unwrap_or(place)
+            .to_string();
+        Some(SemanticFieldAccess {
+            expression: format!("{}.{}", base, model_field.name),
+            base,
+            field: model_field.name.clone(),
+            owner_type,
+            field_type: model_field.ty.clone(),
+        })
     }
 }
 
@@ -932,6 +1090,7 @@ fn semantic_summary(
     item_matches: &[SemanticItemMatch],
     rustc_version: &str,
 ) -> String {
+    let model_fields = model_field_maps(metadata);
     let mut summary = String::new();
     summary.push_str("format=trust-semantic-dump-v1\n");
     summary.push_str(&format!("rustc_version={rustc_version}\n"));
@@ -952,11 +1111,11 @@ fn semantic_summary(
         ));
         if let Some(mir_function) = &item.mir_function {
             let return_expr = mir_function
-                .normalized_return_expression()
+                .normalized_return_expression_with_models(&model_fields)
                 .or_else(|| mir_function.return_expr.clone())
                 .unwrap_or_else(|| "none".to_string());
             let arithmetic_ops = mir_function
-                .semantic_arithmetic_operations()
+                .semantic_arithmetic_operations_with_models(&model_fields)
                 .iter()
                 .map(|operation| {
                     if operation.guards.is_empty() {
@@ -972,7 +1131,7 @@ fn semantic_summary(
                 .collect::<Vec<_>>()
                 .join(",");
             let slice_indexes = mir_function
-                .semantic_slice_indexes()
+                .semantic_slice_indexes_with_models(&model_fields)
                 .iter()
                 .map(|index| {
                     if index.guards.is_empty() {
@@ -984,7 +1143,7 @@ fn semantic_summary(
                 .collect::<Vec<_>>()
                 .join(",");
             let calls = mir_function
-                .semantic_calls()
+                .semantic_calls_with_models(&model_fields)
                 .iter()
                 .map(|call| {
                     let call_expr = format!("{}({})", call.callee, call.args.join(","));
@@ -996,8 +1155,14 @@ fn semantic_summary(
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let field_accesses = mir_function
+                .semantic_field_accesses(&model_fields)
+                .iter()
+                .map(|field| format!("{}:{}", field.expression, field.field_type))
+                .collect::<Vec<_>>()
+                .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={}\n",
                 item.rust_function_path,
                 mir_function
                     .args
@@ -1016,6 +1181,7 @@ fn semantic_summary(
                 arithmetic_ops,
                 slice_indexes,
                 calls,
+                field_accesses,
             ));
         }
     }
@@ -1069,6 +1235,67 @@ fn id_i32(_1: i32) -> i32 {
                 terminators: Vec::new(),
                 return_expr: Some("copy _1".to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn extracts_model_field_return_expression() {
+        let mir = r#"
+fn balance(_1: Account) -> i64 {
+    debug acct => _1;
+    let mut _0: i64;
+
+    bb0: {
+        _0 = copy (_1.1: i64);
+        return;
+    }
+}
+"#;
+        let fields = vec![ModelFieldMap {
+            ty: "Account".to_string(),
+            fields: vec![
+                ModelField {
+                    name: "id".to_string(),
+                    ty: "u64".to_string(),
+                },
+                ModelField {
+                    name: "balance".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ],
+        }];
+        let summary = extract_mir_function_summary(mir, "balance").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression_with_models(&fields),
+            Some("acct.balance".to_string())
+        );
+        assert_eq!(
+            summary.semantic_field_accesses(&fields),
+            vec![SemanticFieldAccess {
+                base: "acct".to_string(),
+                field: "balance".to_string(),
+                owner_type: "Account".to_string(),
+                field_type: "i64".to_string(),
+                expression: "acct.balance".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_model_fields_from_metadata_source() {
+        assert_eq!(
+            parse_model_fields("pub struct Account { pub id: u64, pub balance: i64, }"),
+            vec![
+                ModelField {
+                    name: "id".to_string(),
+                    ty: "u64".to_string(),
+                },
+                ModelField {
+                    name: "balance".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ]
         );
     }
 
