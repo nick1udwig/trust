@@ -407,6 +407,19 @@ impl MirFunctionSummary {
         if let Some(constant) = mir_const_value(expr) {
             return Some(constant);
         }
+        if let Some((ty, fields)) = mir_aggregate_fields(expr) {
+            let fields = fields
+                .iter()
+                .map(|(field, value)| {
+                    Some(format!(
+                        "{}: {}",
+                        field,
+                        self.normalized_mir_expression_with_depth(value, depth + 1, model_fields)?
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(format!("{ty} {{ {} }}", fields.join(", ")));
+        }
         if let Some(operation) = self.normalized_mir_operation(expr, depth + 1, model_fields) {
             return Some(operation);
         }
@@ -918,6 +931,7 @@ fn parse_comma_separated(input: &str) -> Vec<String> {
     let mut start = 0usize;
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
     let mut angle_depth = 0usize;
 
     for (idx, ch) in input.char_indices() {
@@ -926,9 +940,15 @@ fn parse_comma_separated(input: &str) -> Vec<String> {
             ')' => paren_depth = paren_depth.saturating_sub(1),
             '[' => bracket_depth += 1,
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
             '<' => angle_depth += 1,
             '>' => angle_depth = angle_depth.saturating_sub(1),
-            ',' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => {
+            ',' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && angle_depth == 0 =>
+            {
                 let item = input[start..idx].trim();
                 if !item.is_empty() {
                     items.push(item.to_string());
@@ -1086,6 +1106,30 @@ fn mir_projection(expr: &str) -> Option<(&str, &str, &str)> {
     let (projection, ty) = expr.split_once(':')?;
     let (place, field) = projection.trim().split_once('.')?;
     Some((place.trim(), field.trim(), ty.trim()))
+}
+
+fn mir_aggregate_fields(expr: &str) -> Option<(&str, Vec<(String, String)>)> {
+    let open = expr.find('{')?;
+    let close = expr.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    let ty = expr[..open].trim();
+    if ty.is_empty() || !ty.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    let fields = parse_comma_separated(&expr[open + 1..close])
+        .into_iter()
+        .map(|field| {
+            let (name, value) = field.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if fields.is_empty() {
+        return None;
+    }
+
+    Some((ty, fields))
 }
 
 fn mir_variant_projection(expr: &str) -> Option<MirVariantProjection> {
@@ -1576,6 +1620,53 @@ fn balance(_1: Account) -> i64 {
                 field_type: "i64".to_string(),
                 expression: "acct.balance".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn normalizes_mir_aggregate_return_expression() {
+        let mir = r#"
+fn withdraw(_1: Account, _2: i64) -> Account {
+    debug acct => _1;
+    debug amount => _2;
+    let mut _0: Account;
+    let mut _3: u64;
+    let mut _4: i64;
+    let mut _5: i64;
+    let mut _6: (i64, bool);
+
+    bb0: {
+        _3 = copy (_1.0: u64);
+        _5 = copy (_1.1: i64);
+        _6 = SubWithOverflow(copy _5, copy _2);
+        assert(!move (_6.1: bool), "attempt to compute `{} - {}`, which would overflow", move _5, copy _2) -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = move (_6.0: i64);
+        _0 = Account { id: move _3, balance: move _4 };
+        return;
+    }
+}
+"#;
+        let fields = vec![ModelFieldMap {
+            ty: "Account".to_string(),
+            fields: vec![
+                ModelField {
+                    name: "id".to_string(),
+                    ty: "u64".to_string(),
+                },
+                ModelField {
+                    name: "balance".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ],
+        }];
+        let summary = extract_mir_function_summary(mir, "withdraw").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression_with_models(&fields),
+            Some("Account { id: acct.id, balance: acct.balance - amount }".to_string())
         );
     }
 

@@ -1062,6 +1062,21 @@ fn pass_semantic_field_return_postcondition_uses_mir_projection() {
 }
 
 #[test]
+fn pass_semantic_struct_return_postcondition_uses_mir_aggregate() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_struct_return_postcondition",
+        Expected::Pass,
+        &format!("pass_semantic_struct_return_postcondition_{suffix}"),
+        &format!("pass_semantic_struct_return_postcondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_semantic_block_slice_precondition_uses_mir_index_fact() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(
