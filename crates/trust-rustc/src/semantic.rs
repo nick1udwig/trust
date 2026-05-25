@@ -291,6 +291,9 @@ impl MirFunctionSummary {
         if let Some(constant) = mir_const_value(expr) {
             return Some(constant);
         }
+        if let Some(operation) = self.normalized_mir_operation(expr, depth + 1) {
+            return Some(operation);
+        }
         if let Some((place, field, _ty)) = mir_projection(expr) {
             if field == "0" {
                 let assignment = self.assignment_for_place(place)?;
@@ -321,6 +324,16 @@ impl MirFunctionSummary {
                 self.normalized_mir_expression_with_depth(left, depth + 1)?,
                 self.normalized_mir_expression_with_depth(right, depth + 1)?
             )),
+            ("Div", [left, right]) => Some(format!(
+                "{} / {}",
+                self.normalized_mir_expression_with_depth(left, depth + 1)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1)?
+            )),
+            ("Rem", [left, right]) => Some(format!(
+                "{} % {}",
+                self.normalized_mir_expression_with_depth(left, depth + 1)?,
+                self.normalized_mir_expression_with_depth(right, depth + 1)?
+            )),
             ("NegWithOverflow", [value]) => Some(format!(
                 "-{}",
                 self.normalized_mir_expression_with_depth(value, depth + 1)?
@@ -345,7 +358,9 @@ impl MirFunctionSummary {
                     (
                         SemanticArithmeticKind::Add
                         | SemanticArithmeticKind::Sub
-                        | SemanticArithmeticKind::Mul,
+                        | SemanticArithmeticKind::Div
+                        | SemanticArithmeticKind::Mul
+                        | SemanticArithmeticKind::Rem,
                         [left, right],
                     ) => {
                         let left = self.normalized_mir_expression(left)?;
@@ -500,6 +515,8 @@ fn mir_checked_arithmetic_operation(expr: &str) -> Option<(SemanticArithmeticKin
         "SubWithOverflow" => SemanticArithmeticKind::Sub,
         "MulWithOverflow" => SemanticArithmeticKind::Mul,
         "NegWithOverflow" => SemanticArithmeticKind::Neg,
+        "Div" => SemanticArithmeticKind::Div,
+        "Rem" => SemanticArithmeticKind::Rem,
         _ => return None,
     };
     Some((kind, parse_mir_call_args(args)))
@@ -511,6 +528,8 @@ fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
         SemanticArithmeticKind::Sub => "-",
         SemanticArithmeticKind::Mul => "*",
         SemanticArithmeticKind::Neg => "-",
+        SemanticArithmeticKind::Div => "/",
+        SemanticArithmeticKind::Rem => "%",
     }
 }
 
@@ -745,6 +764,48 @@ fn add_one(_1: i32) -> i32 {
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_mir_division_and_remainder_operations() {
+        let mir = r#"
+fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: i32;
+    let mut _3: i32;
+
+    bb0: {
+        _3 = Rem(copy _1, copy _2);
+        _0 = Div(copy _1, copy _2);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "ratio_and_mod").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x / y".to_string())
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Rem,
+                    left: "x".to_string(),
+                    right: Some("y".to_string()),
+                    expression: "x % y".to_string(),
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Div,
+                    left: "x".to_string(),
+                    right: Some("y".to_string()),
+                    expression: "x / y".to_string(),
+                },
+            ]
         );
     }
 

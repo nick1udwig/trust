@@ -910,6 +910,22 @@ fn fail_semantic_block_add_unproved_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_block_div_unproved",
+        Expected::Fail,
+        &format!("fail_semantic_block_div_unproved_{suffix}"),
+        &format!("fail_semantic_block_div_unproved_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove integer division denominator is nonzero");
+    output.assert_contains("x / y");
+}
+
+#[test]
 fn fail_i64_overflow_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_i64_overflow_unproved", Expected::Fail);
 

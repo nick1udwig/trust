@@ -33,6 +33,8 @@ pub enum SemanticArithmeticKind {
     Sub,
     Mul,
     Neg,
+    Div,
+    Rem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,7 +446,25 @@ fn verify_total_with_env(
         }
     }
 
+    for obligation in semantic_division_obligations(semantics) {
+        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
+            return Err(VerificationError::IntegerDivisionByZero {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     for obligation in remainder_obligations(body, &params) {
+        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
+            return Err(VerificationError::IntegerRemainderByZero {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    for obligation in semantic_remainder_obligations(semantics) {
         if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
             return Err(VerificationError::IntegerRemainderByZero {
                 function: metadata.rust_function_path.clone(),
@@ -1060,6 +1080,18 @@ fn semantic_multiplication_obligations(
         .collect()
 }
 
+fn semantic_division_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<DenominatorObligation> {
+    semantic_denominator_obligations(semantics, SemanticArithmeticKind::Div)
+}
+
+fn semantic_remainder_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<DenominatorObligation> {
+    semantic_denominator_obligations(semantics, SemanticArithmeticKind::Rem)
+}
+
 fn semantic_arithmetic_operations(
     semantics: Option<&TrustFunctionSemantics>,
     kind: SemanticArithmeticKind,
@@ -1068,6 +1100,21 @@ fn semantic_arithmetic_operations(
         .into_iter()
         .flat_map(|semantics| semantics.arithmetic_operations.iter())
         .filter(move |operation| operation.kind == kind)
+}
+
+fn semantic_denominator_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    kind: SemanticArithmeticKind,
+) -> Vec<DenominatorObligation> {
+    semantic_arithmetic_operations(semantics, kind)
+        .filter_map(|operation| {
+            let denominator = operation.right.as_ref()?;
+            Some(DenominatorObligation {
+                denominator: denominator.clone(),
+                expression: operation.expression.clone(),
+            })
+        })
+        .collect()
 }
 
 fn semantic_addition_obligation(
@@ -3405,6 +3452,80 @@ mod tests {
                 function: "add_one".to_string(),
                 expression: "x + 1".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_catches_block_division_by_zero() {
+        let metadata = metadata_named(
+            "divide",
+            "pub fn divide(x: i32, y: i32) -> i32 { x / { y } }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "divide".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "y".to_string(),
+                    ty: "i32".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            return_expression: Some("x / y".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Div,
+                left: "x".to_string(),
+                right: Some("y".to_string()),
+                expression: "x / y".to_string(),
+            }],
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerDivisionByZero {
+                function: "divide".to_string(),
+                expression: "x / y".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_proves_block_division_precondition() {
+        let metadata = metadata_named(
+            "divide",
+            "pub fn divide(x: i32, y: i32) -> i32 { x / { y } }",
+            &["y != 0"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "divide".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "y".to_string(),
+                    ty: "i32".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            return_expression: Some("x / y".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Div,
+                left: "x".to_string(),
+                right: Some("y".to_string()),
+                expression: "x / y".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
         );
     }
 
