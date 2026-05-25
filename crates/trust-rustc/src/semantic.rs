@@ -103,7 +103,10 @@ pub(crate) fn maybe_extract_semantic_views(
 }
 
 fn semantic_verify_enabled() -> bool {
-    env::var("TRUST_SEMANTIC_VERIFY").as_deref() == Ok("1")
+    !matches!(
+        env::var("TRUST_SEMANTIC_VERIFY").as_deref(),
+        Ok("0" | "false" | "off")
+    )
 }
 
 fn extract_semantic_views(

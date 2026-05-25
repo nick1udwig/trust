@@ -36,8 +36,8 @@ Still intentionally limited:
 - diagnostics are deterministic and tested, but source-span quality is still MVP-level
 - Trust total/proof/model names must be unique within a crate until metadata
   records full Rust module paths
-- verification still mostly uses the metadata/token verifier; opt-in HIR/MIR
-  extraction now feeds compiler-derived return expressions, arithmetic
+- verification still mostly uses the metadata/token verifier plus default
+  HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic
   operations, slice index facts, call arguments with simple branch guards,
   `if` branch return facts, Option/Result match arms, and TrustModel field
   projections, field types, path guards, and struct returns into verification,
@@ -124,12 +124,13 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
 - `TRUST_SMT_DUMP_DIR=/path/to/dumps`: writes SMT-LIB queries for z3-backed VCs.
 - `TRUST_SEMANTIC_DUMP_DIR=/path/to/dumps`: writes rustc `hir-tree`, MIR, and
   a Trust-to-compiler-item summary for Trust crates.
-- `TRUST_SEMANTIC_VERIFY=1`: extracts rustc HIR/MIR and feeds supported MIR
-  facts, including return expressions, guarded arithmetic operations, guarded
-  slice indexes, guarded call arguments, `if` branch return facts,
+- `TRUST_SEMANTIC_VERIFY=0`: debug escape hatch that disables feeding default
+  rustc HIR/MIR facts into verification when semantic dumps are not requested.
+  By default, Trust extracts HIR/MIR for Trust verification items and feeds
+  supported facts, including return expressions, guarded arithmetic operations,
+  guarded slice indexes, guarded call arguments, `if` branch return facts,
   Option/Result match arms, and TrustModel field projections in returns and
-  path guards plus field types for arithmetic obligations, into verification
-  without writing dumps.
+  path guards plus field types for arithmetic obligations, into verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 

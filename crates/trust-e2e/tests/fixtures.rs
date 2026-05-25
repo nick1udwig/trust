@@ -73,6 +73,36 @@ fn pass_total_identity_writes_hir_mir_semantic_dumps_when_requested() {
 }
 
 #[test]
+fn pass_total_identity_extracts_hir_mir_by_default() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_total_identity",
+        Expected::Pass,
+        &format!("pass_total_identity_semantic_default_{suffix}"),
+        &format!("pass_total_identity_semantic_default_{suffix}"),
+        &[],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_total_identity_can_disable_default_semantic_verification_for_debugging() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_total_identity",
+        Expected::Pass,
+        &format!("pass_total_identity_semantic_disabled_{suffix}"),
+        &format!("pass_total_identity_semantic_disabled_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "0")],
+    );
+
+    output.assert_not_contains("trust: extracted HIR/MIR");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_semantic_let_return_postcondition_uses_mir_return_expression() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(
@@ -939,7 +969,7 @@ fn fail_semantic_field_add_unproved_is_rejected_by_mir_verifier() {
         Expected::Fail,
         &format!("fail_semantic_field_add_unproved_{suffix}"),
         &format!("fail_semantic_field_add_unproved_{suffix}"),
-        &[("TRUST_SEMANTIC_VERIFY", "1")],
+        &[],
     );
 
     output.assert_contains("trust: extracted HIR/MIR for 1 total function");

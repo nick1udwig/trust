@@ -178,7 +178,9 @@ fn run_fixture_inner(
         .env("TRUST_CACHE_DIR", fixture_cache_dir(cache_name))
         .env_remove("TRUST_MACRO_UNIT_TEST")
         .env_remove("TRUST_RUSTC_ACTIVE")
-        .env_remove("TRUST_METADATA_OUT");
+        .env_remove("TRUST_METADATA_OUT")
+        .env_remove("TRUST_SEMANTIC_DUMP_DIR")
+        .env_remove("TRUST_SEMANTIC_VERIFY");
 
     if let Some(wrapper) = wrapper {
         command.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
