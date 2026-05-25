@@ -226,6 +226,25 @@ fn pass_cache_hit_reuses_proof_cache() {
 }
 
 #[test]
+fn pass_cache_entry_records_fingerprint_summary() {
+    let suffix = std::process::id();
+    let target_name = format!("pass_cache_entry_summary_{suffix}");
+    let cache_name = format!("pass_cache_entry_summary_{suffix}");
+    let output =
+        run_fixture_with_cache("pass_cache_hit", Expected::Pass, &target_name, &cache_name);
+
+    output.assert_contains("trust: verified 1 function; cache hits 0; cache misses 1");
+    let proof_entries = proof_cache_entries(&cache_name);
+    assert_eq!(proof_entries.len(), 1, "expected one proof cache entry");
+    let contents = fs::read_to_string(&proof_entries[0]).expect("read proof cache entry");
+    assert!(contents.contains("format=trust-proof-cache-v2\n"));
+    assert!(contents.contains("status=proved\n"));
+    assert!(contents.contains("entry_fingerprint="));
+    assert!(contents.contains("verified_items=1\n"));
+    assert!(contents.contains("solver=mock\n"));
+}
+
+#[test]
 fn pass_cache_misses_when_body_changes() {
     let suffix = std::process::id();
     let cache_name = format!("pass_cache_body_changed_shared_{suffix}");

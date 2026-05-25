@@ -282,7 +282,7 @@ fn verify_metadata(
     if let Some(cache_file) = cache_file(metadata, cache_context) {
         if matches!(
             fs::read_to_string(&cache_file),
-            Ok(contents) if contents == "status=proved\n"
+            Ok(contents) if cache_entry_proved(&contents, metadata, cache_context)
         ) {
             return Ok(CacheStats {
                 hits: verification_items,
@@ -291,7 +291,7 @@ fn verify_metadata(
         }
 
         verify_all(metadata, config)?;
-        write_cache_entry(&cache_file)?;
+        write_cache_entry(&cache_file, metadata, cache_context)?;
         return Ok(CacheStats {
             hits: 0,
             misses: verification_items,
@@ -596,7 +596,60 @@ fn cache_path(
     cache_dir.join(format!("{:016x}.proof", hasher.finish()))
 }
 
-fn write_cache_entry(cache_file: &PathBuf) -> Result<(), String> {
+fn cache_entry_proved(
+    contents: &str,
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> bool {
+    contents.lines().any(|line| line == "status=proved")
+        && contents.lines().any(|line| {
+            line == format!(
+                "entry_fingerprint={:016x}",
+                cache_entry_fingerprint(metadata, cache_context)
+            )
+        })
+}
+
+fn cache_entry_fingerprint(
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "trust-proof-cache-entry-v2".hash(&mut hasher);
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    cache_context.hash(&mut hasher);
+    for item in metadata {
+        item.schema_version.hash(&mut hasher);
+        item.item_kind.hash(&mut hasher);
+        item.item_id.hash(&mut hasher);
+        item.rust_function_path.hash(&mut hasher);
+        item.contracts_original.hash(&mut hasher);
+        item.contract_classes.hash(&mut hasher);
+        item.function_source.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn cache_entry_contents(
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> String {
+    let verification_items = metadata
+        .iter()
+        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .count();
+    format!(
+        "format=trust-proof-cache-v2\nstatus=proved\nentry_fingerprint={:016x}\nverified_items={verification_items}\nsolver={}\n",
+        cache_entry_fingerprint(metadata, cache_context),
+        cache_context.solver_name,
+    )
+}
+
+fn write_cache_entry(
+    cache_file: &PathBuf,
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> Result<(), String> {
     if let Some(parent) = cache_file.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create Trust cache directory: {err}"))?;
@@ -606,7 +659,7 @@ fn write_cache_entry(cache_file: &PathBuf) -> Result<(), String> {
     {
         let mut file = fs::File::create(&temp_file)
             .map_err(|err| format!("failed to write Trust cache entry: {err}"))?;
-        file.write_all(b"status=proved\n")
+        file.write_all(cache_entry_contents(metadata, cache_context).as_bytes())
             .map_err(|err| format!("failed to write Trust cache entry: {err}"))?;
         file.sync_all()
             .map_err(|err| format!("failed to persist Trust cache entry: {err}"))?;
