@@ -15,6 +15,7 @@ pub struct TrustFunctionSemantics {
     pub calls: Vec<SemanticCall>,
     pub field_accesses: Vec<SemanticFieldAccess>,
     pub matches: Vec<SemanticMatch>,
+    pub branches: Vec<SemanticBranch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,6 +87,18 @@ pub struct SemanticMatchPayload {
     pub binding: String,
     pub field_index: usize,
     pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticBranch {
+    pub condition: String,
+    pub arms: Vec<SemanticBranchArm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticBranchArm {
+    pub guard: String,
+    pub return_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +524,8 @@ fn verify_total_with_env(
             semantic_return_expression.as_deref(),
             semantics,
             &postcondition_assumptions,
+            &params,
+            options,
         ) {
             return Err(VerificationError::PostconditionUnproved {
                 function: metadata.rust_function_path.clone(),
@@ -767,18 +782,51 @@ fn postcondition_proved(
     semantic_return_expression: Option<&str>,
     semantics: Option<&TrustFunctionSemantics>,
     contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
 ) -> bool {
     let return_expression = return_expression(body);
     if semantic_return_expression.is_some_and(|return_expression| {
-        postcondition_proved_by_return_expression(postcondition, raw_body, return_expression)
+        postcondition_proved_by_return_expression_with_assumptions(
+            postcondition,
+            raw_body,
+            return_expression,
+            contracts,
+            params,
+            options,
+        )
     }) {
         return true;
     }
-    if semantic_match_proves_postcondition(postcondition, raw_body, semantics, contracts) {
+    if semantic_match_proves_postcondition(
+        postcondition,
+        raw_body,
+        semantics,
+        contracts,
+        params,
+        options,
+    ) {
+        return true;
+    }
+    if semantic_branch_proves_postcondition(
+        postcondition,
+        raw_body,
+        semantics,
+        contracts,
+        params,
+        options,
+    ) {
         return true;
     }
 
-    postcondition_proved_by_return_expression(postcondition, raw_body, &return_expression)
+    postcondition_proved_by_return_expression_with_assumptions(
+        postcondition,
+        raw_body,
+        &return_expression,
+        contracts,
+        params,
+        options,
+    )
 }
 
 fn semantic_match_proves_postcondition(
@@ -786,6 +834,8 @@ fn semantic_match_proves_postcondition(
     raw_body: &str,
     semantics: Option<&TrustFunctionSemantics>,
     contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
 ) -> bool {
     semantics.into_iter().any(|semantics| {
         semantics.matches.iter().any(|semantic_match| {
@@ -804,10 +854,13 @@ fn semantic_match_proves_postcondition(
                         .as_ref()
                         .is_some_and(|return_expression| {
                             let return_expression = normalize(return_expression);
-                            postcondition_proved_by_return_expression(
+                            postcondition_proved_by_return_expression_with_assumptions(
                                 postcondition,
                                 raw_body,
                                 &return_expression,
+                                contracts,
+                                params,
+                                options,
                             )
                         })
                 })
@@ -853,6 +906,71 @@ fn semantic_variant_excluded_by_contract(scrutinee: &str, variant: &str, contrac
     }
 }
 
+fn semantic_branch_proves_postcondition(
+    postcondition: &Contract,
+    raw_body: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics.branches.iter().any(|branch| {
+            let reachable_arms = branch
+                .arms
+                .iter()
+                .filter(|arm| semantic_branch_arm_reachable(arm, contracts))
+                .collect::<Vec<_>>();
+            !reachable_arms.is_empty()
+                && reachable_arms.iter().all(|arm| {
+                    arm.return_expression
+                        .as_ref()
+                        .is_some_and(|return_expression| {
+                            let return_expression = normalize(return_expression);
+                            let branch_contracts =
+                                contracts_with_assumptions(contracts, &[normalize(&arm.guard)]);
+                            postcondition_proved_by_return_expression_with_assumptions(
+                                postcondition,
+                                raw_body,
+                                &return_expression,
+                                &branch_contracts,
+                                params,
+                                options,
+                            )
+                        })
+                })
+        })
+    })
+}
+
+fn semantic_branch_arm_reachable(arm: &SemanticBranchArm, contracts: &[String]) -> bool {
+    !contracts.iter().any(|contract| {
+        semantic_condition_excluded_by_contract(&normalize(&arm.guard), &normalize(contract))
+    })
+}
+
+fn semantic_condition_excluded_by_contract(condition: &str, contract: &str) -> bool {
+    negated_condition(condition).as_deref() == Some(contract)
+}
+
+fn negated_condition(condition: &str) -> Option<String> {
+    for (op, negated) in [
+        ("<=", ">"),
+        (">=", "<"),
+        ("!=", "=="),
+        ("==", "!="),
+        ("<", ">="),
+        (">", "<="),
+    ] {
+        let Some((left, right)) = condition.split_once(op) else {
+            continue;
+        };
+        return Some(format!("{}{}{}", left.trim(), negated, right.trim()));
+    }
+
+    None
+}
+
 fn postcondition_proved_by_return_expression(
     postcondition: &Contract,
     raw_body: &str,
@@ -868,6 +986,37 @@ fn postcondition_proved_by_return_expression(
         || (right == "out" && loop_exit_proves_value(raw_body, &return_expression, left))
         || output_field_equals_return_field(left, right, &return_expression)
         || output_field_equals_return_field(right, left, &return_expression)
+}
+
+fn postcondition_proved_by_return_expression_with_assumptions(
+    postcondition: &Contract,
+    raw_body: &str,
+    return_expression: &str,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
+    if postcondition_proved_by_return_expression(postcondition, raw_body, return_expression) {
+        return true;
+    }
+
+    let conclusion = substitute_out(&postcondition.normalized, return_expression);
+    z3_proves_conclusion(&conclusion, contracts, params, options).is_some_and(|proved| proved)
+}
+
+fn substitute_out(condition: &str, return_expression: &str) -> String {
+    token_expression(
+        &tokens(condition)
+            .into_iter()
+            .map(|token| {
+                if token == "out" {
+                    return_expression.to_string()
+                } else {
+                    token
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn output_field_equals_return_field(output: &str, expected: &str, return_expression: &str) -> bool {
@@ -3752,6 +3901,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3792,6 +3942,7 @@ mod tests {
                 expression: "acct.balance".to_string(),
             }],
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3846,6 +3997,7 @@ mod tests {
                     },
                 ],
             }],
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3900,6 +4052,7 @@ mod tests {
                     },
                 ],
             }],
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3950,10 +4103,107 @@ mod tests {
                     },
                 ],
             }],
+            branches: Vec::new(),
         };
 
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_branch_arms_can_prove_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "zero_for_any_i32",
+            "pub fn zero_for_any_i32(x: i32) -> i32 { if x > 0 { 0 } else { 0 } }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "zero_for_any_i32".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "x > 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x > 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x <= 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_branch_guard_assumption_can_prove_postcondition_with_z3() {
+        let metadata = metadata_named_with_classes(
+            "zero_or_self",
+            "pub fn zero_or_self(x: i32) -> i32 { if x == 0 { 0 } else { x } }",
+            &["out == x"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "zero_or_self".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "x == 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x == 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x != 0".to_string(),
+                        return_expression: Some("x".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert!(matches!(
+            verify_totals_with_semantics(
+                &[metadata.clone()],
+                &[semantics.clone()],
+                VerificationOptions::default()
+            ),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::z3(5000)),
             Ok(())
         );
     }
@@ -3984,6 +4234,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -4022,6 +4273,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -4066,6 +4318,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -4110,6 +4363,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert_eq!(
@@ -4149,6 +4403,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -4192,6 +4447,7 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -4233,6 +4489,7 @@ mod tests {
             }],
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(
@@ -4278,6 +4535,7 @@ mod tests {
             }],
             field_accesses: Vec::new(),
             matches: Vec::new(),
+            branches: Vec::new(),
         };
 
         assert!(matches!(

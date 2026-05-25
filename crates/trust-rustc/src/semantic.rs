@@ -9,9 +9,9 @@ use std::process::Command;
 use trust_core::{
     metadata::TrustMetadata,
     verifier::{
-        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticCall, SemanticFieldAccess,
-        SemanticMatch, SemanticMatchArm, SemanticMatchPayload, SemanticParam, SemanticSliceIndex,
-        TrustFunctionSemantics,
+        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticBranch, SemanticBranchArm,
+        SemanticCall, SemanticFieldAccess, SemanticMatch, SemanticMatchArm, SemanticMatchPayload,
+        SemanticParam, SemanticSliceIndex, TrustFunctionSemantics,
     },
 };
 
@@ -238,6 +238,7 @@ fn verifier_semantics(
                 calls: mir_function.semantic_calls_with_models(&model_fields),
                 field_accesses: mir_function.semantic_field_accesses(&model_fields),
                 matches: mir_function.semantic_matches(&model_fields),
+                branches: mir_function.semantic_branches(&model_fields),
             })
         })
         .collect()
@@ -523,19 +524,20 @@ impl MirFunctionSummary {
             .iter()
             .filter_map(|terminator| {
                 let (condition, targets) = mir_switch(&terminator.expression)?;
-                let predicate = self.normalized_mir_predicate(condition)?;
+                let explicit_values = explicit_mir_switch_values(&targets);
                 Some(
                     targets
-                        .into_iter()
+                        .iter()
                         .filter_map(|target| {
                             if target.block != block {
                                 return None;
                             }
-                            match target.value.as_str() {
-                                "otherwise" | "1" | "true" => Some(predicate.clone()),
-                                "0" | "false" => negate_predicate(&predicate),
-                                _ => None,
-                            }
+                            self.guard_for_switch_target(
+                                condition,
+                                &target.value,
+                                &explicit_values,
+                                &[],
+                            )
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -765,6 +767,63 @@ impl MirFunctionSummary {
                 })
             })
             .collect()
+    }
+
+    fn semantic_branches(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticBranch> {
+        self.terminators
+            .iter()
+            .filter_map(|terminator| {
+                let (switch_condition, targets) = mir_switch(&terminator.expression)?;
+                let predicate = self.normalized_mir_predicate(switch_condition);
+                let condition_expression =
+                    self.normalized_mir_expression_with_models(switch_condition, model_fields);
+                let condition = predicate.clone().or(condition_expression)?;
+                let explicit_values = explicit_mir_switch_values(&targets);
+                let arms = targets
+                    .iter()
+                    .filter_map(|target| {
+                        let guard = self.guard_for_switch_target(
+                            switch_condition,
+                            &target.value,
+                            &explicit_values,
+                            model_fields,
+                        )?;
+                        let return_expression =
+                            self.semantic_return_expression_for_block(&target.block, model_fields);
+                        Some(SemanticBranchArm {
+                            guard,
+                            return_expression,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if arms.len() < 2 {
+                    return None;
+                }
+
+                Some(SemanticBranch { condition, arms })
+            })
+            .collect()
+    }
+
+    fn guard_for_switch_target(
+        &self,
+        condition: &str,
+        target_value: &str,
+        explicit_values: &[String],
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        if let Some(predicate) = self.normalized_mir_predicate(condition) {
+            return mir_boolean_branch_guard(&predicate, target_value);
+        }
+
+        let expression = self.normalized_mir_expression_with_models(condition, model_fields)?;
+        match target_value {
+            "otherwise" if explicit_values.len() == 1 => {
+                Some(format!("{expression} != {}", explicit_values[0]))
+            }
+            "otherwise" => None,
+            value => Some(format!("{expression} == {value}")),
+        }
     }
 
     fn semantic_match_payload(
@@ -1126,6 +1185,22 @@ fn mir_switch(expr: &str) -> Option<(&str, Vec<MirSwitchTarget>)> {
     Some((condition.trim(), parse_mir_switch_targets(targets)))
 }
 
+fn mir_boolean_branch_guard(predicate: &str, target_value: &str) -> Option<String> {
+    match target_value {
+        "otherwise" | "1" | "true" => Some(predicate.to_string()),
+        "0" | "false" => negate_predicate(predicate),
+        _ => None,
+    }
+}
+
+fn explicit_mir_switch_values(targets: &[MirSwitchTarget]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| target.value != "otherwise")
+        .map(|target| target.value.clone())
+        .collect()
+}
+
 fn parse_mir_switch_targets(input: &str) -> Vec<MirSwitchTarget> {
     parse_comma_separated(input)
         .into_iter()
@@ -1363,8 +1438,26 @@ fn semantic_summary(
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let branches = mir_function
+                .semantic_branches(&model_fields)
+                .iter()
+                .map(|branch| {
+                    let arms = branch
+                        .arms
+                        .iter()
+                        .map(|arm| {
+                            let return_expression =
+                                arm.return_expression.as_deref().unwrap_or("none");
+                            format!("{}=>{}", arm.guard, return_expression)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    format!("{}:{}", branch.condition, arms)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={} branches={}\n",
                 item.rust_function_path,
                 mir_function
                     .args
@@ -1385,6 +1478,7 @@ fn semantic_summary(
                 calls,
                 field_accesses,
                 matches,
+                branches,
             ));
         }
     }
@@ -1481,6 +1575,102 @@ fn balance(_1: Account) -> i64 {
                 owner_type: "Account".to_string(),
                 field_type: "i64".to_string(),
                 expression: "acct.balance".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_if_branch_guards_and_return_expressions() {
+        let mir = r#"
+fn zero_if_positive(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: bool;
+
+    bb0: {
+        _2 = Gt(copy _1, const 0_i32);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = const 1_i32;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "zero_if_positive").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_branches(&[]),
+            vec![SemanticBranch {
+                condition: "x > 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x <= 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x > 0".to_string(),
+                        return_expression: Some("1".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_if_branch_guards_from_scalar_switch() {
+        let mir = r#"
+fn zero_or_self(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = const 0_i32;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = copy _1;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "zero_or_self").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_branches(&[]),
+            vec![SemanticBranch {
+                condition: "x".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x == 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x != 0".to_string(),
+                        return_expression: Some("x".to_string()),
+                    },
+                ],
             }]
         );
     }
