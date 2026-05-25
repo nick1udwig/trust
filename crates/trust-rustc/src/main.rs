@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::process::{self, Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 use trust_core::{
-    metadata::parse_metadata_line,
+    metadata::{parse_metadata_line, TrustMetadata},
     solver::VerificationOptions,
-    verifier::{verify_totals, verify_totals_with_options},
+    verifier::{verify_totals, verify_totals_with_options, VerificationError},
 };
 use z3::{ast::Bool, Config, SatResult, Solver};
 
@@ -343,11 +343,171 @@ fn verify_all(
     metadata: &[trust_core::metadata::TrustMetadata],
     config: &TrustConfig,
 ) -> Result<(), String> {
-    match config.solver.as_str() {
-        "mock" => verify_totals(metadata).map_err(|err| err.to_string()),
-        "z3" => verify_totals_with_options(metadata, VerificationOptions::z3(config.timeout_ms))
-            .map_err(|err| err.to_string()),
-        solver => Err(format!("unsupported solver `{solver}`")),
+    let result = match config.solver.as_str() {
+        "mock" => verify_totals(metadata),
+        "z3" => verify_totals_with_options(metadata, VerificationOptions::z3(config.timeout_ms)),
+        solver => return Err(format!("unsupported solver `{solver}`")),
+    };
+
+    result.map_err(|err| format_verification_error(&err, metadata))
+}
+
+fn format_verification_error(err: &VerificationError, metadata: &[TrustMetadata]) -> String {
+    let mut diagnostic = err.to_string();
+    let Some(item_name) = verification_error_item_name(err) else {
+        return diagnostic;
+    };
+    let Some(item) = metadata.iter().find(|item| {
+        matches!(item.item_kind.as_str(), "total" | "proof") && item.rust_function_path == item_name
+    }) else {
+        return diagnostic;
+    };
+
+    diagnostic.push_str(&format!(
+        "\n  --> Trust {} `{}`",
+        item.item_kind, item.rust_function_path
+    ));
+    if item.source_span != "unknown" {
+        diagnostic.push_str(&format!(" at {}", item.source_span));
+    }
+
+    let snippet = diagnostic_source_snippet(err, item)
+        .or_else(|| first_source_line(&item.function_source))
+        .unwrap_or_else(|| item.function_source.trim().to_string());
+    if !snippet.is_empty() {
+        diagnostic.push_str("\n   |");
+        diagnostic.push_str(&format!("\n   | {snippet}"));
+        diagnostic.push_str("\n   |");
+    }
+
+    if let Some(help) = diagnostic_help(err) {
+        diagnostic.push_str(&format!("\nhelp[trust]: {help}"));
+    }
+
+    diagnostic
+}
+
+fn verification_error_item_name(err: &VerificationError) -> Option<&str> {
+    match err {
+        VerificationError::IntegerAdditionOverflow { function, .. }
+        | VerificationError::IntegerSubtractionOverflow { function, .. }
+        | VerificationError::IntegerNegationOverflow { function, .. }
+        | VerificationError::IntegerMultiplicationOverflow { function, .. }
+        | VerificationError::IntegerDivisionByZero { function, .. }
+        | VerificationError::IntegerRemainderByZero { function, .. }
+        | VerificationError::SliceIndexOutOfBounds { function, .. }
+        | VerificationError::UnsupportedIndex { function, .. }
+        | VerificationError::CalleePreconditionUnproved { function, .. }
+        | VerificationError::MissingTrustModel { function, .. }
+        | VerificationError::LoopMissingSpec { function }
+        | VerificationError::LoopAmbiguousSpec { function }
+        | VerificationError::LoopMissingDecreases { function }
+        | VerificationError::LoopInvariantNotPreserved { function, .. }
+        | VerificationError::LoopDecreasesNotDecreasing { function, .. }
+        | VerificationError::UnsupportedLoopControl { function, .. }
+        | VerificationError::UnsupportedCall { function, .. }
+        | VerificationError::UnsupportedClosure { function }
+        | VerificationError::ExplicitPanic { function }
+        | VerificationError::UncheckedUnwrap { function }
+        | VerificationError::PostconditionUnproved { function, .. } => Some(function),
+        VerificationError::ProofObligationUnproved { proof, .. }
+        | VerificationError::UnsupportedProofStep { proof } => Some(proof),
+    }
+}
+
+fn diagnostic_source_snippet(err: &VerificationError, item: &TrustMetadata) -> Option<String> {
+    let needle = verification_error_expression(err)?;
+    source_line_containing(&item.function_source, needle)
+}
+
+fn verification_error_expression(err: &VerificationError) -> Option<&str> {
+    match err {
+        VerificationError::IntegerAdditionOverflow { expression, .. }
+        | VerificationError::IntegerSubtractionOverflow { expression, .. }
+        | VerificationError::IntegerNegationOverflow { expression, .. }
+        | VerificationError::IntegerMultiplicationOverflow { expression, .. }
+        | VerificationError::IntegerDivisionByZero { expression, .. }
+        | VerificationError::IntegerRemainderByZero { expression, .. }
+        | VerificationError::SliceIndexOutOfBounds { expression, .. }
+        | VerificationError::UnsupportedIndex { expression, .. } => Some(expression),
+        VerificationError::CalleePreconditionUnproved { condition, .. }
+        | VerificationError::LoopInvariantNotPreserved {
+            invariant: condition,
+            ..
+        }
+        | VerificationError::LoopDecreasesNotDecreasing {
+            measure: condition, ..
+        }
+        | VerificationError::PostconditionUnproved { condition, .. }
+        | VerificationError::ProofObligationUnproved { condition, .. } => Some(condition),
+        VerificationError::UnsupportedLoopControl { keyword, .. }
+        | VerificationError::UnsupportedCall {
+            callee: keyword, ..
+        } => Some(keyword),
+        VerificationError::MissingTrustModel { .. }
+        | VerificationError::LoopMissingSpec { .. }
+        | VerificationError::LoopAmbiguousSpec { .. }
+        | VerificationError::LoopMissingDecreases { .. }
+        | VerificationError::UnsupportedClosure { .. }
+        | VerificationError::ExplicitPanic { .. }
+        | VerificationError::UncheckedUnwrap { .. }
+        | VerificationError::UnsupportedProofStep { .. } => None,
+    }
+}
+
+fn source_line_containing(source: &str, needle: &str) -> Option<String> {
+    let normalized_needle = normalize_for_diagnostic_search(needle);
+    if normalized_needle.is_empty() {
+        return None;
+    }
+
+    source
+        .lines()
+        .map(str::trim)
+        .find(|line| normalize_for_diagnostic_search(line).contains(&normalized_needle))
+        .map(str::to_string)
+}
+
+fn first_source_line(source: &str) -> Option<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_for_diagnostic_search(input: &str) -> String {
+    input.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn diagnostic_help(err: &VerificationError) -> Option<&'static str> {
+    match err {
+        VerificationError::IntegerAdditionOverflow { .. }
+        | VerificationError::IntegerSubtractionOverflow { .. }
+        | VerificationError::IntegerNegationOverflow { .. }
+        | VerificationError::IntegerMultiplicationOverflow { .. } => {
+            Some("add executable preconditions that bound the arithmetic expression")
+        }
+        VerificationError::IntegerDivisionByZero { .. }
+        | VerificationError::IntegerRemainderByZero { .. } => {
+            Some("add an executable precondition proving the denominator is nonzero")
+        }
+        VerificationError::SliceIndexOutOfBounds { .. } => {
+            Some("add an executable precondition proving the index is below the slice length")
+        }
+        VerificationError::MissingTrustModel { .. } => {
+            Some("derive TrustModel for the type if it satisfies the MVP model restrictions")
+        }
+        VerificationError::CalleePreconditionUnproved { .. } => {
+            Some("strengthen the caller preconditions or prove the callee requirement before the call")
+        }
+        VerificationError::PostconditionUnproved { .. } => {
+            Some("make the returned expression match the stated postcondition or strengthen the proof facts")
+        }
+        VerificationError::LoopMissingSpec { .. } | VerificationError::LoopMissingDecreases { .. } => {
+            Some("add a loop_spec block with an invariant and decreases measure before the loop")
+        }
+        _ => None,
     }
 }
 

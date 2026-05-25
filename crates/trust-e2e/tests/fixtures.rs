@@ -819,6 +819,9 @@ fn fail_overflow_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_overflow_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+    output.assert_contains("--> Trust total `add_one`");
+    output.assert_contains("x + 1");
+    output.assert_contains("help[trust]: add executable preconditions");
 }
 
 #[test]
