@@ -9,7 +9,8 @@ use std::process::Command;
 use trust_core::{
     metadata::TrustMetadata,
     verifier::{
-        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticParam, TrustFunctionSemantics,
+        SemanticArithmeticKind, SemanticArithmeticOperation, SemanticParam, SemanticSliceIndex,
+        TrustFunctionSemantics,
     },
 };
 
@@ -192,6 +193,7 @@ fn verifier_semantics(item_matches: &[SemanticItemMatch]) -> Vec<TrustFunctionSe
                 return_type: mir_function.return_type.clone(),
                 return_expression: mir_function.normalized_return_expression(),
                 arithmetic_operations: mir_function.semantic_arithmetic_operations(),
+                slice_indexes: mir_function.semantic_slice_indexes(),
             })
         })
         .collect()
@@ -232,8 +234,8 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
     let lines = mir.lines().collect::<Vec<_>>();
     let signature_idx = lines
         .iter()
-        .position(|line| line.trim_start().starts_with(&format!("fn {name}(")))?;
-    let signature = parse_mir_signature(lines[signature_idx].trim(), name)?;
+        .position(|line| mir_signature_matches_leaf(line.trim(), name))?;
+    let signature = parse_mir_signature(lines[signature_idx].trim())?;
     let function_end = mir_function_end(&lines, signature_idx).unwrap_or(lines.len());
     let function_lines = &lines[signature_idx + 1..function_end];
 
@@ -293,6 +295,13 @@ impl MirFunctionSummary {
         }
         if let Some(operation) = self.normalized_mir_operation(expr, depth + 1) {
             return Some(operation);
+        }
+        if let Some((base, index)) = mir_slice_index(expr) {
+            return Some(format!(
+                "{}[{}]",
+                self.normalized_mir_expression_with_depth(base, depth + 1)?,
+                self.normalized_mir_expression_with_depth(index, depth + 1)?
+            ));
         }
         if let Some((place, field, _ty)) = mir_projection(expr) {
             if field == "0" {
@@ -387,6 +396,23 @@ impl MirFunctionSummary {
             })
             .collect()
     }
+
+    fn semantic_slice_indexes(&self) -> Vec<SemanticSliceIndex> {
+        self.assignments
+            .iter()
+            .filter_map(|assignment| {
+                let expr = strip_mir_move_or_copy(&assignment.expression);
+                let (base, index) = mir_slice_index(expr)?;
+                let base = self.normalized_mir_expression(base)?;
+                let index = self.normalized_mir_expression(index)?;
+                Some(SemanticSliceIndex {
+                    expression: format!("{base}[{index}]"),
+                    base,
+                    index,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,10 +421,20 @@ struct MirSignature {
     return_type: String,
 }
 
-fn parse_mir_signature(line: &str, name: &str) -> Option<MirSignature> {
-    let prefix = format!("fn {name}(");
-    let rest = line.strip_prefix(&prefix)?;
+fn mir_signature_matches_leaf(line: &str, name: &str) -> bool {
+    mir_signature_name(line).is_some_and(|path| function_leaf_name(path) == name)
+}
+
+fn mir_signature_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("fn ")?;
+    let (name, _rest) = rest.split_once('(')?;
+    Some(name.trim())
+}
+
+fn parse_mir_signature(line: &str) -> Option<MirSignature> {
+    let rest = line.strip_prefix("fn ")?;
     let (args, rest) = rest.split_once(") -> ")?;
+    let (_name, args) = args.split_once('(')?;
     let return_type = rest
         .trim()
         .strip_suffix('{')
@@ -501,6 +537,19 @@ fn mir_projection(expr: &str) -> Option<(&str, &str, &str)> {
     let (projection, ty) = expr.split_once(':')?;
     let (place, field) = projection.trim().split_once('.')?;
     Some((place.trim(), field.trim(), ty.trim()))
+}
+
+fn mir_slice_index(expr: &str) -> Option<(&str, &str)> {
+    let (base, index) = expr.split_once('[')?;
+    let index = index.strip_suffix(']')?;
+    Some((mir_slice_base_place(base.trim())?, index.trim()))
+}
+
+fn mir_slice_base_place(base: &str) -> Option<&str> {
+    base.strip_prefix("(*")
+        .and_then(|base| base.strip_suffix(')'))
+        .or_else(|| base.strip_prefix('*'))
+        .map(str::trim)
 }
 
 fn parse_mir_call_args(input: &str) -> Vec<String> {
@@ -622,8 +671,14 @@ fn semantic_summary(
                 .map(|operation| operation.expression.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
+            let slice_indexes = mir_function
+                .semantic_slice_indexes()
+                .iter()
+                .map(|index| index.expression.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={}\n",
                 item.rust_function_path,
                 mir_function
                     .args
@@ -640,6 +695,7 @@ fn semantic_summary(
                     .join(","),
                 return_expr,
                 arithmetic_ops,
+                slice_indexes,
             ));
         }
     }
@@ -806,6 +862,45 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                     expression: "x / y".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn extracts_module_qualified_slice_index_summary() {
+        let mir = r#"
+fn verified::get(_1: &[i32], _2: usize) -> i32 {
+    debug xs => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: usize;
+    let mut _4: bool;
+
+    bb0: {
+        _3 = PtrMetadata(copy _1);
+        _4 = Lt(copy _2, copy _3);
+        assert(move _4, "index out of bounds") -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = copy (*_1)[_2];
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "get").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("xs[i]".to_string())
+        );
+        assert_eq!(
+            summary.semantic_slice_indexes(),
+            vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                index: "i".to_string(),
+                expression: "xs[i]".to_string(),
+            }]
         );
     }
 

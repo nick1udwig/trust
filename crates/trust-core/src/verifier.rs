@@ -11,6 +11,7 @@ pub struct TrustFunctionSemantics {
     pub return_type: String,
     pub return_expression: Option<String>,
     pub arithmetic_operations: Vec<SemanticArithmeticOperation>,
+    pub slice_indexes: Vec<SemanticSliceIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,6 +36,13 @@ pub enum SemanticArithmeticKind {
     Neg,
     Div,
     Rem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticSliceIndex {
+    pub base: String,
+    pub index: String,
+    pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,7 +488,7 @@ fn verify_total_with_env(
         });
     }
 
-    for obligation in slice_index_obligations(body, &params) {
+    for obligation in verification_slice_index_obligations(body, &params, semantics) {
         if !slice_index_obligation_proved(&obligation, &contracts) {
             return Err(VerificationError::SliceIndexOutOfBounds {
                 function: metadata.rust_function_path.clone(),
@@ -1311,6 +1319,33 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
     }
 
     obligations
+}
+
+fn verification_slice_index_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<SliceIndexObligation> {
+    let semantic_obligations = semantic_slice_index_obligations(semantics);
+    if semantic_obligations.is_empty() {
+        slice_index_obligations(body, params)
+    } else {
+        semantic_obligations
+    }
+}
+
+fn semantic_slice_index_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<SliceIndexObligation> {
+    semantics
+        .into_iter()
+        .flat_map(|semantics| semantics.slice_indexes.iter())
+        .map(|index| SliceIndexObligation {
+            base: index.base.clone(),
+            index: index.index.clone(),
+            expression: index.expression.clone(),
+        })
+        .collect()
 }
 
 fn unsupported_index_expression(body: &str, params: &[Param]) -> Option<String> {
@@ -3410,6 +3445,7 @@ mod tests {
             return_type: "i32".to_string(),
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
         };
 
         assert!(matches!(
@@ -3443,6 +3479,7 @@ mod tests {
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
             }],
+            slice_indexes: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3482,6 +3519,7 @@ mod tests {
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
             }],
+            slice_indexes: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3521,8 +3559,48 @@ mod tests {
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
             }],
+            slice_indexes: Vec::new(),
         };
 
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_slice_index_proves_block_index_precondition() {
+        let metadata = metadata_named(
+            "get",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[{ i }] }",
+            &["i < xs.len()"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "&[i32]".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            return_expression: Some("xs[i]".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                index: "i".to_string(),
+                expression: "xs[i]".to_string(),
+            }],
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::SliceIndexOutOfBounds { .. })
+        ));
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())

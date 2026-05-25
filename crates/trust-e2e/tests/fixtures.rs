@@ -926,6 +926,21 @@ fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn pass_semantic_block_slice_precondition_uses_mir_index_fact() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_block_slice_precondition",
+        Expected::Pass,
+        &format!("pass_semantic_block_slice_precondition_{suffix}"),
+        &format!("pass_semantic_block_slice_precondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_i64_overflow_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_i64_overflow_unproved", Expected::Fail);
 
