@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 trust-core.workspace = true
+z3.workspace = true

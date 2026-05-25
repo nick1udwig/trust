@@ -5,18 +5,22 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{self, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{self, Command, ExitStatus};
+use std::time::{SystemTime, UNIX_EPOCH};
 use trust_core::{metadata::parse_metadata_line, verifier::verify_totals};
+use z3::{ast::Bool, Config, SatResult, Solver};
 
 fn main() {
-    match run() {
-        Ok(code) => process::exit(code),
+    cleanup_z3_trace_file();
+    let code = match run() {
+        Ok(code) => code,
         Err(err) => {
             eprintln!("error[trust]: {err}");
-            process::exit(1);
+            1
         }
-    }
+    };
+    cleanup_z3_trace_file();
+    process::exit(code);
 }
 
 fn run() -> Result<i32, String> {
@@ -314,68 +318,16 @@ fn check_mock_solver_status() -> Result<(), String> {
 }
 
 fn check_z3_solver_status(config: &TrustConfig) -> Result<(), String> {
-    let solver = z3_solver_bin();
-    let query = format!(
-        "(set-logic QF_LIA)\n(set-option :timeout {})\n(assert false)\n(check-sat)\n",
-        config.timeout_ms
-    );
-    let output = run_solver_with_timeout(&solver, &query, config.timeout_ms)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            return Err("solver error".to_string());
-        }
-        return Err(format!("solver error: {detail}"));
-    }
+    let mut cfg = Config::new();
+    cfg.set_bool_param_value("trace", false);
+    cfg.set_timeout_msec(config.timeout_ms);
+    let result = z3::with_z3_config(&cfg, || {
+        let solver = Solver::new_for_logic("QF_LIA").unwrap_or_else(Solver::new);
+        solver.assert(Bool::from_bool(false));
+        solver.check()
+    });
 
-    solver_result_from_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn run_solver_with_timeout(
-    solver: &PathBuf,
-    input: &str,
-    timeout_ms: u64,
-) -> Result<std::process::Output, String> {
-    let mut child = Command::new(solver)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            format!(
-                "solver `z3` is unavailable at `{}`: {err}",
-                solver.display()
-            )
-        })?;
-
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "solver error".to_string())?;
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|_| "solver error".to_string())?;
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("solver timed out".to_string());
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => return Err("solver error".to_string()),
-        }
-    }
-
-    child
-        .wait_with_output()
-        .map_err(|_| "solver error".to_string())
+    solver_result_from_sat_result(result)
 }
 
 fn solver_version(config: &TrustConfig) -> Result<String, String> {
@@ -385,39 +337,17 @@ fn solver_version(config: &TrustConfig) -> Result<String, String> {
 
     match config.solver.as_str() {
         "mock" => Ok("mock-v1".to_string()),
-        "z3" => {
-            let solver = z3_solver_bin();
-            let output = Command::new(&solver)
-                .arg("--version")
-                .output()
-                .map_err(|err| {
-                    format!(
-                        "solver `z3` is unavailable at `{}`: {err}",
-                        solver.display()
-                    )
-                })?;
-            if !output.status.success() {
-                return Err("solver error".to_string());
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        }
+        "z3" => Ok(z3::full_version().to_string()),
         solver => Err(format!("unsupported solver `{solver}`")),
     }
 }
 
-fn z3_solver_bin() -> PathBuf {
-    env::var_os("TRUST_SOLVER_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("z3"))
-}
-
-fn solver_result_from_output(output: &str) -> Result<(), String> {
-    let status = output
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "solver error".to_string())?;
-
-    solver_result_from_status(status)
+fn solver_result_from_sat_result(result: SatResult) -> Result<(), String> {
+    match result {
+        SatResult::Unsat => Ok(()),
+        SatResult::Sat => Err("solver found counterexample".to_string()),
+        SatResult::Unknown => Err("solver returned unknown".to_string()),
+    }
 }
 
 fn solver_result_from_status(status: &str) -> Result<(), String> {
@@ -428,6 +358,14 @@ fn solver_result_from_status(status: &str) -> Result<(), String> {
         "timeout" => Err("solver timed out".to_string()),
         "error" | "solver_error" => Err("solver error".to_string()),
         status => Err(format!("unsupported solver status `{status}`")),
+    }
+}
+
+fn cleanup_z3_trace_file() {
+    // Vendored debug Z3 opens this at library load even when tracing is disabled.
+    let path = PathBuf::from(".z3-trace");
+    if matches!(fs::metadata(&path), Ok(metadata) if metadata.len() == 0) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -700,22 +638,27 @@ mod tests {
     }
 
     #[test]
-    fn solver_output_maps_unsat_to_proved() {
-        assert_eq!(solver_result_from_output("unsat\n"), Ok(()));
+    fn removes_vendored_z3_trace_file() {
+        cleanup_z3_trace_file();
     }
 
     #[test]
-    fn solver_output_maps_sat_to_counterexample() {
+    fn solver_result_maps_unsat_to_proved() {
+        assert_eq!(solver_result_from_sat_result(SatResult::Unsat), Ok(()));
+    }
+
+    #[test]
+    fn solver_result_maps_sat_to_counterexample() {
         assert_eq!(
-            solver_result_from_output("sat\n"),
+            solver_result_from_sat_result(SatResult::Sat),
             Err("solver found counterexample".to_string())
         );
     }
 
     #[test]
-    fn solver_output_maps_unknown_to_failure() {
+    fn solver_result_maps_unknown_to_failure() {
         assert_eq!(
-            solver_result_from_output("unknown\n"),
+            solver_result_from_sat_result(SatResult::Unknown),
             Err("solver returned unknown".to_string())
         );
     }
