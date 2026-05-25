@@ -385,7 +385,7 @@ fn verify_total_with_env(
     }
 
     for obligation in call_obligations(body, env) {
-        if !callee_precondition_proved(&obligation.condition, &given_contracts) {
+        if !callee_precondition_proved(&obligation.condition, &given_contracts, &params, options) {
             return Err(VerificationError::CalleePreconditionUnproved {
                 function: metadata.rust_function_path.clone(),
                 callee: obligation.callee,
@@ -1640,15 +1640,23 @@ fn slice_index_obligation_proved(obligation: &SliceIndexObligation, contracts: &
         .any(|contract| contract == &index_lt_len || contract == &len_gt_index)
 }
 
-fn callee_precondition_proved(condition: &str, contracts: &[String]) -> bool {
+fn callee_precondition_proved(
+    condition: &str,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
     if contracts.iter().any(|contract| contract == condition) {
         return true;
     }
 
-    let Some(flipped) = flipped_inequality(condition) else {
-        return false;
-    };
-    contracts.iter().any(|contract| contract == &flipped)
+    if flipped_inequality(condition)
+        .is_some_and(|flipped| contracts.iter().any(|contract| contract == &flipped))
+    {
+        return true;
+    }
+
+    z3_proves_conclusion(condition, contracts, params, options).is_some_and(|proved| proved)
 }
 
 fn executable_tokens(body: &str) -> Vec<String> {
@@ -2608,6 +2616,29 @@ mod tests {
         );
 
         assert_eq!(verify_totals(&[get, first]), Ok(()));
+    }
+
+    #[test]
+    fn z3_proves_callee_precondition_from_equivalent_numeric_bound() {
+        let inc = metadata_named(
+            "inc",
+            "pub fn inc(x: i32) -> i32 { x + 1 }",
+            &["x < i32::MAX"],
+        );
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(x: i32) -> i32 { inc(x) }",
+            &["x < 2147483647"],
+        );
+
+        assert!(matches!(
+            verify_totals(&[inc.clone(), caller.clone()]),
+            Err(VerificationError::CalleePreconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_options(&[inc, caller], VerificationOptions::z3(5000)),
+            Ok(())
+        );
     }
 
     #[test]
