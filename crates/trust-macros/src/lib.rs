@@ -682,8 +682,66 @@ fn parse_trust_model_source(source: &str) -> Result<ModelInfo, &'static str> {
     if !has_body_group(&tokens) {
         return Err("error[trust]: TrustModel derive requires a braced struct body");
     }
+    validate_trust_model_fields(source)?;
 
     Ok(ModelInfo { name })
+}
+
+fn validate_trust_model_fields(source: &str) -> Result<(), &'static str> {
+    let Some(body_start) = source.find('{') else {
+        return Err("error[trust]: TrustModel derive requires a braced struct body");
+    };
+    let Some((body, _after_body)) = extract_braced(&source[body_start..]) else {
+        return Err("error[trust]: TrustModel derive requires a braced struct body");
+    };
+
+    for raw_field in body.split(',') {
+        let field = raw_field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let Some((_name, ty)) = field.rsplit_once(':') else {
+            return Err("error[trust]: TrustModel derive supports named fields in this MVP");
+        };
+        if !is_supported_trust_model_field_type(ty.trim()) {
+            return Err("error[trust]: field type is not supported by TrustModel MVP");
+        }
+    }
+
+    Ok(())
+}
+
+fn is_supported_trust_model_field_type(ty: &str) -> bool {
+    if ty.contains('<')
+        || ty.contains('>')
+        || ty.contains('*')
+        || ty.contains('&')
+        || ty.contains('(')
+        || ty.contains(')')
+        || ty.contains("dyn")
+        || ty.contains("fn")
+        || ty.contains("UnsafeCell")
+    {
+        return false;
+    }
+
+    matches!(
+        ty.trim(),
+        "bool"
+            | "char"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+    )
 }
 
 fn inspect_module_info(input: &str) -> Result<ModuleInfo, &'static str> {
@@ -1285,6 +1343,16 @@ mod tests {
         assert_eq!(
             err,
             "error[trust]: generic TrustModel types are not supported in MVP"
+        );
+    }
+
+    #[test]
+    fn trust_model_derive_rejects_unsupported_field_type() {
+        let err = parse_trust_model_source("pub struct Bag { pub values: Vec<i32> }").unwrap_err();
+
+        assert_eq!(
+            err,
+            "error[trust]: field type is not supported by TrustModel MVP"
         );
     }
 

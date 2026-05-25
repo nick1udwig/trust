@@ -75,6 +75,13 @@ fn pass_trust_model_struct_allows_field_reasoning() {
 }
 
 #[test]
+fn fail_trust_model_unsupported_field_type_is_rejected() {
+    let output = run_fixture("fail_trust_model_unsupported_field_type", Expected::Fail);
+
+    output.assert_contains("error[trust]: field type is not supported by TrustModel MVP");
+}
+
+#[test]
 fn pass_withdraw_account_proves_old_field_postconditions() {
     let output = run_fixture("pass_withdraw_account", Expected::Pass);
 
