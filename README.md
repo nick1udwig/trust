@@ -40,8 +40,8 @@ Still intentionally limited:
   extraction now feeds compiler-derived return expressions, arithmetic
   operations, slice index facts, call arguments with simple branch guards,
   `if` branch return facts, Option/Result match arms, and TrustModel field
-  projections, path guards, and struct returns into verification, but it is not
-  the primary VC generator yet
+  projections, field types, path guards, and struct returns into verification,
+  but it is not the primary VC generator yet
 
 ## Toolchain
 
@@ -128,7 +128,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   facts, including return expressions, guarded arithmetic operations, guarded
   slice indexes, guarded call arguments, `if` branch return facts,
   Option/Result match arms, and TrustModel field projections in returns and
-  path guards, into verification without writing dumps.
+  path guards plus field types for arithmetic obligations, into verification
+  without writing dumps.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 

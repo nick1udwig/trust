@@ -387,6 +387,7 @@ fn verify_total_with_env(
     let mut contracts = executable_preconditions(metadata);
     let given_contracts = given_preconditions(metadata);
     let params = verification_params(&source, semantics);
+    let value_params = verification_value_params(&params, semantics);
     let raw_body = body(&metadata.function_source);
     let body = body(&source);
     let semantic_return_expression = semantics
@@ -441,8 +442,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_addition_obligations(body, &params, semantics) {
-        if !addition_obligation_proved(&obligation, &contracts, &params, options) {
+    for obligation in verification_addition_obligations(body, &value_params, semantics) {
+        if !addition_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerAdditionOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -450,8 +451,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_subtraction_obligations(body, &params, semantics) {
-        if !subtraction_obligation_proved(&obligation, &contracts, &params, options) {
+    for obligation in verification_subtraction_obligations(body, &value_params, semantics) {
+        if !subtraction_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerSubtractionOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -459,8 +460,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_negation_obligations(body, &params, semantics) {
-        if !negation_obligation_proved(&obligation, &contracts, &params, options) {
+    for obligation in verification_negation_obligations(body, &value_params, semantics) {
+        if !negation_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerNegationOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -468,8 +469,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_multiplication_obligations(body, &params, semantics) {
-        if !multiplication_obligation_proved(&obligation, &contracts, &params, options) {
+    for obligation in verification_multiplication_obligations(body, &value_params, semantics) {
+        if !multiplication_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -479,7 +480,7 @@ fn verify_total_with_env(
 
     for obligation in verification_division_obligations(body, &params, semantics) {
         let contracts = contracts_with_assumptions(&contracts, &obligation.assumptions);
-        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
+        if !denominator_nonzero(&obligation.denominator, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerDivisionByZero {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -489,7 +490,7 @@ fn verify_total_with_env(
 
     for obligation in verification_remainder_obligations(body, &params, semantics) {
         let contracts = contracts_with_assumptions(&contracts, &obligation.assumptions);
-        if !denominator_nonzero(&obligation.denominator, &contracts, &params, options) {
+        if !denominator_nonzero(&obligation.denominator, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerRemainderByZero {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -515,7 +516,7 @@ fn verify_total_with_env(
 
     for obligation in verification_call_obligations(body, env, semantics) {
         let contracts = contracts_with_assumptions(&given_contracts, &obligation.assumptions);
-        if !callee_precondition_proved(&obligation.condition, &contracts, &params, options) {
+        if !callee_precondition_proved(&obligation.condition, &contracts, &value_params, options) {
             return Err(VerificationError::CalleePreconditionUnproved {
                 function: metadata.rust_function_path.clone(),
                 callee: obligation.callee,
@@ -532,7 +533,7 @@ fn verify_total_with_env(
             semantic_return_expression.as_deref(),
             semantics,
             &postcondition_assumptions,
-            &params,
+            &value_params,
             options,
         ) {
             return Err(VerificationError::PostconditionUnproved {
@@ -757,6 +758,31 @@ fn verification_params(source: &str, semantics: Option<&TrustFunctionSemantics>)
     } else {
         semantic_params
     }
+}
+
+fn verification_value_params(
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<Param> {
+    let mut value_params = params.to_vec();
+    let Some(semantics) = semantics else {
+        return value_params;
+    };
+
+    for field in &semantics.field_accesses {
+        if value_params
+            .iter()
+            .any(|param| param.name == field.expression)
+        {
+            continue;
+        }
+        value_params.push(Param {
+            name: field.expression.clone(),
+            ty: field.field_type.clone(),
+        });
+    }
+
+    value_params
 }
 
 fn body(source: &str) -> &str {
@@ -3982,6 +4008,101 @@ mod tests {
             verify_totals(&[account.clone(), metadata.clone()]),
             Err(VerificationError::PostconditionUnproved { .. })
         ));
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[account, metadata],
+                &[semantics],
+                VerificationOptions::default()
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_field_addition_requires_typed_overflow_proof() {
+        let account = model_metadata("Account");
+        let metadata = metadata_named(
+            "reward",
+            "pub fn reward(acct: Account) -> i64 { acct.balance + 1 }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "reward".to_string(),
+            params: vec![SemanticParam {
+                name: "acct".to_string(),
+                ty: "Account".to_string(),
+            }],
+            return_type: "i64".to_string(),
+            return_expression: Some("acct.balance + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "acct.balance".to_string(),
+                right: Some("1".to_string()),
+                expression: "acct.balance + 1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: vec![SemanticFieldAccess {
+                base: "acct".to_string(),
+                field: "balance".to_string(),
+                owner_type: "Account".to_string(),
+                field_type: "i64".to_string(),
+                expression: "acct.balance".to_string(),
+            }],
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[account, metadata],
+                &[semantics],
+                VerificationOptions::default()
+            ),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "reward".to_string(),
+                expression: "acct.balance + 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_field_addition_uses_typed_contract_bound() {
+        let account = model_metadata("Account");
+        let metadata = metadata_named(
+            "reward",
+            "pub fn reward(acct: Account) -> i64 { acct.balance + 1 }",
+            &["acct.balance < i64::MAX"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "reward".to_string(),
+            params: vec![SemanticParam {
+                name: "acct".to_string(),
+                ty: "Account".to_string(),
+            }],
+            return_type: "i64".to_string(),
+            return_expression: Some("acct.balance + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                left: "acct.balance".to_string(),
+                right: Some("1".to_string()),
+                expression: "acct.balance + 1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: vec![SemanticFieldAccess {
+                base: "acct".to_string(),
+                field: "balance".to_string(),
+                owner_type: "Account".to_string(),
+                field_type: "i64".to_string(),
+                expression: "acct.balance".to_string(),
+            }],
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
         assert_eq!(
             verify_totals_with_semantics(
                 &[account, metadata],

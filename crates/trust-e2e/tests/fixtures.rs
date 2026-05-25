@@ -932,6 +932,22 @@ fn fail_semantic_block_add_unproved_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn fail_semantic_field_add_unproved_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_field_add_unproved",
+        Expected::Fail,
+        &format!("fail_semantic_field_add_unproved_{suffix}"),
+        &format!("fail_semantic_field_add_unproved_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+    output.assert_contains("acct.balance + 1");
+}
+
+#[test]
 fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(
@@ -1061,6 +1077,21 @@ fn pass_semantic_field_branch_guard_subtraction_uses_mir_path_condition() {
         Expected::Pass,
         &format!("pass_semantic_field_branch_guard_subtraction_{suffix}"),
         &format!("pass_semantic_field_branch_guard_subtraction_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_semantic_field_add_precondition_uses_mir_field_type() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_field_add_precondition",
+        Expected::Pass,
+        &format!("pass_semantic_field_add_precondition_{suffix}"),
+        &format!("pass_semantic_field_add_precondition_{suffix}"),
         &[("TRUST_SEMANTIC_VERIFY", "1")],
     );
 
