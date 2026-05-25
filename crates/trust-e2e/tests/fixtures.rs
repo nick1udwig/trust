@@ -675,6 +675,13 @@ fn fail_multiple_fn_in_total_is_rejected() {
 }
 
 #[test]
+fn fail_duplicate_trust_names_are_rejected() {
+    let output = run_fixture("fail_duplicate_trust_names", Expected::Fail);
+
+    output.assert_contains("error[trust]: duplicate Trust metadata name `same`");
+}
+
+#[test]
 fn fail_executable_precondition_quantifier_is_rejected() {
     let output = run_fixture("fail_executable_precondition_quantifier", Expected::Fail);
 

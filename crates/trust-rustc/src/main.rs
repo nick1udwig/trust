@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -53,6 +53,7 @@ fn run() -> Result<i32, String> {
     }
 
     let metadata = read_metadata(&metadata_path)?;
+    reject_ambiguous_metadata_paths(&metadata)?;
     emit_config_warnings(&metadata, &config);
     let semantics = if metadata_has_verification_item(&metadata) {
         semantic::maybe_extract_semantic_views(&rustc, &rustc_args, &metadata)?
@@ -765,6 +766,38 @@ fn read_metadata(path: &PathBuf) -> Result<Vec<trust_core::metadata::TrustMetada
     Ok(metadata)
 }
 
+fn reject_ambiguous_metadata_paths(metadata: &[TrustMetadata]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = Vec::new();
+
+    for item in metadata
+        .iter()
+        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof" | "trust_model"))
+    {
+        if !seen.insert(item.rust_function_path.as_str())
+            && !duplicates
+                .iter()
+                .any(|duplicate| duplicate == &item.rust_function_path)
+        {
+            duplicates.push(item.rust_function_path.clone());
+        }
+    }
+
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+
+    let names = duplicates
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "duplicate Trust metadata name{} {names}; Trust MVP requires unique total/proof/model names within a crate so HIR/MIR facts map unambiguously",
+        plural(duplicates.len())
+    ))
+}
+
 fn metadata_path() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -990,6 +1023,26 @@ fn exit_code(status: ExitStatus) -> i32 {
 mod tests {
     use super::*;
 
+    fn metadata_item(kind: &str, path: &str) -> TrustMetadata {
+        TrustMetadata {
+            schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "test-module".to_string(),
+            item_id: format!("{kind}:{path}:test"),
+            item_kind: kind.to_string(),
+            source_span: "test-span".to_string(),
+            rust_function_path: path.to_string(),
+            visibility: "public".to_string(),
+            contracts_original: Vec::new(),
+            contracts_normalized: Vec::new(),
+            contract_classes: Vec::new(),
+            assertion_policy: "always".to_string(),
+            function_source: format!("pub fn {path}() {{}}"),
+            body_hash_placeholder: format!("{path}-hash"),
+            trust_model_dependencies: Vec::new(),
+        }
+    }
+
     #[test]
     fn wrapper_splits_cargo_style_rustc_args() {
         let (rustc, args) = split_rustc_args(vec![
@@ -1015,6 +1068,29 @@ mod tests {
     #[test]
     fn removes_vendored_z3_trace_file() {
         cleanup_z3_trace_file();
+    }
+
+    #[test]
+    fn accepts_unique_metadata_paths() {
+        let metadata = vec![
+            metadata_item("total", "first"),
+            metadata_item("proof", "second"),
+        ];
+
+        assert_eq!(reject_ambiguous_metadata_paths(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_duplicate_metadata_paths() {
+        let metadata = vec![
+            metadata_item("total", "same"),
+            metadata_item("total", "same"),
+        ];
+
+        assert_eq!(
+            reject_ambiguous_metadata_paths(&metadata),
+            Err("duplicate Trust metadata name `same`; Trust MVP requires unique total/proof/model names within a crate so HIR/MIR facts map unambiguously".to_string())
+        );
     }
 
     #[test]

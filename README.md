@@ -34,6 +34,8 @@ Still intentionally limited:
   arbitrary Rust calls, arbitrary method calls, iterators, mutation-heavy collection models,
   or user-declared trusted axioms
 - diagnostics are deterministic and tested, but source-span quality is still MVP-level
+- Trust total/proof/model names must be unique within a crate until metadata
+  records full Rust module paths
 - verification still mostly uses the metadata/token verifier; opt-in HIR/MIR
   extraction now feeds compiler-derived return expressions, arithmetic
   operations, slice index facts, call arguments with simple branch guards,

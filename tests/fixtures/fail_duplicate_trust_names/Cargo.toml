@@ -1,0 +1,13 @@
+[package]
+name = "fail_duplicate_trust_names"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]
+trust = { path = "../../../crates/trust" }
+
