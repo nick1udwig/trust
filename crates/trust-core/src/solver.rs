@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::str::FromStr;
 use z3::{
     ast::{Bool, Int},
@@ -109,15 +113,41 @@ fn prove_integer_implication(
             solver.assert(&assumption);
         }
 
-        let Some(conclusion) = conclusion.to_z3(&mut env) else {
+        let Some(z3_conclusion) = conclusion.to_z3(&mut env) else {
             return ProofResult::Unsupported;
         };
-        solver.assert(&conclusion.not());
+        solver.assert(&z3_conclusion.not());
+        dump_smt_if_requested(&solver, assumptions, conclusion, params);
         match solver.check() {
             SatResult::Unsat => ProofResult::Proved,
             SatResult::Sat | SatResult::Unknown => ProofResult::Unproved,
         }
     })
+}
+
+fn dump_smt_if_requested(
+    solver: &Solver,
+    assumptions: &[String],
+    conclusion: &Predicate,
+    params: &[(String, String)],
+) {
+    let Some(dump_dir) = env::var_os("TRUST_SMT_DUMP_DIR").map(PathBuf::from) else {
+        return;
+    };
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "trust-smt-dump-v1".hash(&mut hasher);
+    assumptions.hash(&mut hasher);
+    conclusion.hash(&mut hasher);
+    params.hash(&mut hasher);
+    let smt = format!("{}\n(check-sat)\n", solver.to_smt2());
+    smt.hash(&mut hasher);
+
+    if fs::create_dir_all(&dump_dir).is_err() {
+        return;
+    }
+    let path = dump_dir.join(format!("vc-{:016x}.smt2", hasher.finish()));
+    let _ = fs::write(path, smt);
 }
 
 struct Z3Env {
@@ -161,7 +191,7 @@ impl Z3Env {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Predicate {
     left: Expr,
     op: CmpOp,
@@ -183,7 +213,7 @@ impl Predicate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CmpOp {
     Lt,
     Le,
@@ -193,7 +223,7 @@ enum CmpOp {
     Ne,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Expr {
     Var(String),
     Const(i128),

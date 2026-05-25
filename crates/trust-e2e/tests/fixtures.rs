@@ -707,6 +707,36 @@ fn pass_z3_solver_runs_crate_backend() {
 }
 
 #[test]
+fn pass_z3_solver_writes_smt_dump_when_requested() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("z3_smt_dump_{suffix}"));
+    let dump_dir_str = dump_dir.to_str().expect("SMT dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "pass_z3_solver",
+        Expected::Pass,
+        &format!("pass_z3_solver_smt_dump_{suffix}"),
+        &format!("pass_z3_solver_smt_dump_{suffix}"),
+        &[("TRUST_SMT_DUMP_DIR", dump_dir_str)],
+    );
+
+    output.assert_contains("trust: proved 1 total function");
+    let dumps = fs::read_dir(&dump_dir)
+        .expect("read SMT dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read SMT dump entries");
+    assert!(
+        dumps
+            .iter()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "smt2")),
+        "expected an SMT-LIB dump in {}",
+        dump_dir.display()
+    );
+    let smt = fs::read_to_string(dumps[0].path()).expect("read SMT dump");
+    assert!(smt.contains("(check-sat)"));
+    assert!(smt.contains("assert"));
+}
+
+#[test]
 fn fail_trusted_model_stub_cannot_prove_false() {
     let output = run_fixture("fail_trusted_model_not_axiom", Expected::Fail);
 
