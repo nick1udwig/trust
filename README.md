@@ -36,7 +36,7 @@ Still intentionally limited:
 - diagnostics are deterministic and tested, but source-span quality is still MVP-level
 - verification still mostly uses the metadata/token verifier; opt-in HIR/MIR
   extraction now feeds compiler-derived return expressions, arithmetic
-  operations with simple branch guards, slice index facts, and call arguments
+  operations, slice index facts, and call arguments with simple branch guards
   into verification, but it is not the primary VC generator yet
 
 ## Toolchain
@@ -121,8 +121,9 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
 - `TRUST_SEMANTIC_DUMP_DIR=/path/to/dumps`: writes rustc `hir-tree`, MIR, and
   a Trust-to-compiler-item summary for Trust crates.
 - `TRUST_SEMANTIC_VERIFY=1`: extracts rustc HIR/MIR and feeds supported MIR
-  facts, including return expressions, guarded arithmetic operations, slice
-  indexes, and call arguments, into verification without writing dumps.
+  facts, including return expressions, guarded arithmetic operations, guarded
+  slice indexes, and guarded call arguments, into verification without writing
+  dumps.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 

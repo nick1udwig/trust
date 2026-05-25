@@ -45,12 +45,14 @@ pub struct SemanticSliceIndex {
     pub base: String,
     pub index: String,
     pub expression: String,
+    pub guards: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticCall {
     pub callee: String,
     pub args: Vec<String>,
+    pub guards: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,7 +456,8 @@ fn verify_total_with_env(
     }
 
     for obligation in verification_call_obligations(body, env, semantics) {
-        if !callee_precondition_proved(&obligation.condition, &given_contracts, &params, options) {
+        let contracts = contracts_with_assumptions(&given_contracts, &obligation.assumptions);
+        if !callee_precondition_proved(&obligation.condition, &contracts, &params, options) {
             return Err(VerificationError::CalleePreconditionUnproved {
                 function: metadata.rust_function_path.clone(),
                 callee: obligation.callee,
@@ -547,12 +550,14 @@ struct SliceIndexObligation {
     base: String,
     index: String,
     expression: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CallObligation {
     callee: String,
     condition: String,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1398,6 +1403,7 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
             base: base.clone(),
             index: index.clone(),
             expression: format!("{base}[{index}]"),
+            assumptions: Vec::new(),
         });
         idx += 1;
     }
@@ -1428,6 +1434,7 @@ fn semantic_slice_index_obligations(
             base: index.base.clone(),
             index: index.index.clone(),
             expression: index.expression.clone(),
+            assumptions: index.guards.iter().map(|guard| normalize(guard)).collect(),
         })
         .collect()
 }
@@ -1860,6 +1867,7 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
                 obligations.push(CallObligation {
                     callee: callee.name.clone(),
                     condition: substitute_params(precondition, &callee.params, &args),
+                    assumptions: Vec::new(),
                 });
             }
         }
@@ -1904,6 +1912,7 @@ fn semantic_call_obligations(
                     .map(|precondition| CallObligation {
                         callee: callee.name.clone(),
                         condition: substitute_params(precondition, &callee.params, &call.args),
+                        assumptions: call.guards.iter().map(|guard| normalize(guard)).collect(),
                     })
                     .collect::<Vec<_>>(),
             )
@@ -2178,6 +2187,8 @@ fn z3_proves_conclusion(
 }
 
 fn slice_index_obligation_proved(obligation: &SliceIndexObligation, contracts: &[String]) -> bool {
+    let contracts = contracts_with_assumptions(contracts, &obligation.assumptions);
+    let contracts = contracts.as_slice();
     let index_lt_len = format!("{}<{}.len()", obligation.index, obligation.base);
     let len_gt_index = format!("{}.len()>{}", obligation.base, obligation.index);
 
@@ -3788,6 +3799,48 @@ mod tests {
                 base: "xs".to_string(),
                 index: "i".to_string(),
                 expression: "xs[i]".to_string(),
+                guards: Vec::new(),
+            }],
+            calls: Vec::new(),
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::SliceIndexOutOfBounds { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_branch_guard_proves_slice_index_bound() {
+        let metadata = metadata_named(
+            "get_or_zero",
+            "pub fn get_or_zero(xs: &[i32], i: usize) -> i32 { if i < xs.len() { xs[i] } else { 0 } }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get_or_zero".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "&[i32]".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                index: "i".to_string(),
+                expression: "xs[i]".to_string(),
+                guards: vec!["i < xs.len()".to_string()],
             }],
             calls: Vec::new(),
         };
@@ -3827,6 +3880,50 @@ mod tests {
             calls: vec![SemanticCall {
                 callee: "inc".to_string(),
                 args: vec!["x".to_string()],
+                guards: Vec::new(),
+            }],
+        };
+
+        assert!(matches!(
+            verify_totals(&[inc.clone(), caller.clone()]),
+            Err(VerificationError::CalleePreconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[inc, caller],
+                &[semantics],
+                VerificationOptions::default()
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_branch_guard_proves_call_precondition() {
+        let inc = metadata_named(
+            "inc",
+            "pub fn inc(x: i32) -> i32 { x + 1 }",
+            &["x < i32::MAX"],
+        );
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(x: i32) -> i32 { if x < i32::MAX { inc(x) } else { x } }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "caller".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: vec!["x < i32::MAX".to_string()],
             }],
         };
 

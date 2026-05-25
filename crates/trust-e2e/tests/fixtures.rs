@@ -941,6 +941,21 @@ fn pass_semantic_branch_guard_add_uses_mir_path_condition() {
 }
 
 #[test]
+fn pass_semantic_branch_guard_slice_call_uses_mir_path_condition() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_branch_guard_slice_call",
+        Expected::Pass,
+        &format!("pass_semantic_branch_guard_slice_call_{suffix}"),
+        &format!("pass_semantic_branch_guard_slice_call_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 3 total functions");
+    output.assert_contains("trust: proved 3 total functions");
+}
+
+#[test]
 fn pass_semantic_block_slice_precondition_uses_mir_index_fact() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(

@@ -58,6 +58,7 @@ struct MirAssignment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirTerminator {
+    block: Option<String>,
     expression: String,
 }
 
@@ -362,6 +363,10 @@ impl MirFunctionSummary {
                 "-{}",
                 self.normalized_mir_expression_with_depth(value, depth + 1)?
             )),
+            ("PtrMetadata", [base]) => Some(format!(
+                "{}.len()",
+                self.normalized_mir_expression_with_depth(base, depth + 1)?
+            )),
             _ => None,
         }
     }
@@ -395,7 +400,17 @@ impl MirFunctionSummary {
     }
 
     fn guards_for_block(&self, block: &str) -> Vec<String> {
-        self.terminators
+        self.guards_for_block_with_seen(block, &mut Vec::new())
+    }
+
+    fn guards_for_block_with_seen(&self, block: &str, seen: &mut Vec<String>) -> Vec<String> {
+        if seen.iter().any(|seen_block| seen_block == block) {
+            return Vec::new();
+        }
+        seen.push(block.to_string());
+
+        let mut guards = self
+            .terminators
             .iter()
             .filter_map(|terminator| {
                 let (condition, targets) = mir_switch(&terminator.expression)?;
@@ -417,7 +432,20 @@ impl MirFunctionSummary {
                 )
             })
             .flatten()
-            .collect()
+            .collect::<Vec<_>>();
+
+        for terminator in &self.terminators {
+            if mir_successor_targets(&terminator.expression)
+                .iter()
+                .any(|target| target == block)
+            {
+                if let Some(predecessor) = terminator.block.as_deref() {
+                    guards.extend(self.guards_for_block_with_seen(predecessor, seen));
+                }
+            }
+        }
+
+        dedup_strings(guards)
     }
 
     fn assignment_for_place(&self, place: &str) -> Option<&MirAssignment> {
@@ -488,6 +516,11 @@ impl MirFunctionSummary {
                     expression: format!("{base}[{index}]"),
                     base,
                     index,
+                    guards: assignment
+                        .block
+                        .as_deref()
+                        .map(|block| self.guards_for_block(block))
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -504,6 +537,11 @@ impl MirFunctionSummary {
                         .iter()
                         .map(|arg| self.normalized_mir_expression(arg))
                         .collect::<Option<Vec<_>>>()?,
+                    guards: assignment
+                        .block
+                        .as_deref()
+                        .map(|block| self.guards_for_block(block))
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -606,14 +644,21 @@ fn extract_mir_assignments(lines: &[&str]) -> Vec<MirAssignment> {
 
 fn extract_mir_terminators(lines: &[&str]) -> Vec<MirTerminator> {
     let mut terminators = Vec::new();
+    let mut current_block = None;
 
     for line in lines {
         let line = line.trim();
-        if mir_block_header(line).is_some() {
+        if let Some(block) = mir_block_header(line) {
+            current_block = Some(block.to_string());
             continue;
         }
-        if line.starts_with("switchInt(") {
+        if line.starts_with("switchInt(")
+            || line.starts_with("goto -> ")
+            || line.starts_with("assert(")
+            || line.contains(" -> [return: ")
+        {
             terminators.push(MirTerminator {
+                block: current_block.clone(),
                 expression: line.trim_end_matches(';').trim().to_string(),
             });
         }
@@ -762,6 +807,32 @@ fn parse_mir_switch_targets(input: &str) -> Vec<MirSwitchTarget> {
         .collect()
 }
 
+fn mir_successor_targets(expr: &str) -> Vec<String> {
+    if let Some((_condition, targets)) = mir_switch(expr) {
+        return targets.into_iter().map(|target| target.block).collect();
+    }
+    if let Some(target) = expr.strip_prefix("goto -> ") {
+        return vec![target.trim().to_string()];
+    }
+    let Some((_head, targets)) = expr.split_once(" -> [") else {
+        return Vec::new();
+    };
+    let Some(targets) = targets.strip_suffix(']') else {
+        return Vec::new();
+    };
+    parse_comma_separated(targets)
+        .into_iter()
+        .filter_map(|target| {
+            let (kind, block) = target.split_once(':')?;
+            if matches!(kind.trim(), "success" | "return") {
+                Some(block.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn negate_predicate(predicate: &str) -> Option<String> {
     for (op, negated) in [
         ("<=", ">"),
@@ -778,6 +849,16 @@ fn negate_predicate(predicate: &str) -> Option<String> {
     }
 
     None
+}
+
+fn dedup_strings(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if !deduped.iter().any(|existing| existing == &value) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
@@ -893,13 +974,26 @@ fn semantic_summary(
             let slice_indexes = mir_function
                 .semantic_slice_indexes()
                 .iter()
-                .map(|index| index.expression.as_str())
+                .map(|index| {
+                    if index.guards.is_empty() {
+                        index.expression.clone()
+                    } else {
+                        format!("{} guarded_by {}", index.expression, index.guards.join("&"))
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             let calls = mir_function
                 .semantic_calls()
                 .iter()
-                .map(|call| format!("{}({})", call.callee, call.args.join(",")))
+                .map(|call| {
+                    let call_expr = format!("{}({})", call.callee, call.args.join(","));
+                    if call.guards.is_empty() {
+                        call_expr
+                    } else {
+                        format!("{call_expr} guarded_by {}", call.guards.join("&"))
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             summary.push_str(&format!(
@@ -1181,6 +1275,58 @@ fn verified::get(_1: &[i32], _2: usize) -> i32 {
                 base: "xs".to_string(),
                 index: "i".to_string(),
                 expression: "xs[i]".to_string(),
+                guards: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_mir_branch_guard_for_slice_index() {
+        let mir = r#"
+fn verified::get_or_zero(_1: &[i32], _2: usize) -> i32 {
+    debug xs => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: usize;
+    let mut _4: bool;
+
+    bb0: {
+        _3 = PtrMetadata(copy _1);
+        _4 = Lt(copy _2, copy _3);
+        switchInt(move _4) -> [0: bb3, otherwise: bb1];
+    }
+
+    bb1: {
+        _5 = PtrMetadata(copy _1);
+        _6 = Lt(copy _2, copy _5);
+        assert(move _6, "index out of bounds") -> [success: bb2, unwind continue];
+    }
+
+    bb2: {
+        _0 = copy (*_1)[_2];
+        goto -> bb4;
+    }
+
+    bb3: {
+        _0 = const 0_i32;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "get_or_zero").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_slice_indexes(),
+            vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                index: "i".to_string(),
+                expression: "xs[i]".to_string(),
+                guards: vec!["i < xs.len()".to_string()],
             }]
         );
     }
@@ -1209,6 +1355,47 @@ fn verified::caller(_1: i32) -> i32 {
             vec![SemanticCall {
                 callee: "verified::inc".to_string(),
                 args: vec!["x".to_string()],
+                guards: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_mir_branch_guard_for_call() {
+        let mir = r#"
+fn verified::caller(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: bool;
+
+    bb0: {
+        _2 = Lt(copy _1, const core::num::<impl i32>::MAX);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = verified::inc(copy _1) -> [return: bb3, unwind continue];
+    }
+
+    bb2: {
+        _0 = copy _1;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "caller").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "verified::inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: vec!["x < i32::MAX".to_string()],
             }]
         );
     }
