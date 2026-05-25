@@ -414,6 +414,14 @@ fn verify_total_with_env(
             function: metadata.rust_function_path.clone(),
         });
     }
+    if let Some(callee) = unsupported_semantic_call(semantics, env, &metadata.rust_function_path) {
+        let callee =
+            unsupported_call(body, &params, env, &metadata.rust_function_path).unwrap_or(callee);
+        return Err(VerificationError::UnsupportedCall {
+            function: metadata.rust_function_path.clone(),
+            callee,
+        });
+    }
     if let Some(callee) = unsupported_call(body, &params, env, &metadata.rust_function_path) {
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
@@ -2050,6 +2058,31 @@ fn unsupported_call(
     }
 
     None
+}
+
+fn unsupported_semantic_call(
+    semantics: Option<&TrustFunctionSemantics>,
+    env: &[TrustFunctionSummary],
+    function: &str,
+) -> Option<String> {
+    semantics.into_iter().find_map(|semantics| {
+        semantics.calls.iter().find_map(|call| {
+            if function_name_matches_call(function, &call.callee) {
+                return Some(call.callee.clone());
+            }
+            if env
+                .iter()
+                .any(|callee| function_name_matches_call(&callee.name, &call.callee))
+            {
+                return None;
+            }
+            if allowed_builtin_call(function_leaf_name(&call.callee)) {
+                return None;
+            }
+
+            Some(call.callee.clone())
+        })
+    })
 }
 
 fn allowed_builtin_call(name: &str) -> bool {
@@ -4549,6 +4582,39 @@ mod tests {
                 VerificationOptions::default()
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_call_rejects_unsupported_callee() {
+        let metadata = metadata_named("abs_value", "pub fn abs_value(x: i32) -> i32 { x }", &[]);
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "abs_value".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "core::num::<impl i32>::abs".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::UnsupportedCall {
+                function: "abs_value".to_string(),
+                callee: "core::num::<impl i32>::abs".to_string(),
+            })
         );
     }
 
