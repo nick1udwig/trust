@@ -56,6 +56,9 @@ dependencies = [
 [[package]]
 name = "trust-core"
 version = "0.1.0"
+dependencies = [
+ "z3",
+]
 
 [[package]]
 name = "trust-e2e"

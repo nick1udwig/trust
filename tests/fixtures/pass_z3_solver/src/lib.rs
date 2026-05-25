@@ -1,14 +1,18 @@
 #[trust::module]
 mod verified {
     trust::total! {
-        pub fn id_i32(x: i32) -> i32 { x }
+        given executable {
+            x < 2147483647;
+        }
+
+        pub fn add_one(x: i32) -> i32 { x + 1 }
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn id_i32_works() {
-        assert_eq!(super::verified::id_i32(7), 7);
+    fn add_one_works() {
+        assert_eq!(super::verified::add_one(7), 8);
     }
 }

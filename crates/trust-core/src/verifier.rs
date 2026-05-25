@@ -1,4 +1,7 @@
-use crate::metadata::TrustMetadata;
+use crate::{
+    metadata::TrustMetadata,
+    solver::{self, ProofResult, SolverBackend, VerificationOptions},
+};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,14 +216,21 @@ impl fmt::Display for VerificationError {
 impl std::error::Error for VerificationError {}
 
 pub fn verify_total(metadata: &TrustMetadata) -> Result<(), VerificationError> {
-    verify_total_with_env(metadata, &[], &[])
+    verify_total_with_env(metadata, &[], &[], VerificationOptions::default())
 }
 
 pub fn verify_totals(metadata: &[TrustMetadata]) -> Result<(), VerificationError> {
+    verify_totals_with_options(metadata, VerificationOptions::default())
+}
+
+pub fn verify_totals_with_options(
+    metadata: &[TrustMetadata],
+    options: VerificationOptions,
+) -> Result<(), VerificationError> {
     let env = function_env(metadata);
     let model_types = model_env(metadata);
     for item in metadata {
-        verify_total_with_env(item, &env, &model_types)?;
+        verify_total_with_env(item, &env, &model_types, options)?;
         verify_proof(item)?;
     }
 
@@ -255,6 +265,7 @@ fn verify_total_with_env(
     metadata: &TrustMetadata,
     env: &[TrustFunctionSummary],
     model_types: &[String],
+    options: VerificationOptions,
 ) -> Result<(), VerificationError> {
     if metadata.item_kind != "total" {
         return Ok(());
@@ -304,7 +315,7 @@ fn verify_total_with_env(
     }
 
     for obligation in addition_obligations(body, &params) {
-        if !addition_obligation_proved(&obligation, &contracts) {
+        if !addition_obligation_proved(&obligation, &contracts, &params, options) {
             return Err(VerificationError::IntegerAdditionOverflow {
                 function: metadata.rust_function_path.clone(),
                 expression: obligation.expression,
@@ -1380,7 +1391,12 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
     obligations
 }
 
-fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) -> bool {
+fn addition_obligation_proved(
+    obligation: &AddObligation,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
     let Some(constant) = obligation.constant else {
         return false;
     };
@@ -1401,6 +1417,26 @@ fn addition_obligation_proved(obligation: &AddObligation, contracts: &[String]) 
         constant_with_type(required_bound, ty)
     );
     let le_unqualified = format!("{}<={required_bound}", obligation.variable);
+
+    if options.solver == SolverBackend::Z3 {
+        let params = params
+            .iter()
+            .filter(|param| is_supported_integer(&param.ty))
+            .map(|param| (param.name.clone(), param.ty.clone()))
+            .collect::<Vec<_>>();
+        match solver::prove_addition_overflow_safety(
+            &obligation.variable,
+            ty,
+            constant,
+            contracts,
+            &params,
+            options.timeout_ms,
+        ) {
+            ProofResult::Proved => return true,
+            ProofResult::Unproved => return false,
+            ProofResult::Unsupported => {}
+        }
+    }
 
     if constant == 1 && contracts.iter().any(|contract| contract == &lt_exact) {
         return true;
@@ -2037,6 +2073,24 @@ mod tests {
         let metadata = metadata("pub fn add_one(x: i32) -> i32 { x + 1 }", &["x < i32::MAX"]);
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn z3_proves_i32_add_one_from_strict_numeric_max() {
+        let metadata = metadata_named(
+            "add_one",
+            "pub fn add_one(x: i32) -> i32 { x + 1 }",
+            &["x < 2147483647"],
+        );
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
+            Ok(())
+        );
     }
 
     #[test]

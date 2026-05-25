@@ -7,7 +7,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{self, Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trust_core::{metadata::parse_metadata_line, verifier::verify_totals};
+use trust_core::{
+    metadata::parse_metadata_line,
+    solver::VerificationOptions,
+    verifier::{verify_totals, verify_totals_with_options},
+};
 use z3::{ast::Bool, Config, SatResult, Solver};
 
 fn main() {
@@ -286,7 +290,7 @@ fn verify_metadata(
             });
         }
 
-        verify_totals(metadata).map_err(|err| err.to_string())?;
+        verify_all(metadata, config)?;
         write_cache_entry(&cache_file)?;
         return Ok(CacheStats {
             hits: 0,
@@ -294,11 +298,23 @@ fn verify_metadata(
         });
     }
 
-    verify_totals(metadata).map_err(|err| err.to_string())?;
+    verify_all(metadata, config)?;
     Ok(CacheStats {
         hits: 0,
         misses: verification_items,
     })
+}
+
+fn verify_all(
+    metadata: &[trust_core::metadata::TrustMetadata],
+    config: &TrustConfig,
+) -> Result<(), String> {
+    match config.solver.as_str() {
+        "mock" => verify_totals(metadata).map_err(|err| err.to_string()),
+        "z3" => verify_totals_with_options(metadata, VerificationOptions::z3(config.timeout_ms))
+            .map_err(|err| err.to_string()),
+        solver => Err(format!("unsupported solver `{solver}`")),
+    }
 }
 
 fn check_solver_status(config: &TrustConfig) -> Result<(), String> {
