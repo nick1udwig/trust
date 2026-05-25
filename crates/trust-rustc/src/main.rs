@@ -636,6 +636,56 @@ fn hash_metadata_item(item: &trust_core::metadata::TrustMetadata, hasher: &mut D
     item.trust_model_dependencies.hash(hasher);
 }
 
+fn vc_fingerprints(
+    metadata: &[trust_core::metadata::TrustMetadata],
+    cache_context: &CacheContext,
+) -> Vec<String> {
+    metadata
+        .iter()
+        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .map(|item| vc_fingerprint(item, cache_context))
+        .collect()
+}
+
+fn vc_fingerprint(
+    item: &trust_core::metadata::TrustMetadata,
+    cache_context: &CacheContext,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    "trust-vc-fingerprint-v1".hash(&mut hasher);
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    hash_verification_model_context(cache_context, &mut hasher);
+    hash_metadata_item(item, &mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn hash_verification_model_context(cache_context: &CacheContext, hasher: &mut DefaultHasher) {
+    cache_context.target_triple.hash(hasher);
+    cache_context.pointer_width.hash(hasher);
+    cache_context.endianness.hash(hasher);
+    cache_context.target_features.hash(hasher);
+    cache_context.cargo_features.hash(hasher);
+}
+
+fn generated_rust_fingerprint(metadata: &[trust_core::metadata::TrustMetadata]) -> String {
+    let mut hasher = DefaultHasher::new();
+    "trust-generated-rust-fingerprint-v1".hash(&mut hasher);
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    for item in metadata {
+        item.item_kind.hash(&mut hasher);
+        item.item_id.hash(&mut hasher);
+        item.assertion_policy.hash(&mut hasher);
+        item.function_source.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn solver_transcript_path() -> String {
+    env::var("TRUST_SOLVER_TRANSCRIPT_PATH")
+        .or_else(|_| env::var("TRUST_SMT_DUMP_DIR"))
+        .unwrap_or_else(|_| "none".to_string())
+}
+
 fn cache_entry_contents(
     metadata: &[trust_core::metadata::TrustMetadata],
     cache_context: &CacheContext,
@@ -644,8 +694,11 @@ fn cache_entry_contents(
         .iter()
         .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
         .count();
+    let vc_fingerprints = vc_fingerprints(metadata, cache_context).join(",");
+    let generated_rust_fingerprint = generated_rust_fingerprint(metadata);
+    let solver_transcript_path = solver_transcript_path();
     format!(
-        "format=trust-proof-cache-v2\nstatus=proved\nentry_fingerprint={:016x}\nverified_items={verification_items}\nsolver={}\n",
+        "format=trust-proof-cache-v2\nstatus=proved\nentry_fingerprint={:016x}\nverified_items={verification_items}\nsolver={}\nvc_fingerprints={vc_fingerprints}\ngenerated_rust_fingerprint={generated_rust_fingerprint}\ndiagnostics_summary=none\nsolver_transcript_path={solver_transcript_path}\n",
         cache_entry_fingerprint(metadata, cache_context),
         cache_context.solver_name,
     )

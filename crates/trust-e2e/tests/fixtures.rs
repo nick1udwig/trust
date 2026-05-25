@@ -242,6 +242,10 @@ fn pass_cache_entry_records_fingerprint_summary() {
     assert!(contents.contains("entry_fingerprint="));
     assert!(contents.contains("verified_items=1\n"));
     assert!(contents.contains("solver=mock\n"));
+    assert!(contents.contains("vc_fingerprints="));
+    assert!(contents.contains("generated_rust_fingerprint="));
+    assert!(contents.contains("diagnostics_summary=none\n"));
+    assert!(contents.contains("solver_transcript_path=none\n"));
 }
 
 #[test]
