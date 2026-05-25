@@ -15,11 +15,42 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let source = item.to_string();
+    let module = match inspect_module_info(&source) {
+        Ok(module) => module,
+        Err(message) => return compile_error(message),
+    };
     if let Err(message) = inspect_module(&source) {
         return compile_error(message);
     }
 
-    item
+    let metadata = module_metadata_json(&module, &source);
+    if let Err(err) = write_metadata_sidecar(&metadata) {
+        return compile_error(&format!(
+            "error[trust]: failed to write Trust metadata: {err}"
+        ));
+    }
+
+    let const_name = format!(
+        "__TRUST_MODULE_META_{}_{}",
+        sanitize_ident(&module.name),
+        short_hash(&source)
+    );
+    let expanded = format!(
+        r###"
+        {item}
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const {const_name}: &str = r##"{metadata}"##;
+        "###,
+        item = source,
+        const_name = const_name,
+        metadata = metadata
+    );
+
+    expanded.parse().unwrap_or_else(|_| {
+        compile_error("error[trust]: failed to generate Rust for #[trust::module]")
+    })
 }
 
 #[proc_macro]
@@ -235,6 +266,12 @@ pub fn derive_trust_model(input: TokenStream) -> TokenStream {
     expanded.parse().unwrap_or_else(|_| {
         compile_error("error[trust]: failed to generate Rust for #[derive(TrustModel)]")
     })
+}
+
+#[derive(Debug)]
+struct ModuleInfo {
+    name: String,
+    visibility: &'static str,
 }
 
 #[derive(Debug)]
@@ -649,6 +686,27 @@ fn parse_trust_model_source(source: &str) -> Result<ModelInfo, &'static str> {
     Ok(ModelInfo { name })
 }
 
+fn inspect_module_info(input: &str) -> Result<ModuleInfo, &'static str> {
+    let tokens = lex(input);
+    let Some(mod_idx) = tokens
+        .iter()
+        .position(|token| matches!(token, LexToken::Ident(ident) if ident == "mod"))
+    else {
+        return Err("error[trust]: #[trust::module] must be applied to a module");
+    };
+    let name = match tokens.get(mod_idx + 1) {
+        Some(LexToken::Ident(ident)) => ident.to_string(),
+        _ => return Err("error[trust]: #[trust::module] could not read module name"),
+    };
+    let visibility = if has_ident_before(&tokens, mod_idx, "pub") {
+        "public"
+    } else {
+        "private"
+    };
+
+    Ok(ModuleInfo { name, visibility })
+}
+
 fn inspect_module(input: &str) -> Result<(), &'static str> {
     let tokens = lex(input);
     let Some(module_body_start) = tokens
@@ -859,6 +917,20 @@ fn metadata_json(
                 .map(|contract| contract.expression_display.as_str())
         ),
         contract_classes = json_string_array(contracts.iter().map(|contract| contract.class)),
+    )
+}
+
+fn module_metadata_json(module: &ModuleInfo, source: &str) -> String {
+    let hash = short_hash(source);
+    format!(
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{name}\",\"item_id\":\"module:{name}:{hash}\",\"item_kind\":\"module\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"{assertion_policy}\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        schema = SCHEMA_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
+        name = json_escape(&module.name),
+        hash = hash,
+        visibility = module.visibility,
+        assertion_policy = json_escape(&assertion_policy()),
+        source = json_escape(source),
     )
 }
 
@@ -1152,6 +1224,27 @@ mod tests {
             "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn module_metadata_records_module_identity() {
+        let module = inspect_module_info(
+            r#"
+            pub mod verified {
+                trust::total! {
+                    pub fn id_i32(x: i32) -> i32 { x }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let metadata = module_metadata_json(&module, "pub mod verified {}");
+
+        assert_eq!(module.name, "verified");
+        assert_eq!(module.visibility, "public");
+        assert!(metadata.contains("\"item_kind\":\"module\""));
+        assert!(metadata.contains("\"module_id\":\"verified\""));
+        assert!(metadata.contains("\"rust_function_path\":\"verified\""));
     }
 
     #[test]
