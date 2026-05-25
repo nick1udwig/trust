@@ -14,6 +14,7 @@ pub struct TrustFunctionSemantics {
     pub slice_indexes: Vec<SemanticSliceIndex>,
     pub calls: Vec<SemanticCall>,
     pub field_accesses: Vec<SemanticFieldAccess>,
+    pub matches: Vec<SemanticMatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,6 +64,28 @@ pub struct SemanticFieldAccess {
     pub owner_type: String,
     pub field_type: String,
     pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticMatch {
+    pub scrutinee: String,
+    pub scrutinee_type: String,
+    pub arms: Vec<SemanticMatchArm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticMatchArm {
+    pub variant: String,
+    pub discriminant: String,
+    pub payload: Option<SemanticMatchPayload>,
+    pub return_expression: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticMatchPayload {
+    pub binding: String,
+    pub field_index: usize,
+    pub ty: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,8 +379,12 @@ fn verify_total_with_env(
     let semantic_return_expression = semantics
         .and_then(|semantics| semantics.return_expression.as_deref())
         .map(normalize);
-    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?;
-    contracts.extend(loop_facts.into_iter().map(|fact| fact.condition));
+    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?
+        .into_iter()
+        .map(|fact| fact.condition)
+        .collect::<Vec<_>>();
+    contracts.extend(loop_facts.iter().cloned());
+    let postcondition_assumptions = contracts_with_assumptions(&given_contracts, &loop_facts);
 
     if contains_unchecked_unwrap(body) {
         return Err(VerificationError::UncheckedUnwrap {
@@ -482,6 +509,8 @@ fn verify_total_with_env(
             body,
             raw_body,
             semantic_return_expression.as_deref(),
+            semantics,
+            &postcondition_assumptions,
         ) {
             return Err(VerificationError::PostconditionUnproved {
                 function: metadata.rust_function_path.clone(),
@@ -736,6 +765,8 @@ fn postcondition_proved(
     body: &str,
     raw_body: &str,
     semantic_return_expression: Option<&str>,
+    semantics: Option<&TrustFunctionSemantics>,
+    contracts: &[String],
 ) -> bool {
     let return_expression = return_expression(body);
     if semantic_return_expression.is_some_and(|return_expression| {
@@ -743,8 +774,83 @@ fn postcondition_proved(
     }) {
         return true;
     }
+    if semantic_match_proves_postcondition(postcondition, raw_body, semantics, contracts) {
+        return true;
+    }
 
     postcondition_proved_by_return_expression(postcondition, raw_body, &return_expression)
+}
+
+fn semantic_match_proves_postcondition(
+    postcondition: &Contract,
+    raw_body: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+    contracts: &[String],
+) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics.matches.iter().any(|semantic_match| {
+            if !semantic_match_is_exhaustive(semantic_match) {
+                return false;
+            }
+
+            let reachable_arms = semantic_match
+                .arms
+                .iter()
+                .filter(|arm| semantic_match_arm_reachable(semantic_match, arm, contracts))
+                .collect::<Vec<_>>();
+            !reachable_arms.is_empty()
+                && reachable_arms.iter().all(|arm| {
+                    arm.return_expression
+                        .as_ref()
+                        .is_some_and(|return_expression| {
+                            let return_expression = normalize(return_expression);
+                            postcondition_proved_by_return_expression(
+                                postcondition,
+                                raw_body,
+                                &return_expression,
+                            )
+                        })
+                })
+        })
+    })
+}
+
+fn semantic_match_is_exhaustive(semantic_match: &SemanticMatch) -> bool {
+    let variants = semantic_match
+        .arms
+        .iter()
+        .map(|arm| arm.variant.as_str())
+        .collect::<Vec<_>>();
+    if type_name_tail(&semantic_match.scrutinee_type).starts_with("Option<") {
+        return variants.contains(&"None") && variants.contains(&"Some");
+    }
+    if type_name_tail(&semantic_match.scrutinee_type).starts_with("Result<") {
+        return variants.contains(&"Ok") && variants.contains(&"Err");
+    }
+
+    false
+}
+
+fn semantic_match_arm_reachable(
+    semantic_match: &SemanticMatch,
+    arm: &SemanticMatchArm,
+    contracts: &[String],
+) -> bool {
+    !contracts.iter().any(|contract| {
+        semantic_variant_excluded_by_contract(&semantic_match.scrutinee, &arm.variant, contract)
+    })
+}
+
+fn semantic_variant_excluded_by_contract(scrutinee: &str, variant: &str, contract: &str) -> bool {
+    match variant {
+        "None" => {
+            contract == format!("{scrutinee}!=None") || contract == format!("None!={scrutinee}")
+        }
+        "Some" => {
+            contract == format!("{scrutinee}==None") || contract == format!("None=={scrutinee}")
+        }
+        _ => false,
+    }
 }
 
 fn postcondition_proved_by_return_expression(
@@ -3645,6 +3751,7 @@ mod tests {
             slice_indexes: Vec::new(),
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3684,6 +3791,7 @@ mod tests {
                 field_type: "i64".to_string(),
                 expression: "acct.balance".to_string(),
             }],
+            matches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3696,6 +3804,156 @@ mod tests {
                 &[semantics],
                 VerificationOptions::default()
             ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_match_arms_can_prove_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "maybe_zero",
+            "pub fn maybe_zero(x: Option<i32>) -> i32 { match x { Some(_) => 0, None => 0 } }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "maybe_zero".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Option<i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: vec![SemanticMatch {
+                scrutinee: "x".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_match_requires_reachable_arms_to_prove_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "unwrap_or_zero",
+            "pub fn unwrap_or_zero(x: Option<i32>) -> i32 { match x { Some(v) => v, None => 0 } }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "unwrap_or_zero".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Option<i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: vec![SemanticMatch {
+                scrutinee: "x".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: Some(SemanticMatchPayload {
+                            binding: "v".to_string(),
+                            field_index: 0,
+                            ty: "i32".to_string(),
+                        }),
+                        return_expression: Some("v".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert!(matches!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+    }
+
+    #[test]
+    fn semantic_match_precondition_can_restrict_option_arm() {
+        let metadata = metadata_named_with_classes(
+            "unwrap_or_zero",
+            "pub fn unwrap_or_zero(x: Option<i32>) -> i32 { match x { Some(v) => v, None => 0 } }",
+            &["x == None", "out == 0"],
+            &["given executable", "gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "unwrap_or_zero".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Option<i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: vec![SemanticMatch {
+                scrutinee: "x".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: Some(SemanticMatchPayload {
+                            binding: "v".to_string(),
+                            field_index: 0,
+                            ty: "i32".to_string(),
+                        }),
+                        return_expression: Some("v".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
         );
     }
@@ -3725,6 +3983,7 @@ mod tests {
             slice_indexes: Vec::new(),
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3762,6 +4021,7 @@ mod tests {
             slice_indexes: Vec::new(),
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3805,6 +4065,7 @@ mod tests {
             slice_indexes: Vec::new(),
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -3848,6 +4109,7 @@ mod tests {
             slice_indexes: Vec::new(),
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert_eq!(
@@ -3886,6 +4148,7 @@ mod tests {
             }],
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3928,6 +4191,7 @@ mod tests {
             }],
             calls: Vec::new(),
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert!(matches!(
@@ -3968,6 +4232,7 @@ mod tests {
                 guards: Vec::new(),
             }],
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert!(matches!(
@@ -4012,6 +4277,7 @@ mod tests {
                 guards: vec!["x < i32::MAX".to_string()],
             }],
             field_accesses: Vec::new(),
+            matches: Vec::new(),
         };
 
         assert!(matches!(

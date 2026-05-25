@@ -10,7 +10,8 @@ use trust_core::{
     metadata::TrustMetadata,
     verifier::{
         SemanticArithmeticKind, SemanticArithmeticOperation, SemanticCall, SemanticFieldAccess,
-        SemanticParam, SemanticSliceIndex, TrustFunctionSemantics,
+        SemanticMatch, SemanticMatchArm, SemanticMatchPayload, SemanticParam, SemanticSliceIndex,
+        TrustFunctionSemantics,
     },
 };
 
@@ -77,6 +78,14 @@ struct ModelFieldMap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelField {
     name: String,
+    ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirVariantProjection {
+    place: String,
+    variant: String,
+    field_index: usize,
     ty: String,
 }
 
@@ -228,6 +237,7 @@ fn verifier_semantics(
                 slice_indexes: mir_function.semantic_slice_indexes_with_models(&model_fields),
                 calls: mir_function.semantic_calls_with_models(&model_fields),
                 field_accesses: mir_function.semantic_field_accesses(&model_fields),
+                matches: mir_function.semantic_matches(&model_fields),
             })
         })
         .collect()
@@ -704,6 +714,99 @@ impl MirFunctionSummary {
             field_type: model_field.ty.clone(),
         })
     }
+
+    fn semantic_matches(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticMatch> {
+        self.assignments
+            .iter()
+            .filter_map(|assignment| {
+                let scrutinee_place = mir_discriminant(&assignment.expression)?;
+                let scrutinee = self
+                    .local_name_for_place(scrutinee_place)
+                    .unwrap_or(scrutinee_place)
+                    .to_string();
+                let scrutinee_type = self
+                    .args
+                    .iter()
+                    .find(|arg| arg.place == scrutinee_place)
+                    .map(|arg| arg.ty.clone())
+                    .unwrap_or_default();
+                let terminator = self.terminators.iter().find(|terminator| {
+                    mir_switch(&terminator.expression).is_some_and(|(condition, _targets)| {
+                        strip_mir_move_or_copy(condition) == assignment.place
+                    })
+                })?;
+                let (_condition, targets) = mir_switch(&terminator.expression)?;
+                let arms = targets
+                    .into_iter()
+                    .filter(|target| target.value != "otherwise")
+                    .filter_map(|target| {
+                        let variant =
+                            semantic_variant_for_discriminant(&scrutinee_type, &target.value)?;
+                        let payload =
+                            self.semantic_match_payload(&target.block, scrutinee_place, &variant);
+                        let return_expression =
+                            self.semantic_return_expression_for_block(&target.block, model_fields);
+                        Some(SemanticMatchArm {
+                            variant,
+                            discriminant: target.value,
+                            payload,
+                            return_expression,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if arms.is_empty() {
+                    return None;
+                }
+
+                Some(SemanticMatch {
+                    scrutinee,
+                    scrutinee_type,
+                    arms,
+                })
+            })
+            .collect()
+    }
+
+    fn semantic_match_payload(
+        &self,
+        block: &str,
+        scrutinee_place: &str,
+        variant: &str,
+    ) -> Option<SemanticMatchPayload> {
+        self.assignments.iter().find_map(|assignment| {
+            if assignment.block.as_deref() != Some(block) {
+                return None;
+            }
+            let expr = strip_mir_move_or_copy(&assignment.expression);
+            let projection = mir_variant_projection(expr)?;
+            if projection.place != scrutinee_place || projection.variant != variant {
+                return None;
+            }
+            Some(SemanticMatchPayload {
+                binding: self
+                    .local_name_for_place(&assignment.place)
+                    .unwrap_or(&assignment.place)
+                    .to_string(),
+                field_index: projection.field_index,
+                ty: projection.ty,
+            })
+        })
+    }
+
+    fn semantic_return_expression_for_block(
+        &self,
+        block: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        self.assignments
+            .iter()
+            .find(|assignment| {
+                assignment.block.as_deref() == Some(block) && assignment.place == "_0"
+            })
+            .and_then(|assignment| {
+                self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -752,12 +855,37 @@ fn parse_mir_args(input: &str) -> Vec<MirArg> {
 }
 
 fn parse_comma_separated(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut angle_depth = 0usize;
+
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => {
+                let item = input[start..idx].trim();
+                if !item.is_empty() {
+                    items.push(item.to_string());
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let item = input[start..].trim();
+    if !item.is_empty() {
+        items.push(item.to_string());
+    }
+
+    items
 }
 
 fn extract_mir_debug_locals(lines: &[&str]) -> Vec<MirDebugLocal> {
@@ -835,14 +963,21 @@ fn mir_block_header(line: &str) -> Option<&str> {
 }
 
 fn extract_mir_return_expr(lines: &[&str]) -> Option<String> {
-    lines.iter().find_map(|line| {
-        line.trim()
-            .strip_prefix("_0 = ")
-            .and_then(|line| line.strip_suffix(';'))
-            .map(str::trim)
-            .filter(|expr| !expr.is_empty())
-            .map(str::to_string)
-    })
+    let return_exprs = lines
+        .iter()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("_0 = ")
+                .and_then(|line| line.strip_suffix(';'))
+                .map(str::trim)
+                .filter(|expr| !expr.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    match return_exprs.as_slice() {
+        [expr] => Some(expr.clone()),
+        _ => None,
+    }
 }
 
 fn strip_mir_move_or_copy(expr: &str) -> &str {
@@ -894,6 +1029,26 @@ fn mir_projection(expr: &str) -> Option<(&str, &str, &str)> {
     Some((place.trim(), field.trim(), ty.trim()))
 }
 
+fn mir_variant_projection(expr: &str) -> Option<MirVariantProjection> {
+    let expr = expr.strip_prefix('(')?.strip_suffix(')')?;
+    let (projection, ty) = expr.split_once(':')?;
+    let (variant_place, field) = projection.trim().split_once(").")?;
+    let variant_place = variant_place.strip_prefix('(')?.trim();
+    let (place, variant) = variant_place.split_once(" as ")?;
+    Some(MirVariantProjection {
+        place: place.trim().to_string(),
+        variant: variant.trim().to_string(),
+        field_index: field.trim().parse().ok()?,
+        ty: ty.trim().to_string(),
+    })
+}
+
+fn mir_discriminant(expr: &str) -> Option<&str> {
+    expr.strip_prefix("discriminant(")
+        .and_then(|expr| expr.strip_suffix(')'))
+        .map(str::trim)
+}
+
 fn mir_slice_index(expr: &str) -> Option<(&str, &str)> {
     let (base, index) = expr.split_once('[')?;
     let index = index.strip_suffix(']')?;
@@ -943,6 +1098,25 @@ fn mir_comparison_operator(op: &str) -> Option<&'static str> {
         "Ne" => Some("!="),
         _ => None,
     }
+}
+
+fn semantic_variant_for_discriminant(ty: &str, discriminant: &str) -> Option<String> {
+    if type_name_tail(ty).starts_with("Option<") {
+        return match discriminant {
+            "0" => Some("None".to_string()),
+            "1" => Some("Some".to_string()),
+            _ => None,
+        };
+    }
+    if type_name_tail(ty).starts_with("Result<") {
+        return match discriminant {
+            "0" => Some("Ok".to_string()),
+            "1" => Some("Err".to_string()),
+            _ => None,
+        };
+    }
+
+    None
 }
 
 fn mir_switch(expr: &str) -> Option<(&str, Vec<MirSwitchTarget>)> {
@@ -1161,8 +1335,36 @@ fn semantic_summary(
                 .map(|field| format!("{}:{}", field.expression, field.field_type))
                 .collect::<Vec<_>>()
                 .join(",");
+            let matches = mir_function
+                .semantic_matches(&model_fields)
+                .iter()
+                .map(|semantic_match| {
+                    let arms = semantic_match
+                        .arms
+                        .iter()
+                        .map(|arm| {
+                            let payload = arm
+                                .payload
+                                .as_ref()
+                                .map(|payload| {
+                                    format!(
+                                        "({}:{}#{})",
+                                        payload.binding, payload.ty, payload.field_index
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let return_expression =
+                                arm.return_expression.as_deref().unwrap_or("none");
+                            format!("{}{}=>{}", arm.variant, payload, return_expression)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    format!("{}:{}", semantic_match.scrutinee, arms)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={}\n",
                 item.rust_function_path,
                 mir_function
                     .args
@@ -1182,6 +1384,7 @@ fn semantic_summary(
                 slice_indexes,
                 calls,
                 field_accesses,
+                matches,
             ));
         }
     }
@@ -1278,6 +1481,153 @@ fn balance(_1: Account) -> i64 {
                 owner_type: "Account".to_string(),
                 field_type: "i64".to_string(),
                 expression: "acct.balance".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_option_match_variants_and_payload() {
+        let mir = r#"
+fn unwrap_or_zero(_1: Option<i32>) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: isize;
+    let _3: i32;
+    scope 1 {
+        debug v => _3;
+    }
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb2, 1: bb3, otherwise: bb1];
+    }
+
+    bb1: {
+        unreachable;
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _3 = copy ((_1 as Some).0: i32);
+        _0 = copy _3;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "unwrap_or_zero").expect("MIR summary");
+
+        assert_eq!(summary.normalized_return_expression(), None);
+        assert_eq!(
+            summary.semantic_matches(&[]),
+            vec![SemanticMatch {
+                scrutinee: "x".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: Some(SemanticMatchPayload {
+                            binding: "v".to_string(),
+                            field_index: 0,
+                            ty: "i32".to_string(),
+                        }),
+                        return_expression: Some("v".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_result_match_variants_and_payload() {
+        let mir = r#"
+fn unwrap_or_zero(_1: Result<i32, i32>) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: isize;
+    let _3: i32;
+    scope 1 {
+        debug v => _3;
+    }
+
+    bb0: {
+        _2 = discriminant(_1);
+        switchInt(move _2) -> [0: bb3, 1: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        unreachable;
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _3 = copy ((_1 as Ok).0: i32);
+        _0 = copy _3;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "unwrap_or_zero").expect("MIR summary");
+
+        assert_eq!(summary.normalized_return_expression(), None);
+        assert_eq!(
+            summary.semantic_matches(&[]),
+            vec![SemanticMatch {
+                scrutinee: "x".to_string(),
+                scrutinee_type: "Result<i32, i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "Ok".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: Some(SemanticMatchPayload {
+                            binding: "v".to_string(),
+                            field_index: 0,
+                            ty: "i32".to_string(),
+                        }),
+                        return_expression: Some("v".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Err".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_generic_mir_args_without_splitting_type_parameters() {
+        assert_eq!(
+            parse_mir_args("_1: Result<i32, i32>"),
+            vec![MirArg {
+                place: "_1".to_string(),
+                ty: "Result<i32, i32>".to_string(),
             }]
         );
     }

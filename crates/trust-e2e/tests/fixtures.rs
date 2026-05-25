@@ -926,6 +926,52 @@ fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn fail_semantic_match_false_postcondition_is_rejected() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_match_false_postcondition",
+        Expected::Fail,
+        &format!("fail_semantic_match_false_postcondition_{suffix}"),
+        &format!("fail_semantic_match_false_postcondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove postcondition");
+    output.assert_contains("out == 0");
+}
+
+#[test]
+fn pass_semantic_match_postcondition_uses_mir_arms() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_match_postcondition",
+        Expected::Pass,
+        &format!("pass_semantic_match_postcondition_{suffix}"),
+        &format!("pass_semantic_match_postcondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_semantic_result_match_postcondition_uses_mir_arms() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_result_match_postcondition",
+        Expected::Pass,
+        &format!("pass_semantic_result_match_postcondition_{suffix}"),
+        &format!("pass_semantic_result_match_postcondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_semantic_branch_guard_add_uses_mir_path_condition() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(
