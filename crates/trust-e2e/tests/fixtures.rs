@@ -978,6 +978,22 @@ fn fail_semantic_field_add_unproved_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn fail_semantic_local_const_add_unproved_uses_mir_integer_type() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_local_const_add_unproved",
+        Expected::Fail,
+        &format!("fail_semantic_local_const_add_unproved_{suffix}"),
+        &format!("fail_semantic_local_const_add_unproved_{suffix}"),
+        &[],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+    output.assert_contains("x + 1");
+}
+
+#[test]
 fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(

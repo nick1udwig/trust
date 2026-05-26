@@ -32,6 +32,7 @@ struct SemanticItemMatch {
 struct MirFunctionSummary {
     args: Vec<MirArg>,
     return_type: String,
+    locals: Vec<MirLocal>,
     debug_locals: Vec<MirDebugLocal>,
     assignments: Vec<MirAssignment>,
     terminators: Vec<MirTerminator>,
@@ -40,6 +41,12 @@ struct MirFunctionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirArg {
+    place: String,
+    ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirLocal {
     place: String,
     ty: String,
 }
@@ -339,6 +346,7 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
     Some(MirFunctionSummary {
         args: signature.args,
         return_type: signature.return_type,
+        locals: extract_mir_locals(function_lines),
         debug_locals: extract_mir_debug_locals(function_lines),
         assignments: extract_mir_assignments(function_lines),
         terminators: extract_mir_terminators(function_lines),
@@ -361,6 +369,19 @@ impl MirFunctionSummary {
             .iter()
             .find(|local| local.place == place)
             .map(|local| local.name.as_str())
+    }
+
+    fn type_for_place(&self, place: &str) -> Option<&str> {
+        self.args
+            .iter()
+            .find(|arg| arg.place == place)
+            .map(|arg| arg.ty.as_str())
+            .or_else(|| {
+                self.locals
+                    .iter()
+                    .find(|local| local.place == place)
+                    .map(|local| local.ty.as_str())
+            })
     }
 
     #[cfg(test)]
@@ -497,6 +518,40 @@ impl MirFunctionSummary {
         }
     }
 
+    fn mir_expression_type(&self, expr: &str, model_fields: &[ModelFieldMap]) -> Option<String> {
+        let expr = strip_mir_move_or_copy(expr);
+        if let Some(ty) = mir_const_type(expr) {
+            return Some(ty);
+        }
+        if let Some(ty) = self.type_for_place(expr) {
+            return Some(ty.to_string());
+        }
+        if let Some((place, field, ty)) = mir_projection(expr) {
+            if let Some(field_access) = self.semantic_field_access(place, field, model_fields) {
+                return Some(field_access.field_type);
+            }
+            return Some(ty.to_string());
+        }
+        if let Some((_kind, args)) = mir_checked_arithmetic_operation(expr) {
+            return args
+                .iter()
+                .find_map(|arg| self.mir_expression_type(arg, model_fields))
+                .filter(|ty| supported_mir_integer_type(ty));
+        }
+        self.assignment_for_place(expr)
+            .and_then(|assignment| self.mir_expression_type(&assignment.expression, model_fields))
+    }
+
+    fn semantic_arithmetic_type(
+        &self,
+        args: &[String],
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        args.iter()
+            .find_map(|arg| self.mir_expression_type(arg, model_fields))
+            .filter(|ty| supported_mir_integer_type(ty))
+    }
+
     fn normalized_mir_predicate_with_models(
         &self,
         expr: &str,
@@ -630,9 +685,11 @@ impl MirFunctionSummary {
                             self.normalized_mir_expression_with_models(left, model_fields)?;
                         let right =
                             self.normalized_mir_expression_with_models(right, model_fields)?;
+                        let ty = self.semantic_arithmetic_type(&args, model_fields);
                         let operator = semantic_arithmetic_operator(kind);
                         Some(SemanticArithmeticOperation {
                             kind,
+                            ty,
                             expression: format!("{left} {operator} {right}"),
                             left,
                             right: Some(right),
@@ -646,8 +703,10 @@ impl MirFunctionSummary {
                     (SemanticArithmeticKind::Neg, [value]) => {
                         let value =
                             self.normalized_mir_expression_with_models(value, model_fields)?;
+                        let ty = self.semantic_arithmetic_type(&args, model_fields);
                         Some(SemanticArithmeticOperation {
                             kind,
+                            ty,
                             expression: format!("-{value}"),
                             left: value,
                             right: None,
@@ -953,6 +1012,23 @@ fn parse_mir_args(input: &str) -> Vec<MirArg> {
         .collect()
 }
 
+fn extract_mir_locals(lines: &[&str]) -> Vec<MirLocal> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("let mut ")
+                .or_else(|| line.strip_prefix("let "))?;
+            let (place, ty) = rest.split_once(':')?;
+            Some(MirLocal {
+                place: place.trim().to_string(),
+                ty: ty.trim_end_matches(';').trim().to_string(),
+            })
+        })
+        .collect()
+}
+
 fn parse_comma_separated(input: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut start = 0usize;
@@ -1109,6 +1185,21 @@ fn mir_const_value(expr: &str) -> Option<String> {
     }
 }
 
+fn mir_const_type(expr: &str) -> Option<String> {
+    let value = expr.strip_prefix("const ")?.trim();
+    if let Some(bound) = mir_integer_bound(value) {
+        return bound.split_once("::").map(|(ty, _)| ty.to_string());
+    }
+
+    let (_value, ty) = value.rsplit_once('_')?;
+    let ty = ty.trim();
+    if supported_mir_integer_type(ty) {
+        Some(ty.to_string())
+    } else {
+        None
+    }
+}
+
 fn mir_integer_bound(value: &str) -> Option<String> {
     let value = value.trim();
     for bound in ["MAX", "MIN"] {
@@ -1126,6 +1217,10 @@ fn mir_integer_bound(value: &str) -> Option<String> {
     }
 
     None
+}
+
+fn supported_mir_integer_type(ty: &str) -> bool {
+    matches!(ty, "i32" | "i64" | "u32" | "u64" | "usize")
 }
 
 fn mir_projection(expr: &str) -> Option<(&str, &str, &str)> {
@@ -1591,6 +1686,10 @@ fn id_i32(_1: i32) -> i32 {
                     ty: "i32".to_string(),
                 }],
                 return_type: "i32".to_string(),
+                locals: vec![MirLocal {
+                    place: "_0".to_string(),
+                    ty: "i32".to_string(),
+                }],
                 debug_locals: vec![MirDebugLocal {
                     name: "x".to_string(),
                     place: "_1".to_string(),
@@ -1987,6 +2086,7 @@ fn add_one(_1: i32) -> i32 {
             summary.semantic_arithmetic_operations(),
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -2024,9 +2124,47 @@ fn add_one(_1: i32) -> i32 {
             summary.semantic_arithmetic_operations(),
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
+                guards: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_arithmetic_type_from_mir_local_constant() {
+        let mir = r#"
+fn overflow() -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let _1: i32;
+    let mut _2: (i32, bool);
+
+    bb0: {
+        _1 = const core::num::<impl i32>::MAX;
+        _2 = AddWithOverflow(copy _1, const 1_i32);
+        assert(!move (_2.1: bool), "overflow") -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move (_2.0: i32);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "overflow").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
+                left: "i32::MAX".to_string(),
+                right: Some("1".to_string()),
+                expression: "i32::MAX + 1".to_string(),
                 guards: Vec::new(),
             }]
         );
@@ -2073,6 +2211,7 @@ fn add_if_safe(_1: i32) -> i32 {
             summary.semantic_arithmetic_operations(),
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -2131,6 +2270,7 @@ fn withdraw_if_safe(_1: Account, _2: i64) -> i64 {
             summary.semantic_arithmetic_operations_with_models(&fields),
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Sub,
+                ty: Some("i64".to_string()),
                 left: "acct.balance".to_string(),
                 right: Some("amount".to_string()),
                 expression: "acct.balance - amount".to_string(),
@@ -2167,6 +2307,7 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
             vec![
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Rem,
+                    ty: Some("i32".to_string()),
                     left: "x".to_string(),
                     right: Some("y".to_string()),
                     expression: "x % y".to_string(),
@@ -2174,6 +2315,7 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                 },
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Div,
+                    ty: Some("i32".to_string()),
                     left: "x".to_string(),
                     right: Some("y".to_string()),
                     expression: "x / y".to_string(),

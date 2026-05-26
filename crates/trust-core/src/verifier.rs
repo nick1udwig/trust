@@ -27,6 +27,7 @@ pub struct SemanticParam {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticArithmeticOperation {
     pub kind: SemanticArithmeticKind,
+    pub ty: Option<String>,
     pub left: String,
     pub right: Option<String>,
     pub expression: String,
@@ -1326,12 +1327,17 @@ fn semantic_addition_obligations(
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Add)
         .filter_map(|operation| {
             let right = operation.right.as_ref()?;
-            semantic_addition_obligation(&operation.left, right, &operation.expression, params).map(
-                |mut obligation| {
-                    obligation.assumptions = semantic_guard_assumptions(operation);
-                    obligation
-                },
+            semantic_addition_obligation(
+                &operation.left,
+                right,
+                &operation.expression,
+                params,
+                operation.ty.as_deref(),
             )
+            .map(|mut obligation| {
+                obligation.assumptions = semantic_guard_assumptions(operation);
+                obligation
+            })
         })
         .collect()
 }
@@ -1356,11 +1362,17 @@ fn semantic_subtraction_obligations(
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Sub)
         .filter_map(|operation| {
             let right = operation.right.as_ref()?;
-            semantic_subtraction_obligation(&operation.left, right, &operation.expression, params)
-                .map(|mut obligation| {
-                    obligation.assumptions = semantic_guard_assumptions(operation);
-                    obligation
-                })
+            semantic_subtraction_obligation(
+                &operation.left,
+                right,
+                &operation.expression,
+                params,
+                operation.ty.as_deref(),
+            )
+            .map(|mut obligation| {
+                obligation.assumptions = semantic_guard_assumptions(operation);
+                obligation
+            })
         })
         .collect()
 }
@@ -1384,12 +1396,19 @@ fn semantic_negation_obligations(
 ) -> Vec<NegObligation> {
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Neg)
         .filter_map(|operation| {
-            let param = params
-                .iter()
-                .find(|param| param.name == operation.left && is_signed_integer(&param.ty))?;
+            let ty = param_type(&operation.left, params)
+                .or_else(|| supported_operation_type(operation.ty.as_deref()))?;
+            if !is_signed_integer(ty) {
+                return None;
+            }
+            if integer_constant_value(&operation.left, Some(ty))
+                .is_some_and(|value| min_value(ty) != Some(value))
+            {
+                return None;
+            }
             Some(NegObligation {
                 variable: operation.left.clone(),
-                ty: param.ty.clone(),
+                ty: ty.to_string(),
                 expression: operation.expression.clone(),
                 assumptions: semantic_guard_assumptions(operation),
             })
@@ -1422,6 +1441,7 @@ fn semantic_multiplication_obligations(
                 right,
                 &operation.expression,
                 params,
+                operation.ty.as_deref(),
             )
             .map(|mut obligation| {
                 obligation.assumptions = semantic_guard_assumptions(operation);
@@ -1508,8 +1528,16 @@ fn semantic_addition_obligation(
     right: &str,
     expression: &str,
     params: &[Param],
+    operation_ty: Option<&str>,
 ) -> Option<AddObligation> {
-    if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+    let operation_ty = supported_operation_type(operation_ty);
+    if typed_constant_binary_is_safe(left, right, operation_ty, i128::checked_add) {
+        return None;
+    }
+
+    let left_ty = param_type(left, params).or(operation_ty);
+    let right_ty = param_type(right, params).or(operation_ty);
+    if let (Some(ty), Some(constant)) = (left_ty, integer_constant_value(right, left_ty)) {
         return Some(AddObligation {
             variable: left.to_string(),
             ty: Some(ty.to_string()),
@@ -1518,7 +1546,7 @@ fn semantic_addition_obligation(
             assumptions: Vec::new(),
         });
     }
-    if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
+    if let (Some(constant), Some(ty)) = (integer_constant_value(left, right_ty), right_ty) {
         return Some(AddObligation {
             variable: right.to_string(),
             ty: Some(ty.to_string()),
@@ -1527,11 +1555,12 @@ fn semantic_addition_obligation(
             assumptions: Vec::new(),
         });
     }
-    if expression_needs_integer_proof(left, right, params) {
+    if expression_needs_integer_proof(left, right, params) || operation_ty.is_some() {
         return Some(AddObligation {
             variable: left.to_string(),
             ty: param_type(left, params)
                 .or_else(|| param_type(right, params))
+                .or(operation_ty)
                 .map(str::to_string),
             constant: None,
             expression: expression.to_string(),
@@ -1547,8 +1576,15 @@ fn semantic_subtraction_obligation(
     right: &str,
     expression: &str,
     params: &[Param],
+    operation_ty: Option<&str>,
 ) -> Option<SubObligation> {
-    if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+    let operation_ty = supported_operation_type(operation_ty);
+    if typed_constant_binary_is_safe(left, right, operation_ty, i128::checked_sub) {
+        return None;
+    }
+
+    let left_ty = param_type(left, params).or(operation_ty);
+    if let (Some(ty), Some(constant)) = (left_ty, integer_constant_value(right, left_ty)) {
         if constant > 0 {
             return Some(SubObligation {
                 variable: left.to_string(),
@@ -1559,10 +1595,12 @@ fn semantic_subtraction_obligation(
                 assumptions: Vec::new(),
             });
         }
-    } else if expression_needs_integer_proof(left, right, params) {
+    } else if expression_needs_integer_proof(left, right, params) || operation_ty.is_some() {
         return Some(SubObligation {
             variable: left.to_string(),
-            ty: param_type(left, params).map(str::to_string),
+            ty: param_type(left, params)
+                .or(operation_ty)
+                .map(str::to_string),
             constant: None,
             rhs: Some(right.to_string()),
             expression: expression.to_string(),
@@ -1578,8 +1616,16 @@ fn semantic_multiplication_obligation(
     right: &str,
     expression: &str,
     params: &[Param],
+    operation_ty: Option<&str>,
 ) -> Option<MulObligation> {
-    if let (Some(ty), Ok(constant)) = (param_type(left, params), right.parse::<i128>()) {
+    let operation_ty = supported_operation_type(operation_ty);
+    if typed_constant_binary_is_safe(left, right, operation_ty, i128::checked_mul) {
+        return None;
+    }
+
+    let left_ty = param_type(left, params).or(operation_ty);
+    let right_ty = param_type(right, params).or(operation_ty);
+    if let (Some(ty), Some(constant)) = (left_ty, integer_constant_value(right, left_ty)) {
         if constant > 1 {
             return Some(MulObligation {
                 variable: left.to_string(),
@@ -1589,7 +1635,7 @@ fn semantic_multiplication_obligation(
                 assumptions: Vec::new(),
             });
         }
-    } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
+    } else if let (Some(constant), Some(ty)) = (integer_constant_value(left, right_ty), right_ty) {
         if constant > 1 {
             return Some(MulObligation {
                 variable: right.to_string(),
@@ -1599,11 +1645,12 @@ fn semantic_multiplication_obligation(
                 assumptions: Vec::new(),
             });
         }
-    } else if expression_needs_integer_proof(left, right, params) {
+    } else if expression_needs_integer_proof(left, right, params) || operation_ty.is_some() {
         return Some(MulObligation {
             variable: left.to_string(),
             ty: param_type(left, params)
                 .or_else(|| param_type(right, params))
+                .or(operation_ty)
                 .map(str::to_string),
             constant: None,
             expression: expression.to_string(),
@@ -2612,6 +2659,54 @@ fn param_type<'a>(name: &str, params: &'a [Param]) -> Option<&'a str> {
         .iter()
         .find(|param| param.name == name && is_supported_integer(&param.ty))
         .map(|param| param.ty.as_str())
+}
+
+fn supported_operation_type(ty: Option<&str>) -> Option<&str> {
+    ty.filter(|ty| is_supported_integer(ty))
+}
+
+fn integer_constant_value(token: &str, ty: Option<&str>) -> Option<i128> {
+    if let Ok(value) = token.parse::<i128>() {
+        return Some(value);
+    }
+
+    let ty = ty?;
+    if token == format!("{ty}::MAX") {
+        return max_value(ty);
+    }
+    if token == format!("{ty}::MIN") {
+        return min_value(ty);
+    }
+
+    None
+}
+
+fn typed_constant_binary_is_safe(
+    left: &str,
+    right: &str,
+    ty: Option<&str>,
+    operation: fn(i128, i128) -> Option<i128>,
+) -> bool {
+    let Some(ty) = ty else {
+        return false;
+    };
+    let (Some(left), Some(right)) = (
+        integer_constant_value(left, Some(ty)),
+        integer_constant_value(right, Some(ty)),
+    ) else {
+        return false;
+    };
+    let Some(value) = operation(left, right) else {
+        return false;
+    };
+    let Some(min) = min_value(ty) else {
+        return false;
+    };
+    let Some(max) = max_value(ty) else {
+        return false;
+    };
+
+    min <= value && value <= max
 }
 
 fn expression_needs_integer_proof(left: &str, right: &str, params: &[Param]) -> bool {
@@ -4036,6 +4131,7 @@ mod tests {
             return_expression: Some("acct.balance + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i64".to_string()),
                 left: "acct.balance".to_string(),
                 right: Some("1".to_string()),
                 expression: "acct.balance + 1".to_string(),
@@ -4085,6 +4181,7 @@ mod tests {
             return_expression: Some("acct.balance + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i64".to_string()),
                 left: "acct.balance".to_string(),
                 right: Some("1".to_string()),
                 expression: "acct.balance + 1".to_string(),
@@ -4379,6 +4476,7 @@ mod tests {
             return_expression: Some("x + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -4402,6 +4500,113 @@ mod tests {
     }
 
     #[test]
+    fn semantic_arithmetic_uses_mir_type_for_constant_addition_overflow() {
+        let metadata = metadata_named(
+            "overflow",
+            "pub fn overflow() -> i32 { let x: i32 = i32::MAX; x + 1 }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "overflow".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            return_expression: Some("i32::MAX + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
+                left: "i32::MAX".to_string(),
+                right: Some("1".to_string()),
+                expression: "i32::MAX + 1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "overflow".to_string(),
+                expression: "i32::MAX + 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_allows_safe_typed_constant_addition() {
+        let metadata = metadata_named(
+            "safe_add",
+            "pub fn safe_add() -> i32 { let x: i32 = 40; x + 1 }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "safe_add".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            return_expression: Some("40 + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
+                left: "40".to_string(),
+                right: Some("1".to_string()),
+                expression: "40 + 1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_uses_mir_type_for_constant_negation_overflow() {
+        let metadata = metadata_named(
+            "negate",
+            "pub fn negate() -> i32 { let x: i32 = i32::MIN; -x }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "negate".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            return_expression: Some("-i32::MIN".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Neg,
+                ty: Some("i32".to_string()),
+                left: "i32::MIN".to_string(),
+                right: None,
+                expression: "-i32::MIN".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerNegationOverflow {
+                function: "negate".to_string(),
+                expression: "-i32::MIN".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn semantic_branch_guard_proves_checked_addition() {
         let metadata = metadata_named(
             "add_if_safe",
@@ -4418,6 +4623,7 @@ mod tests {
             return_expression: None,
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -4463,6 +4669,7 @@ mod tests {
             return_expression: Some("x / y".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
@@ -4508,6 +4715,7 @@ mod tests {
             return_expression: Some("x / y".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
+                ty: Some("i32".to_string()),
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
