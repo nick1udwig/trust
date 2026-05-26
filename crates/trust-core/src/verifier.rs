@@ -221,6 +221,11 @@ pub enum VerificationError {
     UnsupportedClosure {
         function: String,
     },
+    SemanticExtractionIncomplete {
+        function: String,
+        category: String,
+        expression: String,
+    },
     ExplicitPanic {
         function: String,
     },
@@ -359,6 +364,14 @@ impl fmt::Display for VerificationError {
             VerificationError::UnsupportedClosure { function } => {
                 write!(f, "closures are not supported in `{function}`")
             }
+            VerificationError::SemanticExtractionIncomplete {
+                function,
+                category,
+                expression,
+            } => write!(
+                f,
+                "rustc semantic extraction did not cover {category} in `{function}`: `{expression}`"
+            ),
             VerificationError::ExplicitPanic { function } => {
                 write!(f, "explicit panic is not supported in `{function}`")
             }
@@ -530,6 +543,29 @@ fn verify_total_with_env(
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
             callee,
+        });
+    }
+    if let Some(expression) =
+        semantic_arithmetic_extraction_gap(raw_body, &value_params, semantics, options)
+    {
+        return Err(VerificationError::SemanticExtractionIncomplete {
+            function: metadata.rust_function_path.clone(),
+            category: "arithmetic operation".to_string(),
+            expression,
+        });
+    }
+    if let Some(expression) = semantic_slice_index_extraction_gap(raw_body, &params, semantics) {
+        return Err(VerificationError::SemanticExtractionIncomplete {
+            function: metadata.rust_function_path.clone(),
+            category: "slice index".to_string(),
+            expression,
+        });
+    }
+    if let Some(expression) = semantic_call_extraction_gap(raw_body, &call_env, semantics) {
+        return Err(VerificationError::SemanticExtractionIncomplete {
+            function: metadata.rust_function_path.clone(),
+            category: "Trust call".to_string(),
+            expression,
         });
     }
 
@@ -1976,6 +2012,9 @@ fn verification_addition_obligations(
 ) -> Vec<AddObligation> {
     let semantic_obligations =
         semantic_addition_obligations(semantics, params, options.target_pointer_width);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         addition_obligations(body, params),
@@ -2020,6 +2059,9 @@ fn verification_subtraction_obligations(
 ) -> Vec<SubObligation> {
     let semantic_obligations =
         semantic_subtraction_obligations(semantics, params, options.target_pointer_width);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         subtraction_obligations(body, params),
@@ -2064,6 +2106,9 @@ fn verification_negation_obligations(
 ) -> Vec<NegObligation> {
     let semantic_obligations =
         semantic_negation_obligations(semantics, params, options.target_pointer_width);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         negation_obligations(body, params),
@@ -2111,6 +2156,9 @@ fn verification_multiplication_obligations(
 ) -> Vec<MulObligation> {
     let semantic_obligations =
         semantic_multiplication_obligations(semantics, params, options.target_pointer_width);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         multiplication_obligations(body, params),
@@ -2165,6 +2213,9 @@ fn verification_division_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<DenominatorObligation> {
     let semantic_obligations = semantic_division_obligations(semantics);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         division_obligations(body, params),
@@ -2183,6 +2234,9 @@ fn verification_remainder_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<DenominatorObligation> {
     let semantic_obligations = semantic_remainder_obligations(semantics);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         remainder_obligations(body, params),
@@ -2241,6 +2295,9 @@ fn verification_signed_division_overflow_obligations(
         kind,
         target_pointer_width,
     );
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         signed_division_overflow_obligations(body, params, op, target_pointer_width),
@@ -2251,6 +2308,102 @@ fn verification_signed_division_overflow_obligations(
         fallback_obligations,
         |existing, fallback| existing.expression == fallback.expression,
     )
+}
+
+fn semantic_arithmetic_extraction_gap(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
+) -> Option<String> {
+    semantics?;
+
+    semantic_obligation_gap(
+        &semantic_addition_obligations(semantics, params, options.target_pointer_width),
+        addition_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    )
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_subtraction_obligations(semantics, params, options.target_pointer_width),
+            subtraction_obligations(body, params),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_negation_obligations(semantics, params, options.target_pointer_width),
+            negation_obligations(body, params),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_multiplication_obligations(semantics, params, options.target_pointer_width),
+            multiplication_obligations(body, params),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_division_obligations(semantics),
+            division_obligations(body, params),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_remainder_obligations(semantics),
+            remainder_obligations(body, params),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_signed_division_overflow_obligations(
+                semantics,
+                params,
+                SemanticArithmeticKind::Div,
+                options.target_pointer_width,
+            ),
+            signed_division_overflow_obligations(body, params, "/", options.target_pointer_width),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+    .or_else(|| {
+        semantic_obligation_gap(
+            &semantic_signed_division_overflow_obligations(
+                semantics,
+                params,
+                SemanticArithmeticKind::Rem,
+                options.target_pointer_width,
+            ),
+            signed_division_overflow_obligations(body, params, "%", options.target_pointer_width),
+            |obligation| obligation.expression.as_str(),
+        )
+    })
+}
+
+fn semantic_obligation_gap<T>(
+    semantic_obligations: &[T],
+    fallback_obligations: Vec<T>,
+    expression: impl Fn(&T) -> &str,
+) -> Option<String> {
+    let semantic_expressions = semantic_obligations
+        .iter()
+        .map(|obligation| normalize(expression(obligation)))
+        .collect::<Vec<_>>();
+
+    fallback_obligations
+        .into_iter()
+        .map(|obligation| expression(&obligation).to_string())
+        .filter(|expression| !expression.contains('{') && !expression.contains('}'))
+        .find(|fallback_expression| {
+            let normalized = normalize(fallback_expression);
+            !semantic_expressions
+                .iter()
+                .any(|semantic_expression| semantic_expression == &normalized)
+        })
 }
 
 fn semantic_signed_division_overflow_obligations(
@@ -2714,6 +2867,9 @@ fn verification_slice_index_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<SliceIndexObligation> {
     let semantic_obligations = semantic_slice_index_obligations(semantics);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         slice_index_obligations(body, params),
@@ -2740,6 +2896,28 @@ fn semantic_slice_index_obligations(
             assumptions: index.guards.iter().map(|guard| normalize(guard)).collect(),
         })
         .collect()
+}
+
+fn semantic_slice_index_extraction_gap(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
+    let semantics = semantics?;
+
+    if let Some(index) = semantics
+        .slice_indexes
+        .iter()
+        .find(|index| !semantic_slice_index_supported(index))
+    {
+        return Some(index.expression.clone());
+    }
+
+    semantic_obligation_gap(
+        &semantic_slice_index_obligations(Some(semantics)),
+        slice_index_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    )
 }
 
 fn semantic_slice_index_supported(index: &SemanticSliceIndex) -> bool {
@@ -3815,6 +3993,9 @@ fn verification_call_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<CallObligation> {
     let semantic_obligations = semantic_call_obligations(semantics, env);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     let token_obligations = if semantic_obligations.is_empty() {
         call_obligations(body, env)
     } else {
@@ -3861,6 +4042,37 @@ fn semantic_call_obligations(
         })
         .flatten()
         .collect()
+}
+
+fn semantic_call_extraction_gap(
+    body: &str,
+    env: &[TrustFunctionSummary],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
+    semantics?;
+
+    let semantic_obligations = semantic_call_obligations(semantics, env);
+    let semantic_conditions = semantic_obligations
+        .iter()
+        .map(|obligation| normalize(&obligation.condition))
+        .collect::<Vec<_>>();
+
+    unambiguous_call_obligations(body, env)
+        .into_iter()
+        .filter(|obligation| token_call_obligation_needs_semantic_coverage(&obligation.condition))
+        .find(|obligation| {
+            let condition = normalize(&obligation.condition);
+            !semantic_conditions
+                .iter()
+                .any(|semantic_condition| semantic_condition == &condition)
+        })
+        .map(|obligation| obligation.condition)
+}
+
+fn token_call_obligation_needs_semantic_coverage(condition: &str) -> bool {
+    !condition.contains('{')
+        && !condition.contains('}')
+        && !tokens(condition).contains(&"let".to_string())
 }
 
 fn semantic_call_callee(
@@ -7773,7 +7985,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_semantic_arithmetic_does_not_suppress_token_obligations() {
+    fn partial_semantic_arithmetic_fails_closed() {
         let metadata = metadata_named(
             "add_both",
             "pub fn add_both(x: i32, y: i32) -> i32 { let _a = x + 1; y + 1 }",
@@ -7813,8 +8025,9 @@ mod tests {
 
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
-            Err(VerificationError::IntegerAdditionOverflow {
+            Err(VerificationError::SemanticExtractionIncomplete {
                 function: "add_both".to_string(),
+                category: "arithmetic operation".to_string(),
                 expression: "y + 1".to_string(),
             })
         );
@@ -8241,7 +8454,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_semantic_slice_indexes_do_not_suppress_token_obligations() {
+    fn partial_semantic_slice_indexes_fail_closed() {
         let metadata = metadata_named(
             "get_second",
             "pub fn get_second(xs: &[i32], i: usize, j: usize) -> i32 { let _a = xs[i]; xs[j] }",
@@ -8285,8 +8498,9 @@ mod tests {
 
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
-            Err(VerificationError::SliceIndexOutOfBounds {
+            Err(VerificationError::SemanticExtractionIncomplete {
                 function: "get_second".to_string(),
+                category: "slice index".to_string(),
                 expression: "xs[j]".to_string(),
             })
         );
@@ -8380,10 +8594,14 @@ mod tests {
             branches: Vec::new(),
         };
 
-        assert!(matches!(
+        assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
-            Err(VerificationError::SliceIndexOutOfBounds { .. })
-        ));
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "get".to_string(),
+                category: "slice index".to_string(),
+                expression: "xs[i]".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -8436,7 +8654,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_semantic_calls_do_not_suppress_simple_token_obligations() {
+    fn partial_semantic_calls_fail_closed() {
         let inc = metadata_named(
             "inc",
             "pub fn inc(x: i32) -> i32 { x + 1 }",
@@ -8482,10 +8700,10 @@ mod tests {
                 &[semantics],
                 VerificationOptions::default()
             ),
-            Err(VerificationError::CalleePreconditionUnproved {
+            Err(VerificationError::SemanticExtractionIncomplete {
                 function: "caller".to_string(),
-                callee: "inc".to_string(),
-                condition: "y<i32::MAX".to_string(),
+                category: "Trust call".to_string(),
+                expression: "y<i32::MAX".to_string(),
             })
         );
     }

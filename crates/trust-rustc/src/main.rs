@@ -450,6 +450,7 @@ fn verification_error_item_name(err: &VerificationError) -> Option<&str> {
         | VerificationError::UnsupportedLoopControl { function, .. }
         | VerificationError::UnsupportedCall { function, .. }
         | VerificationError::UnsupportedClosure { function }
+        | VerificationError::SemanticExtractionIncomplete { function, .. }
         | VerificationError::ExplicitPanic { function }
         | VerificationError::UncheckedUnwrap { function }
         | VerificationError::PostconditionUnproved { function, .. } => Some(function),
@@ -474,7 +475,8 @@ fn verification_error_expression(err: &VerificationError) -> Option<&str> {
         | VerificationError::IntegerDivisionByZero { expression, .. }
         | VerificationError::IntegerRemainderByZero { expression, .. }
         | VerificationError::SliceIndexOutOfBounds { expression, .. }
-        | VerificationError::UnsupportedIndex { expression, .. } => Some(expression),
+        | VerificationError::UnsupportedIndex { expression, .. }
+        | VerificationError::SemanticExtractionIncomplete { expression, .. } => Some(expression),
         VerificationError::CalleePreconditionUnproved { condition, .. }
         | VerificationError::LoopInvariantNotEstablished {
             invariant: condition,
@@ -558,6 +560,9 @@ fn diagnostic_help(err: &VerificationError) -> Option<&'static str> {
         }
         VerificationError::PostconditionUnproved { .. } => {
             Some("make the returned expression match the stated postcondition or strengthen the proof facts")
+        }
+        VerificationError::SemanticExtractionIncomplete { .. } => {
+            Some("rerun with TRUST_SEMANTIC_DUMP_DIR to inspect the HIR/MIR facts Trust extracted")
         }
         VerificationError::LoopMissingSpec { .. } | VerificationError::LoopMissingDecreases { .. } => {
             Some("add a loop_spec block with an invariant and decreases measure before the loop")

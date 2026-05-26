@@ -993,31 +993,21 @@ impl MirFunctionSummary {
         let args = args.strip_suffix(')')?;
         let args = parse_mir_call_args(args);
         match (op.trim(), args.as_slice()) {
-            ("Add", [left, right]) | ("AddWithOverflow", [left, right]) => Some(format!(
-                "{} + {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
-            )),
-            ("Sub", [left, right]) | ("SubWithOverflow", [left, right]) => Some(format!(
-                "{} - {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
-            )),
-            ("Mul", [left, right]) | ("MulWithOverflow", [left, right]) => Some(format!(
-                "{} * {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
-            )),
-            ("Div", [left, right]) => Some(format!(
-                "{} / {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
-            )),
-            ("Rem", [left, right]) => Some(format!(
-                "{} % {}",
-                self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
-                self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
-            )),
+            ("Add", [left, right]) | ("AddWithOverflow", [left, right]) => {
+                Some(self.normalized_mir_binary_operation(left, "+", right, depth, model_fields)?)
+            }
+            ("Sub", [left, right]) | ("SubWithOverflow", [left, right]) => {
+                Some(self.normalized_mir_binary_operation(left, "-", right, depth, model_fields)?)
+            }
+            ("Mul", [left, right]) | ("MulWithOverflow", [left, right]) => {
+                Some(self.normalized_mir_binary_operation(left, "*", right, depth, model_fields)?)
+            }
+            ("Div", [left, right]) => {
+                Some(self.normalized_mir_binary_operation(left, "/", right, depth, model_fields)?)
+            }
+            ("Rem", [left, right]) => {
+                Some(self.normalized_mir_binary_operation(left, "%", right, depth, model_fields)?)
+            }
             ("Neg", [value]) | ("NegWithOverflow", [value]) => Some(format!(
                 "-{}",
                 self.normalized_mir_expression_with_depth(value, depth + 1, model_fields)?
@@ -1028,6 +1018,19 @@ impl MirFunctionSummary {
             )),
             _ => None,
         }
+    }
+
+    fn normalized_mir_binary_operation(
+        &self,
+        left: &str,
+        operator: &str,
+        right: &str,
+        depth: usize,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        let left = self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?;
+        let right = self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?;
+        Some(semantic_binary_expression(&left, operator, &right))
     }
 
     fn mir_expression_type(&self, expr: &str, model_fields: &[ModelFieldMap]) -> Option<String> {
@@ -1356,7 +1359,7 @@ impl MirFunctionSummary {
                             kind,
                             ty,
                             target: self.semantic_arithmetic_target(assignment, model_fields),
-                            expression: format!("{left} {operator} {right}"),
+                            expression: semantic_binary_expression(&left, operator, &right),
                             left,
                             right: Some(right),
                             guards: self.guards_for_assignment(assignment, model_fields),
@@ -2804,6 +2807,55 @@ fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
         SemanticArithmeticKind::Neg => "-",
         SemanticArithmeticKind::Div => "/",
         SemanticArithmeticKind::Rem => "%",
+    }
+}
+
+fn semantic_binary_expression(left: &str, operator: &str, right: &str) -> String {
+    format!(
+        "{} {operator} {}",
+        semantic_binary_operand(left, operator, false),
+        semantic_binary_operand(right, operator, true)
+    )
+}
+
+fn semantic_binary_operand(expr: &str, operator: &str, is_right: bool) -> String {
+    if semantic_binary_operand_needs_parentheses(expr, operator, is_right) {
+        format!("({expr})")
+    } else {
+        expr.to_string()
+    }
+}
+
+fn semantic_binary_operand_needs_parentheses(expr: &str, operator: &str, is_right: bool) -> bool {
+    let Some(parent_precedence) = semantic_operator_precedence(operator) else {
+        return false;
+    };
+    let Some(child_precedence) = semantic_expression_lowest_precedence(expr) else {
+        return false;
+    };
+
+    child_precedence < parent_precedence || (is_right && child_precedence == parent_precedence)
+}
+
+fn semantic_expression_has_additive_operator(expr: &str) -> bool {
+    expr.contains(" + ") || expr.contains(" - ")
+}
+
+fn semantic_expression_lowest_precedence(expr: &str) -> Option<u8> {
+    if semantic_expression_has_additive_operator(expr) {
+        Some(1)
+    } else if expr.contains(" * ") || expr.contains(" / ") || expr.contains(" % ") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn semantic_operator_precedence(operator: &str) -> Option<u8> {
+    match operator {
+        "+" | "-" => Some(1),
+        "*" | "/" | "%" => Some(2),
+        _ => None,
     }
 }
 
@@ -4872,6 +4924,65 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn normalizes_nested_mir_arithmetic_with_parentheses() {
+        let mir = r#"
+fn div(_1: i32, _2: i32) -> i32 {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: i32;
+    let mut _3: i32;
+    let mut _4: (i32, bool);
+
+    bb0: {
+        _4 = AddWithOverflow(copy _2, const 0_i32);
+        _3 = move (_4.0: i32);
+        _0 = Div(copy _1, move _3);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "div").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x / (y + 0)".to_string())
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Add,
+                    ty: Some("i32".to_string()),
+                    target: None,
+                    left: "y".to_string(),
+                    right: Some("0".to_string()),
+                    expression: "y + 0".to_string(),
+                    guards: Vec::new(),
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Div,
+                    ty: Some("i32".to_string()),
+                    target: None,
+                    left: "x".to_string(),
+                    right: Some("y + 0".to_string()),
+                    expression: "x / (y + 0)".to_string(),
+                    guards: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_right_nested_arithmetic_shape() {
+        assert_eq!(semantic_binary_expression("x", "+", "y - z"), "x + (y - z)");
+        assert_eq!(semantic_binary_expression("x", "*", "y / z"), "x * (y / z)");
+        assert_eq!(semantic_binary_expression("x + y", "*", "z"), "(x + y) * z");
+        assert_eq!(semantic_binary_expression("x", "+", "y * z"), "x + y * z");
+        assert_eq!(semantic_binary_expression("x / y", "*", "z"), "x / y * z");
     }
 
     #[test]
