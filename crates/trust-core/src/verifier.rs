@@ -45,6 +45,7 @@ pub enum SemanticContractBindingKind {
 pub struct SemanticArithmeticOperation {
     pub kind: SemanticArithmeticKind,
     pub ty: Option<String>,
+    pub target: Option<String>,
     pub left: String,
     pub right: Option<String>,
     pub expression: String,
@@ -465,7 +466,7 @@ fn verify_total_with_env(
     let semantic_return_expression = semantics
         .and_then(|semantics| semantics.return_expression.as_deref())
         .map(normalize);
-    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?;
+    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path, semantics)?;
     let loop_exit_facts = loop_facts
         .iter()
         .filter_map(|fact| loop_exit_fact(&fact.condition))
@@ -2612,7 +2613,11 @@ fn semantic_field_access_obligations(
         .collect()
 }
 
-fn verify_loops(body: &str, function: &str) -> Result<Vec<LoopFact>, VerificationError> {
+fn verify_loops(
+    body: &str,
+    function: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Result<Vec<LoopFact>, VerificationError> {
     let tokens = tokens(body);
     let mut facts = Vec::new();
     let mut pending_spec = None;
@@ -2659,7 +2664,7 @@ fn verify_loops(body: &str, function: &str) -> Result<Vec<LoopFact>, Verificatio
 
         let condition = token_expression(&tokens[idx + 1..body_open_idx]);
         let loop_body = &tokens[body_open_idx + 1..body_close_idx];
-        verify_loop_spec(&spec, &condition, loop_body, function)?;
+        verify_loop_spec(&spec, &condition, loop_body, function, semantics)?;
         facts.push(LoopFact { condition });
         idx = body_close_idx + 1;
     }
@@ -2728,6 +2733,7 @@ fn verify_loop_spec(
     condition: &str,
     loop_body: &[String],
     function: &str,
+    semantics: Option<&TrustFunctionSemantics>,
 ) -> Result<(), VerificationError> {
     let Some(measure) = &spec.decreases else {
         return Err(VerificationError::LoopMissingDecreases {
@@ -2745,7 +2751,7 @@ fn verify_loop_spec(
     }
 
     if let Some(invariant) = &spec.invariant {
-        if loop_invariant_may_not_be_preserved(invariant, condition, loop_body) {
+        if loop_invariant_may_not_be_preserved(invariant, condition, loop_body, semantics) {
             return Err(VerificationError::LoopInvariantNotPreserved {
                 function: function.to_string(),
                 invariant: invariant.clone(),
@@ -2753,7 +2759,7 @@ fn verify_loop_spec(
         }
     }
 
-    if !loop_measure_decreases(measure, loop_body) {
+    if !loop_measure_decreases(measure, condition, loop_body, semantics) {
         return Err(VerificationError::LoopDecreasesNotDecreasing {
             function: function.to_string(),
             measure: measure.clone(),
@@ -2767,6 +2773,7 @@ fn loop_invariant_may_not_be_preserved(
     invariant: &str,
     condition: &str,
     loop_body: &[String],
+    semantics: Option<&TrustFunctionSemantics>,
 ) -> bool {
     let Some((left, right)) = invariant.split_once("<=") else {
         return false;
@@ -2775,18 +2782,84 @@ fn loop_invariant_may_not_be_preserved(
         return false;
     }
 
-    increment_amount(loop_body, left).is_some_and(|amount| amount > 1)
+    increment_amount(loop_body, left)
+        .or_else(|| semantic_increment_amount(semantics, condition, left))
+        .is_some_and(|amount| amount > 1)
 }
 
-fn loop_measure_decreases(measure: &str, loop_body: &[String]) -> bool {
-    if decrements_variable(loop_body, measure) {
+fn loop_measure_decreases(
+    measure: &str,
+    condition: &str,
+    loop_body: &[String],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> bool {
+    if decrements_variable(loop_body, measure)
+        || semantic_decrements_variable(semantics, condition, measure)
+    {
         return true;
     }
 
     let Some((left, right)) = measure.split_once('-') else {
         return false;
     };
-    decrements_variable(loop_body, left) || increment_amount(loop_body, right).is_some()
+    let left = left.trim();
+    let right = right.trim();
+    decrements_variable(loop_body, left)
+        || semantic_decrements_variable(semantics, condition, left)
+        || increment_amount(loop_body, right).is_some()
+        || semantic_increment_amount(semantics, condition, right).is_some()
+}
+
+fn semantic_decrements_variable(
+    semantics: Option<&TrustFunctionSemantics>,
+    condition: &str,
+    variable: &str,
+) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics.arithmetic_operations.iter().any(|operation| {
+            operation.kind == SemanticArithmeticKind::Sub
+                && operation.target.as_deref() == Some(variable)
+                && operation.left == variable
+                && operation
+                    .right
+                    .as_deref()
+                    .and_then(|right| right.parse::<i128>().ok())
+                    .is_some_and(|amount| amount > 0)
+                && semantic_operation_guarded_by(operation, condition)
+        })
+    })
+}
+
+fn semantic_increment_amount(
+    semantics: Option<&TrustFunctionSemantics>,
+    condition: &str,
+    variable: &str,
+) -> Option<i128> {
+    semantics.into_iter().find_map(|semantics| {
+        semantics
+            .arithmetic_operations
+            .iter()
+            .filter(|operation| {
+                operation.kind == SemanticArithmeticKind::Add
+                    && operation.target.as_deref() == Some(variable)
+                    && operation.left == variable
+                    && semantic_operation_guarded_by(operation, condition)
+            })
+            .find_map(|operation| {
+                operation
+                    .right
+                    .as_deref()
+                    .and_then(|right| right.parse::<i128>().ok())
+            })
+    })
+}
+
+fn semantic_operation_guarded_by(operation: &SemanticArithmeticOperation, condition: &str) -> bool {
+    let condition = normalize(condition);
+    operation
+        .guards
+        .iter()
+        .any(|guard| normalize(guard) == condition)
 }
 
 fn loop_exit_fact(condition: &str) -> Option<String> {
@@ -5259,6 +5332,53 @@ mod tests {
     }
 
     #[test]
+    fn semantic_loop_decreases_uses_mir_assignment_target() {
+        let metadata = metadata_named_with_classes(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { n -= 1; } n }",
+            &["out == 0"],
+            &["gives executable"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("n".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                ty: Some("usize".to_string()),
+                target: Some("n".to_string()),
+                left: "n".to_string(),
+                right: Some("1".to_string()),
+                expression: "n - 1".to_string(),
+                guards: vec!["n > 0".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopDecreasesNotDecreasing {
+                function: "countdown".to_string(),
+                measure: "n".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn rejects_loop_missing_decreases() {
         let metadata = metadata_named(
             "count_up",
@@ -5908,6 +6028,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i64".to_string()),
+                target: None,
                 left: "acct.balance".to_string(),
                 right: Some("1".to_string()),
                 expression: "acct.balance + 1".to_string(),
@@ -5960,6 +6081,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i64".to_string()),
+                target: None,
                 left: "acct.balance".to_string(),
                 right: Some("1".to_string()),
                 expression: "acct.balance + 1".to_string(),
@@ -6366,6 +6488,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -6414,6 +6537,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -6452,6 +6576,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "i32::MAX".to_string(),
                 right: Some("1".to_string()),
                 expression: "i32::MAX + 1".to_string(),
@@ -6491,6 +6616,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("u32".to_string()),
+                target: None,
                 left: "u32::MAX".to_string(),
                 right: Some("1".to_string()),
                 expression: "u32::MAX + 1".to_string(),
@@ -6530,6 +6656,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "40".to_string(),
                 right: Some("1".to_string()),
                 expression: "40 + 1".to_string(),
@@ -6565,6 +6692,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Neg,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "i32::MIN".to_string(),
                 right: None,
                 expression: "-i32::MIN".to_string(),
@@ -6607,6 +6735,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -6655,6 +6784,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
@@ -6703,6 +6833,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
@@ -6737,6 +6868,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("-1".to_string()),
                 expression: "x / -1".to_string(),
@@ -6779,6 +6911,7 @@ mod tests {
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("-1".to_string()),
                 expression: "x / -1".to_string(),

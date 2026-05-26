@@ -1313,6 +1313,7 @@ impl MirFunctionSummary {
                         Some(SemanticArithmeticOperation {
                             kind,
                             ty,
+                            target: self.semantic_arithmetic_target(assignment, model_fields),
                             expression: format!("{left} {operator} {right}"),
                             left,
                             right: Some(right),
@@ -1326,6 +1327,7 @@ impl MirFunctionSummary {
                         Some(SemanticArithmeticOperation {
                             kind,
                             ty,
+                            target: self.semantic_arithmetic_target(assignment, model_fields),
                             expression: format!("-{value}"),
                             left: value,
                             right: None,
@@ -1336,6 +1338,26 @@ impl MirFunctionSummary {
                 }
             })
             .collect()
+    }
+
+    fn semantic_arithmetic_target(
+        &self,
+        assignment: &MirAssignment,
+        _model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        self.local_name_for_place(&assignment.place)
+            .map(ToString::to_string)
+            .or_else(|| {
+                self.assignments.iter().find_map(|target_assignment| {
+                    let expr = strip_mir_move_or_copy(&target_assignment.expression);
+                    let (place, field, _ty) = mir_projection(expr)?;
+                    if place != assignment.place || field != "0" {
+                        return None;
+                    }
+                    self.local_name_for_place(&target_assignment.place)
+                        .map(ToString::to_string)
+                })
+            })
     }
 
     #[cfg(test)]
@@ -2940,6 +2962,7 @@ fn reward_alias(_1: Account) -> i64 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i64".to_string()),
+                target: None,
                 left: "acct.balance".to_string(),
                 right: Some("1".to_string()),
                 expression: "acct.balance + 1".to_string(),
@@ -3316,6 +3339,7 @@ fn add_one(_1: i32) -> i32 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -3358,6 +3382,7 @@ fn arithmetic(_1: i32) -> i32 {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Add,
                     ty: Some("i32".to_string()),
+                    target: None,
                     left: "x".to_string(),
                     right: Some("1".to_string()),
                     expression: "x + 1".to_string(),
@@ -3366,6 +3391,7 @@ fn arithmetic(_1: i32) -> i32 {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Sub,
                     ty: Some("i32".to_string()),
+                    target: None,
                     left: "x".to_string(),
                     right: Some("1".to_string()),
                     expression: "x - 1".to_string(),
@@ -3374,6 +3400,7 @@ fn arithmetic(_1: i32) -> i32 {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Mul,
                     ty: Some("i32".to_string()),
+                    target: None,
                     left: "x".to_string(),
                     right: Some("2".to_string()),
                     expression: "x * 2".to_string(),
@@ -3382,6 +3409,7 @@ fn arithmetic(_1: i32) -> i32 {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Neg,
                     ty: Some("i32".to_string()),
+                    target: None,
                     left: "x".to_string(),
                     right: None,
                     expression: "-x".to_string(),
@@ -3421,10 +3449,59 @@ fn add_one(_1: i32) -> i32 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: Some("y".to_string()),
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
                 guards: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_arithmetic_target_through_overflow_temp_assignment() {
+        let mir = r#"
+fn count_up(_1: usize, _2: usize) -> usize {
+    debug i => _1;
+    debug n => _2;
+    let mut _0: usize;
+    let mut _3: bool;
+    let mut _4: (usize, bool);
+
+    bb0: {
+        _3 = Lt(copy _1, copy _2);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = AddWithOverflow(copy _1, const 1_usize);
+        assert(!move (_4.1: bool), "overflow", copy _1, const 1_usize) -> [success: bb3, unwind continue];
+    }
+
+    bb2: {
+        _0 = copy _1;
+        return;
+    }
+
+    bb3: {
+        _1 = move (_4.0: usize);
+        goto -> bb0;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "count_up").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("usize".to_string()),
+                target: Some("i".to_string()),
+                left: "i".to_string(),
+                right: Some("1".to_string()),
+                expression: "i + 1".to_string(),
+                guards: vec!["i < n".to_string()],
             }]
         );
     }
@@ -3508,6 +3585,7 @@ fn divide_after_countdown(_1: usize) -> usize {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Sub,
                     ty: Some("usize".to_string()),
+                    target: Some("n".to_string()),
                     left: "n".to_string(),
                     right: Some("1".to_string()),
                     expression: "n - 1".to_string(),
@@ -3516,6 +3594,7 @@ fn divide_after_countdown(_1: usize) -> usize {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Div,
                     ty: Some("usize".to_string()),
+                    target: None,
                     left: "1".to_string(),
                     right: Some("n".to_string()),
                     expression: "1 / n".to_string(),
@@ -3559,6 +3638,7 @@ fn divide_inside_loop(_1: usize) -> usize {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Sub,
                     ty: Some("usize".to_string()),
+                    target: Some("n".to_string()),
                     left: "n".to_string(),
                     right: Some("1".to_string()),
                     expression: "n - 1".to_string(),
@@ -3567,6 +3647,7 @@ fn divide_inside_loop(_1: usize) -> usize {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Div,
                     ty: Some("usize".to_string()),
+                    target: None,
                     left: "1".to_string(),
                     right: Some("n".to_string()),
                     expression: "1 / n".to_string(),
@@ -3623,6 +3704,7 @@ fn add_from_late_branch(_1: i32) -> i32 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -3720,6 +3802,7 @@ fn overflow() -> i32 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "i32::MAX".to_string(),
                 right: Some("1".to_string()),
                 expression: "i32::MAX + 1".to_string(),
@@ -3796,6 +3879,7 @@ fn add_if_safe(_1: i32) -> i32 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("1".to_string()),
                 expression: "x + 1".to_string(),
@@ -3855,6 +3939,7 @@ fn withdraw_if_safe(_1: Account, _2: i64) -> i64 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Sub,
                 ty: Some("i64".to_string()),
+                target: None,
                 left: "acct.balance".to_string(),
                 right: Some("amount".to_string()),
                 expression: "acct.balance - amount".to_string(),
@@ -3892,6 +3977,7 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Rem,
                     ty: Some("i32".to_string()),
+                    target: None,
                     left: "x".to_string(),
                     right: Some("y".to_string()),
                     expression: "x % y".to_string(),
@@ -3900,6 +3986,7 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                 SemanticArithmeticOperation {
                     kind: SemanticArithmeticKind::Div,
                     ty: Some("i32".to_string()),
+                    target: None,
                     left: "x".to_string(),
                     right: Some("y".to_string()),
                     expression: "x / y".to_string(),
@@ -3934,6 +4021,7 @@ fn div_neg_one(_1: i32) -> i32 {
             vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
                 ty: Some("i32".to_string()),
+                target: None,
                 left: "x".to_string(),
                 right: Some("-1".to_string()),
                 expression: "x / -1".to_string(),

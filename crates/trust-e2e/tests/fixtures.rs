@@ -335,6 +335,14 @@ fn pass_loop_countdown_proves_decreases() {
 }
 
 #[test]
+fn pass_loop_compound_decrement_uses_mir_target_for_decreases() {
+    let output = run_fixture("pass_loop_compound_decrement", Expected::Pass);
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_loop_without_spec_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_without_spec", Expected::Fail);
 
