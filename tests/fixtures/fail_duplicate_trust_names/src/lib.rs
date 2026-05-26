@@ -1,13 +1,7 @@
-#[trust::module]
-mod first {
-    trust::proof! {
-        fn same() {}
-    }
+trust::proof! {
+    fn same() {}
 }
 
-#[trust::module]
-mod second {
-    trust::proof! {
-        fn same() {}
-    }
+trust::proof! {
+    fn same() given ghost { true; } { assert(true); }
 }

@@ -34,9 +34,10 @@ Still intentionally limited:
   arbitrary Rust calls, arbitrary method calls, iterators, mutation-heavy collection models,
   or user-declared trusted axioms
 - diagnostics are deterministic and tested, but source-span quality is still MVP-level
-- Trust total functions in distinct verified modules can share a leaf name, but
-  duplicate unresolved proof/model paths are still rejected until all metadata
-  records full Rust module paths
+- Trust total/proof/spec macros and inert trusted-model stubs inside distinct
+  verified modules record module-qualified metadata paths, but `#[derive(TrustModel)]`
+  still records unresolved model leaf names, so duplicate model names are still
+  rejected until derive metadata receives full Rust module paths
 - verification still mostly uses the metadata/token verifier plus default
   HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic
   operations with concrete Rust integer types, slice index facts with element and

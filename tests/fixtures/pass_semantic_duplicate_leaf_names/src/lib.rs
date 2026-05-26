@@ -3,12 +3,20 @@ mod left {
     trust::total! {
         pub fn same(x: i32) -> i32 { x }
     }
+
+    trust::proof! {
+        fn lemma() {}
+    }
 }
 
 #[trust::module]
 mod right {
     trust::total! {
         pub fn same(x: i32) -> i32 { x }
+    }
+
+    trust::proof! {
+        fn lemma() {}
     }
 }
 

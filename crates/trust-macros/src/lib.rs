@@ -110,11 +110,15 @@ pub fn trusted_model(input: TokenStream) -> TokenStream {
     }
 
     let source = input.to_string();
+    let (module_path, source) = match strip_internal_module_path(&source) {
+        Ok((module_path, source)) => (module_path, source),
+        Err(message) => return compile_error(message),
+    };
     if source.trim().is_empty() {
         return compile_error("error[trust]: trust::trusted_model! requires a declaration");
     }
 
-    let metadata = trusted_model_metadata_json(&source);
+    let metadata = trusted_model_metadata_json(module_path.as_deref(), &source);
     if let Err(err) = write_metadata_sidecar(&metadata) {
         return compile_error(&format!(
             "error[trust]: failed to write Trust metadata: {err}"
@@ -302,6 +306,7 @@ struct TotalExpansion {
 
 #[derive(Debug)]
 struct SpecExpansion {
+    module_path: Option<String>,
     kind: &'static str,
     fn_source: String,
     fn_info: FnInfo,
@@ -309,6 +314,8 @@ struct SpecExpansion {
 
 #[derive(Debug)]
 struct ProofExpansion {
+    module_path: Option<String>,
+    source: String,
     fn_info: FnInfo,
     contracts: Vec<Contract>,
 }
@@ -321,6 +328,7 @@ struct Contract {
 }
 
 fn parse_spec_source(source: &str) -> Result<SpecExpansion, &'static str> {
+    let (module_path, source) = strip_internal_module_path(source)?;
     let rest = source.trim();
     let (kind, fn_source) = if let Some(after_executable) = strip_keyword(rest, "executable") {
         ("executable", after_executable.trim_start())
@@ -336,6 +344,7 @@ fn parse_spec_source(source: &str) -> Result<SpecExpansion, &'static str> {
     }
 
     Ok(SpecExpansion {
+        module_path,
         kind,
         fn_source: fn_source.to_string(),
         fn_info,
@@ -343,6 +352,7 @@ fn parse_spec_source(source: &str) -> Result<SpecExpansion, &'static str> {
 }
 
 fn parse_proof_source(source: &str) -> Result<ProofExpansion, &'static str> {
+    let (module_path, source) = strip_internal_module_path(source)?;
     let source = source.trim();
     let tokens = lex(source);
     let Some(fn_idx) = tokens
@@ -431,6 +441,8 @@ fn parse_proof_source(source: &str) -> Result<ProofExpansion, &'static str> {
     }
 
     Ok(ProofExpansion {
+        module_path,
+        source: source.to_string(),
         fn_info: FnInfo {
             name,
             visibility: "private",
@@ -553,11 +565,20 @@ fn take_internal_module_path(input: &str) -> Result<Option<(String, &str)>, &'st
     }
 }
 
+fn strip_internal_module_path(input: &str) -> Result<(Option<String>, String), &'static str> {
+    let input = input.trim();
+    if let Some((module_path, rest)) = take_internal_module_path(input)? {
+        Ok((Some(module_path), rest.trim_start().to_string()))
+    } else {
+        Ok((None, input.to_string()))
+    }
+}
+
 fn inject_module_path_markers(source: &str, module_path: &str) -> String {
     let mut output = String::new();
     let mut remaining = source;
 
-    while let Some((prefix_len, open_brace_end)) = find_trust_macro_open(remaining, "total") {
+    while let Some((prefix_len, open_brace_end)) = find_next_trust_macro_open(remaining) {
         output.push_str(&remaining[..open_brace_end]);
         output.push_str(" __trust_module_path ");
         output.push_str(module_path);
@@ -570,6 +591,13 @@ fn inject_module_path_markers(source: &str, module_path: &str) -> String {
 
     output.push_str(remaining);
     output
+}
+
+fn find_next_trust_macro_open(input: &str) -> Option<(usize, usize)> {
+    ["total", "spec", "proof", "trusted_model"]
+        .into_iter()
+        .filter_map(|macro_name| find_trust_macro_open(input, macro_name))
+        .min_by_key(|(prefix_len, _open_brace_end)| *prefix_len)
 }
 
 fn find_trust_macro_open(input: &str, macro_name: &str) -> Option<(usize, usize)> {
@@ -1180,12 +1208,26 @@ fn model_metadata_json(model: &ModelInfo, source: &str) -> String {
     )
 }
 
-fn trusted_model_metadata_json(source: &str) -> String {
+fn metadata_module_id(module_path: Option<&str>) -> &str {
+    module_path.unwrap_or("unknown")
+}
+
+fn qualified_metadata_path(module_path: Option<&str>, name: &str) -> String {
+    module_path
+        .map(|module_path| format!("{module_path}::{name}"))
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn trusted_model_metadata_json(module_path: Option<&str>, source: &str) -> String {
     let hash = short_hash(source);
+    let module_id = metadata_module_id(module_path);
+    let rust_function_path = qualified_metadata_path(module_path, "trusted_model_stub");
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"trusted_model_stub:{hash}\",\"item_kind\":\"trusted_model_stub\",\"source_span\":\"unknown\",\"rust_function_path\":\"trusted_model_stub\",\"visibility\":\"unknown\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"trusted_model_stub:{hash}\",\"item_kind\":\"trusted_model_stub\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"unknown\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
+        module_id = json_escape(module_id),
+        rust_function_path = json_escape(&rust_function_path),
         hash = hash,
         source = json_escape(source),
     )
@@ -1193,12 +1235,17 @@ fn trusted_model_metadata_json(source: &str) -> String {
 
 fn spec_metadata_json(spec: &SpecExpansion, source: &str) -> String {
     let hash = short_hash(source);
+    let module_id = metadata_module_id(spec.module_path.as_deref());
+    let rust_function_path =
+        qualified_metadata_path(spec.module_path.as_deref(), &spec.fn_info.name);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"spec:{kind}:{name}:{hash}\",\"item_kind\":\"spec\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"spec:{kind}:{name}:{hash}\",\"item_kind\":\"spec\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"{visibility}\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
+        module_id = json_escape(module_id),
         kind = spec.kind,
         name = json_escape(&spec.fn_info.name),
+        rust_function_path = json_escape(&rust_function_path),
         hash = hash,
         visibility = spec.fn_info.visibility,
         function_source = json_escape(&spec.fn_source),
@@ -1207,13 +1254,18 @@ fn spec_metadata_json(spec: &SpecExpansion, source: &str) -> String {
 
 fn proof_metadata_json(proof: &ProofExpansion, source: &str) -> String {
     let hash = short_hash(source);
+    let module_id = metadata_module_id(proof.module_path.as_deref());
+    let rust_function_path =
+        qualified_metadata_path(proof.module_path.as_deref(), &proof.fn_info.name);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"proof:{name}:{hash}\",\"item_kind\":\"proof\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"private\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"proof:{name}:{hash}\",\"item_kind\":\"proof\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"private\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
+        module_id = json_escape(module_id),
         name = json_escape(&proof.fn_info.name),
+        rust_function_path = json_escape(&rust_function_path),
         hash = hash,
-        source = json_escape(source),
+        source = json_escape(&proof.source),
         contracts_original = json_string_array(
             proof
                 .contracts
@@ -1483,11 +1535,11 @@ mod tests {
 
     #[test]
     fn module_injects_path_marker_into_total_macros() {
-        let source = "mod left { trust :: total ! { pub fn same(x : i32) -> i32 { x } } }";
+        let source = "mod left { trust :: total ! { pub fn same(x : i32) -> i32 { x } } trust::proof! { fn lemma() {} } }";
 
         assert_eq!(
             inject_module_path_markers(source, "left"),
-            "mod left { trust :: total ! { __trust_module_path left;  pub fn same(x : i32) -> i32 { x } } }"
+            "mod left { trust :: total ! { __trust_module_path left;  pub fn same(x : i32) -> i32 { x } } trust::proof! { __trust_module_path left;  fn lemma() {} } }"
         );
     }
 
@@ -1563,10 +1615,18 @@ mod tests {
 
     #[test]
     fn trusted_model_metadata_is_inert_stub() {
-        let metadata = trusted_model_metadata_json("axiom false_is_true: false;");
+        let metadata = trusted_model_metadata_json(None, "axiom false_is_true: false;");
 
         assert!(metadata.contains("\"item_kind\":\"trusted_model_stub\""));
         assert!(metadata.contains("\"contracts_original\":[]"));
+    }
+
+    #[test]
+    fn trusted_model_metadata_records_internal_module_path() {
+        let metadata = trusted_model_metadata_json(Some("verified"), "axiom trusted: true;");
+
+        assert!(metadata.contains("\"module_id\":\"verified\""));
+        assert!(metadata.contains("\"rust_function_path\":\"verified::trusted_model_stub\""));
     }
 
     #[test]
@@ -1582,6 +1642,25 @@ mod tests {
             "executable fn nonempty(xs: &[i32]) -> bool { xs . len() > 0 }"
         )
         .contains("\"item_kind\":\"spec\""));
+    }
+
+    #[test]
+    fn spec_metadata_records_internal_module_path() {
+        let spec = parse_spec_source(
+            "__trust_module_path verified; executable fn nonempty(xs: &[i32]) -> bool { xs . len() > 0 }",
+        )
+        .unwrap();
+        let metadata = spec_metadata_json(
+            &spec,
+            "__trust_module_path verified; executable fn nonempty(xs: &[i32]) -> bool { xs . len() > 0 }",
+        );
+
+        assert_eq!(spec.module_path.as_deref(), Some("verified"));
+        assert!(metadata.contains("\"module_id\":\"verified\""));
+        assert!(metadata.contains("\"rust_function_path\":\"verified::nonempty\""));
+        assert!(metadata.contains(
+            "\"function_source\":\"fn nonempty(xs: &[i32]) -> bool { xs . len() > 0 }\""
+        ));
     }
 
     #[test]
@@ -1611,6 +1690,18 @@ mod tests {
         assert_eq!(proof.contracts.len(), 3);
         assert!(metadata.contains("\"item_kind\":\"proof\""));
         assert!(metadata.contains("\"contracts_original\":[\"a <= b\",\"b <= c\",\"a <= c\"]"));
+    }
+
+    #[test]
+    fn proof_metadata_records_internal_module_path() {
+        let proof = parse_proof_source("__trust_module_path left; fn same() {}").unwrap();
+        let metadata = proof_metadata_json(&proof, "__trust_module_path left; fn same() {}");
+
+        assert_eq!(proof.module_path.as_deref(), Some("left"));
+        assert_eq!(proof.source, "fn same() {}");
+        assert!(metadata.contains("\"module_id\":\"left\""));
+        assert!(metadata.contains("\"rust_function_path\":\"left::same\""));
+        assert!(metadata.contains("\"function_source\":\"fn same() {}\""));
     }
 
     #[test]
