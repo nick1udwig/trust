@@ -880,19 +880,17 @@ fn postcondition_proved(
     options: VerificationOptions,
 ) -> bool {
     let return_expression = return_expression(body);
-    if semantic_return_expression.is_some_and(|return_expression| {
-        postcondition_proved_by_return_expression_with_assumptions(
-            postcondition,
-            raw_body,
-            return_expression,
-            contracts,
-            params,
-            options,
-        )
-    }) {
-        return true;
+    if let Some(proved) = semantic_return_proves_postcondition(
+        postcondition,
+        raw_body,
+        semantic_return_expression,
+        contracts,
+        params,
+        options,
+    ) {
+        return proved;
     }
-    if semantic_match_proves_postcondition(
+    if let Some(proved) = semantic_match_proves_postcondition(
         postcondition,
         raw_body,
         semantics,
@@ -900,9 +898,9 @@ fn postcondition_proved(
         params,
         options,
     ) {
-        return true;
+        return proved;
     }
-    if semantic_branch_proves_postcondition(
+    if let Some(proved) = semantic_branch_proves_postcondition(
         postcondition,
         raw_body,
         semantics,
@@ -910,7 +908,7 @@ fn postcondition_proved(
         params,
         options,
     ) {
-        return true;
+        return proved;
     }
 
     postcondition_proved_by_return_expression_with_assumptions(
@@ -923,6 +921,26 @@ fn postcondition_proved(
     )
 }
 
+fn semantic_return_proves_postcondition(
+    postcondition: &Contract,
+    raw_body: &str,
+    semantic_return_expression: Option<&str>,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> Option<bool> {
+    semantic_return_expression.map(|return_expression| {
+        postcondition_proved_by_return_expression_with_assumptions(
+            postcondition,
+            raw_body,
+            return_expression,
+            contracts,
+            params,
+            options,
+        )
+    })
+}
+
 fn semantic_match_proves_postcondition(
     postcondition: &Contract,
     raw_body: &str,
@@ -930,11 +948,13 @@ fn semantic_match_proves_postcondition(
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
-) -> bool {
-    semantics.into_iter().any(|semantics| {
-        semantics.matches.iter().any(|semantic_match| {
+) -> Option<bool> {
+    let mut complete_match_seen = false;
+
+    if let Some(semantics) = semantics {
+        for semantic_match in &semantics.matches {
             if !semantic_match_is_exhaustive(semantic_match) {
-                return false;
+                continue;
             }
 
             let reachable_arms = semantic_match
@@ -942,24 +962,36 @@ fn semantic_match_proves_postcondition(
                 .iter()
                 .filter(|arm| semantic_match_arm_reachable(semantic_match, arm, contracts))
                 .collect::<Vec<_>>();
-            !reachable_arms.is_empty()
-                && reachable_arms.iter().all(|arm| {
-                    arm.return_expression
-                        .as_ref()
-                        .is_some_and(|return_expression| {
-                            let return_expression = normalize(return_expression);
-                            postcondition_proved_by_return_expression_with_assumptions(
-                                postcondition,
-                                raw_body,
-                                &return_expression,
-                                contracts,
-                                params,
-                                options,
-                            )
-                        })
-                })
-        })
-    })
+            if reachable_arms.is_empty()
+                || reachable_arms
+                    .iter()
+                    .any(|arm| arm.return_expression.is_none())
+            {
+                continue;
+            }
+
+            complete_match_seen = true;
+            if reachable_arms.iter().all(|arm| {
+                arm.return_expression
+                    .as_ref()
+                    .is_some_and(|return_expression| {
+                        let return_expression = normalize(return_expression);
+                        postcondition_proved_by_return_expression_with_assumptions(
+                            postcondition,
+                            raw_body,
+                            &return_expression,
+                            contracts,
+                            params,
+                            options,
+                        )
+                    })
+            }) {
+                return Some(true);
+            }
+        }
+    }
+
+    complete_match_seen.then_some(false)
 }
 
 fn semantic_match_is_exhaustive(semantic_match: &SemanticMatch) -> bool {
@@ -1007,34 +1039,48 @@ fn semantic_branch_proves_postcondition(
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
-) -> bool {
-    semantics.into_iter().any(|semantics| {
-        semantics.branches.iter().any(|branch| {
+) -> Option<bool> {
+    let mut complete_branch_seen = false;
+
+    if let Some(semantics) = semantics {
+        for branch in &semantics.branches {
             let reachable_arms = branch
                 .arms
                 .iter()
                 .filter(|arm| semantic_branch_arm_reachable(arm, contracts))
                 .collect::<Vec<_>>();
-            !reachable_arms.is_empty()
-                && reachable_arms.iter().all(|arm| {
-                    arm.return_expression
-                        .as_ref()
-                        .is_some_and(|return_expression| {
-                            let return_expression = normalize(return_expression);
-                            let branch_contracts =
-                                contracts_with_assumptions(contracts, &[normalize(&arm.guard)]);
-                            postcondition_proved_by_return_expression_with_assumptions(
-                                postcondition,
-                                raw_body,
-                                &return_expression,
-                                &branch_contracts,
-                                params,
-                                options,
-                            )
-                        })
-                })
-        })
-    })
+            if reachable_arms.is_empty()
+                || reachable_arms
+                    .iter()
+                    .any(|arm| arm.return_expression.is_none())
+            {
+                continue;
+            }
+
+            complete_branch_seen = true;
+            if reachable_arms.iter().all(|arm| {
+                arm.return_expression
+                    .as_ref()
+                    .is_some_and(|return_expression| {
+                        let return_expression = normalize(return_expression);
+                        let branch_contracts =
+                            contracts_with_assumptions(contracts, &[normalize(&arm.guard)]);
+                        postcondition_proved_by_return_expression_with_assumptions(
+                            postcondition,
+                            raw_body,
+                            &return_expression,
+                            &branch_contracts,
+                            params,
+                            options,
+                        )
+                    })
+            }) {
+                return Some(true);
+            }
+        }
+    }
+
+    complete_branch_seen.then_some(false)
 }
 
 fn semantic_branch_arm_reachable(arm: &SemanticBranchArm, contracts: &[String]) -> bool {
@@ -4458,6 +4504,38 @@ mod tests {
     }
 
     #[test]
+    fn semantic_return_expression_blocks_source_return_fallback() {
+        let metadata = metadata_named_with_classes(
+            "id_i32",
+            "pub fn id_i32(x: i32) -> i32 { 0 }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "id_i32".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert!(matches!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+    }
+
+    #[test]
     fn semantic_field_return_expression_can_prove_postcondition() {
         let account = model_metadata("Account");
         let metadata = metadata_named_with_classes(
@@ -4752,6 +4830,59 @@ mod tests {
     }
 
     #[test]
+    fn semantic_match_blocks_source_return_fallback_when_complete() {
+        let metadata = metadata_named_with_classes(
+            "unwrap_or_zero",
+            "pub fn unwrap_or_zero(x: Option<i32>) -> i32 { match x { Some(v) => v, None => 0 } 0 }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "unwrap_or_zero".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Option<i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: vec![SemanticMatch {
+                scrutinee: "x".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: Some(SemanticMatchPayload {
+                            binding: "v".to_string(),
+                            field_index: 0,
+                            ty: "i32".to_string(),
+                        }),
+                        return_expression: Some("v".to_string()),
+                    },
+                ],
+            }],
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert!(matches!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
+    }
+
+    #[test]
     fn semantic_match_precondition_can_restrict_option_arm() {
         let metadata = metadata_named_with_classes(
             "unwrap_or_zero",
@@ -4848,6 +4979,50 @@ mod tests {
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
         );
+    }
+
+    #[test]
+    fn semantic_branch_blocks_source_return_fallback_when_complete() {
+        let metadata = metadata_named_with_classes(
+            "zero_or_self",
+            "pub fn zero_or_self(x: i32) -> i32 { if x == 0 { 0 } else { x } 0 }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "zero_or_self".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "x == 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x == 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x != 0".to_string(),
+                        return_expression: Some("x".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert!(matches!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
     }
 
     #[test]
