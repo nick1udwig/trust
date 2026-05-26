@@ -793,7 +793,7 @@ fn reject_ambiguous_metadata_paths(metadata: &[TrustMetadata]) -> Result<(), Str
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "duplicate Trust metadata name{} {names}; Trust MVP requires unique total/proof/model names within a crate so HIR/MIR facts map unambiguously",
+        "duplicate Trust metadata path{} {names}; Trust MVP requires unique total/proof/model paths within a crate so HIR/MIR facts map unambiguously",
         plural(duplicates.len())
     ))
 }
@@ -1081,6 +1081,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_duplicate_leaf_names_with_distinct_metadata_paths() {
+        let metadata = vec![
+            metadata_item("total", "left::same"),
+            metadata_item("total", "right::same"),
+        ];
+
+        assert_eq!(reject_ambiguous_metadata_paths(&metadata), Ok(()));
+    }
+
+    #[test]
     fn rejects_duplicate_metadata_paths() {
         let metadata = vec![
             metadata_item("total", "same"),
@@ -1089,7 +1099,7 @@ mod tests {
 
         assert_eq!(
             reject_ambiguous_metadata_paths(&metadata),
-            Err("duplicate Trust metadata name `same`; Trust MVP requires unique total/proof/model names within a crate so HIR/MIR facts map unambiguously".to_string())
+            Err("duplicate Trust metadata path `same`; Trust MVP requires unique total/proof/model paths within a crate so HIR/MIR facts map unambiguously".to_string())
         );
     }
 

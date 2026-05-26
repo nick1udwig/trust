@@ -34,7 +34,8 @@ Still intentionally limited:
   arbitrary Rust calls, arbitrary method calls, iterators, mutation-heavy collection models,
   or user-declared trusted axioms
 - diagnostics are deterministic and tested, but source-span quality is still MVP-level
-- Trust total/proof/model names must be unique within a crate until metadata
+- Trust total functions in distinct verified modules can share a leaf name, but
+  duplicate unresolved proof/model paths are still rejected until all metadata
   records full Rust module paths
 - verification still mostly uses the metadata/token verifier plus default
   HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic

@@ -1,1 +1,1 @@
-error[trust]: could not prove postcondition in `zero`: `out == 1`
+error[trust]: could not prove postcondition in `verified::zero`: `out == 1`

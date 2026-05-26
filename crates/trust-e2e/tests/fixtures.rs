@@ -62,7 +62,7 @@ fn pass_total_identity_writes_hir_mir_semantic_dumps_when_requested() {
     assert!(summary.contains("format=trust-semantic-dump-v1"));
     assert!(summary.contains("rustc_version=rustc-test"));
     assert!(summary.contains("item kind=total"));
-    assert!(summary.contains("path=id_i32"));
+    assert!(summary.contains("path=verified::id_i32"));
     assert!(summary.contains("hir_match=true"));
     assert!(summary.contains("mir_match=true"));
     assert!(summary.contains("mir_function path=id_i32"));
@@ -100,6 +100,40 @@ fn pass_total_identity_can_disable_default_semantic_verification_for_debugging()
 
     output.assert_not_contains("trust: extracted HIR/MIR");
     output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
+fn pass_semantic_duplicate_leaf_names_use_module_qualified_mir_paths() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_duplicate_leaf_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_duplicate_leaf_names",
+        Expected::Pass,
+        &format!("pass_semantic_duplicate_leaf_names_{suffix}"),
+        &format!("pass_semantic_duplicate_leaf_names_{suffix}"),
+        &[("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str)],
+    );
+
+    output.assert_contains("trust: discovered 2 total functions");
+    output.assert_contains("trust: extracted HIR/MIR for 2 total functions");
+    output.assert_contains("trust: proved 2 total functions");
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("path=left::same"));
+    assert!(summary.contains("path=right::same"));
+    assert!(summary.contains("mir_function path=left::same"));
+    assert!(summary.contains("mir_function path=right::same"));
 }
 
 #[test]
@@ -205,28 +239,32 @@ fn pass_loop_countdown_proves_decreases() {
 fn fail_loop_without_spec_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_without_spec", Expected::Fail);
 
-    output.assert_contains("error[trust]: loop in `countdown` requires loop_spec");
+    output.assert_contains("error[trust]: loop in `verified::countdown` requires loop_spec");
 }
 
 #[test]
 fn fail_loop_spec_without_loop_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_spec_without_loop", Expected::Fail);
 
-    output.assert_contains("error[trust]: loop in `id` requires loop_spec");
+    output.assert_contains("error[trust]: loop in `verified::id` requires loop_spec");
 }
 
 #[test]
 fn fail_loop_two_specs_one_loop_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_two_specs_one_loop", Expected::Fail);
 
-    output.assert_contains("error[trust]: multiple loop_spec blocks before loop in `countdown`");
+    output.assert_contains(
+        "error[trust]: multiple loop_spec blocks before loop in `verified::countdown`",
+    );
 }
 
 #[test]
 fn fail_loop_break_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_break", Expected::Fail);
 
-    output.assert_contains("error[trust]: `break` is not supported in loops in `countdown`");
+    output.assert_contains(
+        "error[trust]: `break` is not supported in loops in `verified::countdown`",
+    );
 }
 
 #[test]
@@ -708,7 +746,7 @@ fn fail_multiple_fn_in_total_is_rejected() {
 fn fail_duplicate_trust_names_are_rejected() {
     let output = run_fixture("fail_duplicate_trust_names", Expected::Fail);
 
-    output.assert_contains("error[trust]: duplicate Trust metadata name `same`");
+    output.assert_contains("error[trust]: duplicate Trust metadata path `same`");
 }
 
 #[test]
@@ -762,7 +800,9 @@ fn fail_result_expect_is_rejected_by_wrapper_verifier() {
 fn fail_unknown_method_call_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_unknown_method_call", Expected::Fail);
 
-    output.assert_contains("error[trust]: unsupported function call in `abs_value`: `x.abs`");
+    output.assert_contains(
+        "error[trust]: unsupported function call in `verified::abs_value`: `x.abs`",
+    );
 }
 
 #[test]
@@ -777,35 +817,43 @@ fn fail_semantic_unknown_method_call_is_rejected_by_mir_verifier() {
     );
 
     output.assert_contains("trust: extracted HIR/MIR for 1 total function");
-    output.assert_contains("error[trust]: unsupported function call in `abs_value`: `x.abs`");
+    output.assert_contains(
+        "error[trust]: unsupported function call in `verified::abs_value`: `x.abs`",
+    );
 }
 
 #[test]
 fn fail_trait_dispatch_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_trait_dispatch", Expected::Fail);
 
-    output.assert_contains("error[trust]: unsupported function call in `display`: `x.to_string`");
+    output.assert_contains(
+        "error[trust]: unsupported function call in `verified::display`: `x.to_string`",
+    );
 }
 
 #[test]
 fn fail_ordinary_call_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_ordinary_call", Expected::Fail);
 
-    output.assert_contains("error[trust]: unsupported function call in `call_helper`: `helper`");
+    output.assert_contains(
+        "error[trust]: unsupported function call in `verified::call_helper`: `helper`",
+    );
 }
 
 #[test]
 fn fail_closure_body_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_closure_body", Expected::Fail);
 
-    output.assert_contains("error[trust]: closures are not supported in `apply`");
+    output.assert_contains("error[trust]: closures are not supported in `verified::apply`");
 }
 
 #[test]
 fn fail_recursive_total_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_recursive_total", Expected::Fail);
 
-    output.assert_contains("error[trust]: unsupported function call in `recurse`: `recurse`");
+    output.assert_contains(
+        "error[trust]: unsupported function call in `verified::recurse`: `recurse`",
+    );
 }
 
 #[test]
@@ -820,7 +868,7 @@ fn pass_result_match_builds() {
 fn fail_explicit_panic_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_explicit_panic", Expected::Fail);
 
-    output.assert_contains("error[trust]: explicit panic is not supported in `fail`");
+    output.assert_contains("error[trust]: explicit panic is not supported in `verified::fail`");
 }
 
 #[test]
@@ -940,7 +988,7 @@ fn fail_overflow_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_overflow_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
-    output.assert_contains("--> Trust total `add_one`");
+    output.assert_contains("--> Trust total `verified::add_one`");
     output.assert_contains("x + 1");
     output.assert_contains("help[trust]: add executable preconditions");
 }
@@ -1301,7 +1349,9 @@ fn fail_slice_index_unproved_is_rejected_by_wrapper_verifier() {
 fn fail_vec_index_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_vec_index", Expected::Fail);
 
-    output.assert_contains("error[trust]: unsupported index expression in `get_vec`: `xs[i]`");
+    output.assert_contains(
+        "error[trust]: unsupported index expression in `verified::get_vec`: `xs[i]`",
+    );
 }
 
 #[test]

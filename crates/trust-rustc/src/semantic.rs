@@ -205,7 +205,7 @@ fn semantic_item_matches(
         .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
         .map(|item| {
             let leaf = function_leaf_name(&item.rust_function_path);
-            let mir_function = extract_mir_function_summary(mir, leaf);
+            let mir_function = extract_mir_function_summary(mir, &item.rust_function_path);
             SemanticItemMatch {
                 item_kind: item.item_kind.clone(),
                 item_id: item.item_id.clone(),
@@ -606,9 +606,7 @@ fn hir_contains_function(hir: &str, name: &str) -> bool {
 
 fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSummary> {
     let lines = mir.lines().collect::<Vec<_>>();
-    let signature_idx = lines
-        .iter()
-        .position(|line| mir_signature_matches_leaf(line.trim(), name))?;
+    let signature_idx = mir_function_signature_idx(&lines, name)?;
     let signature = parse_mir_signature(lines[signature_idx].trim())?;
     let function_end = mir_function_end(&lines, signature_idx).unwrap_or(lines.len());
     let function_lines = &lines[signature_idx + 1..function_end];
@@ -623,6 +621,30 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
         terminators: extract_mir_terminators(function_lines),
         return_expr: extract_mir_return_expr(function_lines),
     })
+}
+
+fn mir_function_signature_idx(lines: &[&str], expected_path: &str) -> Option<usize> {
+    if expected_path.contains("::") {
+        if let Some(idx) = lines
+            .iter()
+            .position(|line| mir_signature_matches_qualified_path(line.trim(), expected_path))
+        {
+            return Some(idx);
+        }
+    }
+
+    let leaf = function_leaf_name(expected_path);
+    let mut leaf_matches = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| mir_signature_matches_leaf(line.trim(), leaf))
+        .map(|(idx, _)| idx);
+    let first = leaf_matches.next()?;
+    if leaf_matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
 }
 
 fn mir_function_end(lines: &[&str], signature_idx: usize) -> Option<usize> {
@@ -1254,6 +1276,13 @@ struct MirSignature {
     path: String,
     args: Vec<MirArg>,
     return_type: String,
+}
+
+fn mir_signature_matches_qualified_path(line: &str, expected_path: &str) -> bool {
+    let Some(path) = mir_signature_name(line) else {
+        return false;
+    };
+    path == expected_path || path.ends_with(&format!("::{expected_path}"))
 }
 
 fn mir_signature_matches_leaf(line: &str, name: &str) -> bool {
@@ -2020,6 +2049,66 @@ fn id_i32(_1: i32) -> i32 {
                 terminators: Vec::new(),
                 return_expr: Some("copy _1".to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn extracts_mir_function_summary_by_qualified_suffix() {
+        let mir = r#"
+fn left::same(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+
+fn right::same(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = Add(copy _1, const 1_i32);
+        return;
+    }
+}
+"#;
+
+        assert_eq!(
+            extract_mir_function_summary(mir, "right::same")
+                .expect("right::same summary")
+                .path,
+            "right::same"
+        );
+        assert_eq!(
+            extract_mir_function_summary(mir, "left::same")
+                .expect("left::same summary")
+                .return_expr,
+            Some("copy _1".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_mir_function_summary_by_unique_leaf_when_rustc_omits_module() {
+        let mir = r#"
+fn id_i32(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+"#;
+
+        assert_eq!(
+            extract_mir_function_summary(mir, "verified::id_i32")
+                .expect("verified::id_i32 summary")
+                .path,
+            "id_i32"
         );
     }
 

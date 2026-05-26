@@ -2166,10 +2166,13 @@ fn unsupported_call(
         if allowed_builtin_call(name) {
             continue;
         }
-        if name == function {
+        if function_name_matches_call(function, name) {
             return Some(name.clone());
         }
-        if env.iter().any(|callee| callee.name == *name) {
+        if env
+            .iter()
+            .any(|callee| function_name_matches_call(&callee.name, name))
+        {
             continue;
         }
 
@@ -2294,7 +2297,10 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
             continue;
         }
 
-        let Some(callee) = env.iter().find(|function| function.name == *callee_name) else {
+        let Some(callee) = env
+            .iter()
+            .find(|function| function_name_matches_call(&function.name, callee_name))
+        else {
             idx += 1;
             continue;
         };
@@ -2535,7 +2541,7 @@ fn subtraction_obligation_proved(
             && constant == 1
             && contracts
                 .iter()
-                .any(|contract| contract == &format!("{}>0", obligation.variable))
+                .any(|contract| contract == &normalize(&format!("{}>0", obligation.variable)))
         {
             return true;
         }
@@ -2550,6 +2556,13 @@ fn subtraction_obligation_proved(
     };
     let ge_rhs = format!("{}>={rhs}", obligation.variable);
     let rhs_nonnegative = format!("{rhs}>=0");
+    if rhs == "1"
+        && contracts
+            .iter()
+            .any(|contract| contract == &normalize(&format!("{}>0", obligation.variable)))
+    {
+        return true;
+    }
 
     if z3_proves_conclusion(&ge_rhs, contracts, params, options).is_some_and(|proved| proved)
         && z3_proves_conclusion(&rhs_nonnegative, contracts, params, options)

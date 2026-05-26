@@ -35,6 +35,7 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         sanitize_ident(&module.name),
         short_hash(&source)
     );
+    let item = inject_module_path_markers(&source, &module.name);
     let expanded = format!(
         r###"
         {item}
@@ -43,7 +44,7 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         const {const_name}: &str = r##"{metadata}"##;
         "###,
-        item = source,
+        item = item,
         const_name = const_name,
         metadata = metadata
     );
@@ -65,7 +66,13 @@ pub fn total(input: TokenStream) -> TokenStream {
         Err(message) => return compile_error(message),
     };
 
-    let metadata = metadata_json(&total.fn_info, &source, &total.fn_source, &total.contracts);
+    let metadata = metadata_json(
+        &total.fn_info,
+        total.module_path.as_deref(),
+        &source,
+        &total.fn_source,
+        &total.contracts,
+    );
     if let Err(err) = write_metadata_sidecar(&metadata) {
         return compile_error(&format!(
             "error[trust]: failed to write Trust metadata: {err}"
@@ -287,6 +294,7 @@ struct ModelInfo {
 
 #[derive(Debug)]
 struct TotalExpansion {
+    module_path: Option<String>,
     fn_source: String,
     fn_info: FnInfo,
     contracts: Vec<Contract>,
@@ -433,6 +441,12 @@ fn parse_proof_source(source: &str) -> Result<ProofExpansion, &'static str> {
 
 fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
     let mut rest = source.trim();
+    let module_path = if let Some((module_path, after_marker)) = take_internal_module_path(rest)? {
+        rest = after_marker.trim_start();
+        Some(module_path)
+    } else {
+        None
+    };
     let mut contracts = Vec::new();
 
     while !rest.is_empty() {
@@ -503,10 +517,165 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
     }
 
     Ok(TotalExpansion {
+        module_path,
         fn_source,
         fn_info,
         contracts,
     })
+}
+
+fn take_internal_module_path(input: &str) -> Result<Option<(String, &str)>, &'static str> {
+    let Some(after_marker) = strip_keyword(input, "__trust_module_path") else {
+        return Ok(None);
+    };
+    let mut rest = after_marker.trim_start();
+    let mut path = String::new();
+
+    loop {
+        let Some((segment, after_segment)) = take_ident(rest) else {
+            return Err("error[trust]: malformed internal module path marker");
+        };
+        if !path.is_empty() {
+            path.push_str("::");
+        }
+        path.push_str(segment);
+        rest = after_segment.trim_start();
+
+        if let Some(after_colons) = rest.strip_prefix("::") {
+            rest = after_colons.trim_start();
+            continue;
+        }
+
+        let Some(after_semicolon) = rest.strip_prefix(';') else {
+            return Err("error[trust]: malformed internal module path marker");
+        };
+        return Ok(Some((path, after_semicolon)));
+    }
+}
+
+fn inject_module_path_markers(source: &str, module_path: &str) -> String {
+    let mut output = String::new();
+    let mut remaining = source;
+
+    while let Some((prefix_len, open_brace_end)) = find_trust_macro_open(remaining, "total") {
+        output.push_str(&remaining[..open_brace_end]);
+        output.push_str(" __trust_module_path ");
+        output.push_str(module_path);
+        output.push_str("; ");
+        remaining = &remaining[open_brace_end..];
+        if prefix_len == 0 && open_brace_end == 0 {
+            break;
+        }
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn find_trust_macro_open(input: &str, macro_name: &str) -> Option<(usize, usize)> {
+    for (idx, _) in input.char_indices() {
+        let Some(after_trust) = consume_ident_at(input, idx, "trust") else {
+            continue;
+        };
+        let Some(after_path) = consume_double_colon(input, after_trust) else {
+            continue;
+        };
+        let Some(after_macro) = consume_ident_at(input, after_path, macro_name) else {
+            continue;
+        };
+        let Some(after_bang) = consume_char_at(input, after_macro, '!') else {
+            continue;
+        };
+        let Some(after_open) = consume_char_at(input, after_bang, '{') else {
+            continue;
+        };
+        return Some((idx, after_open));
+    }
+
+    None
+}
+
+fn take_ident(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let mut end = 0;
+    for (idx, ch) in input.char_indices() {
+        if idx == 0 {
+            if !is_ident_start(ch) {
+                return None;
+            }
+            end = ch.len_utf8();
+            continue;
+        }
+        if !is_ident_continue(ch) {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+
+    if end == 0 {
+        None
+    } else {
+        Some((&input[..end], &input[end..]))
+    }
+}
+
+fn consume_ident_at(input: &str, idx: usize, ident: &str) -> Option<usize> {
+    let idx = skip_ws(input, idx);
+    if idx > 0
+        && input[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(is_ident_continue)
+    {
+        return None;
+    }
+    let rest = input.get(idx..)?;
+    let after = rest.strip_prefix(ident)?;
+    if rest[..ident.len()]
+        .chars()
+        .next()
+        .is_some_and(is_ident_start)
+        && after.chars().next().is_none_or(|ch| !is_ident_continue(ch))
+    {
+        Some(idx + ident.len())
+    } else {
+        None
+    }
+}
+
+fn consume_double_colon(input: &str, idx: usize) -> Option<usize> {
+    let idx = skip_ws(input, idx);
+    input.get(idx..)?.strip_prefix("::")?;
+    Some(idx + 2)
+}
+
+fn consume_char_at(input: &str, idx: usize, expected: char) -> Option<usize> {
+    let idx = skip_ws(input, idx);
+    let mut chars = input.get(idx..)?.chars();
+    let ch = chars.next()?;
+    if ch == expected {
+        Some(idx + ch.len_utf8())
+    } else {
+        None
+    }
+}
+
+fn skip_ws(input: &str, mut idx: usize) -> usize {
+    while let Some(ch) = input.get(idx..).and_then(|rest| rest.chars().next()) {
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn inspect_total_fn(input: &str) -> Result<FnInfo, &'static str> {
@@ -950,16 +1119,23 @@ fn render_runtime_assertion(policy: &str, assertion: &str) -> String {
 
 fn metadata_json(
     fn_info: &FnInfo,
+    module_path: Option<&str>,
     source: &str,
     function_source: &str,
     contracts: &[Contract],
 ) -> String {
     let hash = short_hash(source);
+    let module_id = module_path.unwrap_or("unknown");
+    let rust_function_path = module_path
+        .map(|module_path| format!("{module_path}::{}", fn_info.name))
+        .unwrap_or_else(|| fn_info.name.clone());
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"{assertion_policy}\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"{assertion_policy}\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
+        module_id = json_escape(module_id),
         name = json_escape(&fn_info.name),
+        rust_function_path = json_escape(&rust_function_path),
         hash = hash,
         visibility = fn_info.visibility,
         assertion_policy = json_escape(&assertion_policy()),
@@ -1303,6 +1479,35 @@ mod tests {
         assert!(metadata.contains("\"item_kind\":\"module\""));
         assert!(metadata.contains("\"module_id\":\"verified\""));
         assert!(metadata.contains("\"rust_function_path\":\"verified\""));
+    }
+
+    #[test]
+    fn module_injects_path_marker_into_total_macros() {
+        let source = "mod left { trust :: total ! { pub fn same(x : i32) -> i32 { x } } }";
+
+        assert_eq!(
+            inject_module_path_markers(source, "left"),
+            "mod left { trust :: total ! { __trust_module_path left;  pub fn same(x : i32) -> i32 { x } } }"
+        );
+    }
+
+    #[test]
+    fn total_metadata_records_internal_module_path() {
+        let total =
+            parse_total_source("__trust_module_path left; pub fn same(x: i32) -> i32 { x }")
+                .unwrap();
+        let metadata = metadata_json(
+            &total.fn_info,
+            total.module_path.as_deref(),
+            "__trust_module_path left; pub fn same(x: i32) -> i32 { x }",
+            &total.fn_source,
+            &total.contracts,
+        );
+
+        assert_eq!(total.module_path.as_deref(), Some("left"));
+        assert!(metadata.contains("\"module_id\":\"left\""));
+        assert!(metadata.contains("\"rust_function_path\":\"left::same\""));
+        assert!(metadata.contains("\"function_source\":\"pub fn same(x: i32) -> i32 { x }\""));
     }
 
     #[test]
