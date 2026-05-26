@@ -89,6 +89,12 @@ struct MirGuardedEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MirSemanticReturnFact {
+    expression: String,
+    assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelFieldMap {
     ty: String,
     fields: Vec<ModelField>,
@@ -1739,7 +1745,7 @@ impl MirFunctionSummary {
                             semantic_variant_for_discriminant(&scrutinee_type, &target.value)?;
                         let payload =
                             self.semantic_match_payload(&target.block, scrutinee_place, &variant);
-                        let return_expression = self.semantic_return_expression_for_target_block(
+                        let return_fact = self.semantic_return_fact_for_target_block(
                             &target.block,
                             terminator.block.as_deref(),
                             model_fields,
@@ -1748,7 +1754,11 @@ impl MirFunctionSummary {
                             variant,
                             discriminant: target.value,
                             payload,
-                            return_expression,
+                            assumptions: return_fact
+                                .as_ref()
+                                .map(|fact| fact.assumptions.clone())
+                                .unwrap_or_default(),
+                            return_expression: return_fact.map(|fact| fact.expression),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1785,14 +1795,18 @@ impl MirFunctionSummary {
                             &explicit_values,
                             model_fields,
                         )?;
-                        let return_expression = self.semantic_return_expression_for_target_block(
+                        let return_fact = self.semantic_return_fact_for_target_block(
                             &target.block,
                             terminator.block.as_deref(),
                             model_fields,
                         );
                         Some(SemanticBranchArm {
                             guard,
-                            return_expression,
+                            assumptions: return_fact
+                                .as_ref()
+                                .map(|fact| fact.assumptions.clone())
+                                .unwrap_or_default(),
+                            return_expression: return_fact.map(|fact| fact.expression),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1853,58 +1867,70 @@ impl MirFunctionSummary {
         })
     }
 
-    fn semantic_return_expression_for_target_block(
+    fn semantic_return_fact_for_target_block(
         &self,
         block: &str,
         predecessor_block: Option<&str>,
         model_fields: &[ModelFieldMap],
-    ) -> Option<String> {
-        self.semantic_join_return_expression_for_block(block, model_fields)
+    ) -> Option<MirSemanticReturnFact> {
+        self.semantic_join_return_fact_for_block(block, model_fields)
             .or_else(|| {
-                self.semantic_predecessor_join_return_expression_for_block(
+                self.semantic_predecessor_join_return_fact_for_block(
                     block,
                     predecessor_block?,
                     model_fields,
                 )
             })
-            .or_else(|| self.semantic_direct_return_expression_for_block(block, model_fields))
+            .or_else(|| self.semantic_direct_return_fact_for_block(block, model_fields))
     }
 
-    fn semantic_direct_return_expression_for_block(
+    fn semantic_direct_return_fact_for_block(
         &self,
         block: &str,
         model_fields: &[ModelFieldMap],
-    ) -> Option<String> {
-        self.assignments
-            .iter()
-            .find(|assignment| {
-                assignment.block.as_deref() == Some(block) && assignment.place == "_0"
-            })
-            .and_then(|assignment| {
-                self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
-            })
+    ) -> Option<MirSemanticReturnFact> {
+        let assignment = self.assignments.iter().find(|assignment| {
+            assignment.block.as_deref() == Some(block) && assignment.place == "_0"
+        })?;
+        Some(MirSemanticReturnFact {
+            expression: self
+                .normalized_mir_expression_with_models(&assignment.expression, model_fields)?,
+            assumptions: self.guards_for_location(
+                block,
+                Some(assignment.statement_index),
+                model_fields,
+            ),
+        })
     }
 
-    fn semantic_join_return_expression_for_block(
+    fn semantic_join_return_fact_for_block(
         &self,
         block: &str,
         model_fields: &[ModelFieldMap],
-    ) -> Option<String> {
+    ) -> Option<MirSemanticReturnFact> {
         let join_block = self.goto_target_for_block(block)?;
         let return_place = self.return_source_place_for_block(join_block)?;
         let assignment = self.assignments.iter().rev().find(|assignment| {
             assignment.block.as_deref() == Some(block) && assignment.place == return_place
         })?;
 
-        self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
+        Some(MirSemanticReturnFact {
+            expression: self
+                .normalized_mir_expression_with_models(&assignment.expression, model_fields)?,
+            assumptions: self.guards_for_location(
+                block,
+                Some(assignment.statement_index),
+                model_fields,
+            ),
+        })
     }
 
-    fn semantic_predecessor_join_return_expression_for_block(
+    fn semantic_predecessor_join_return_fact_for_block(
         &self,
         block: &str,
         predecessor_block: &str,
         model_fields: &[ModelFieldMap],
-    ) -> Option<String> {
+    ) -> Option<MirSemanticReturnFact> {
         let return_place = self.join_return_source_place_for_block(block)?;
         let terminator = self.terminator_for_block(predecessor_block)?;
         let assignment = self.assignments.iter().rev().find(|assignment| {
@@ -1913,7 +1939,18 @@ impl MirFunctionSummary {
                 && assignment.statement_index < terminator.statement_index
         })?;
 
-        self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
+        Some(MirSemanticReturnFact {
+            expression: self
+                .normalized_mir_expression_with_models(&assignment.expression, model_fields)?,
+            assumptions: self.guards_for_location(
+                block,
+                self.return_statement_index_for_block(block).or_else(|| {
+                    self.terminator_for_block(block)
+                        .map(|terminator| terminator.statement_index)
+                }),
+                model_fields,
+            ),
+        })
     }
 
     fn join_return_source_place_for_block(&self, block: &str) -> Option<&str> {
@@ -1935,6 +1972,15 @@ impl MirFunctionSummary {
         self.terminators
             .iter()
             .find(|terminator| terminator.block.as_deref() == Some(block))
+    }
+
+    fn return_statement_index_for_block(&self, block: &str) -> Option<usize> {
+        self.assignments
+            .iter()
+            .find(|assignment| {
+                assignment.block.as_deref() == Some(block) && assignment.place == "_0"
+            })
+            .map(|assignment| assignment.statement_index)
     }
 
     fn return_source_place_for_block(&self, block: &str) -> Option<&str> {
@@ -2600,6 +2646,24 @@ fn sanitize_file_component(value: &str) -> String {
     }
 }
 
+fn semantic_arm_assumptions_summary(assumptions: &[String]) -> String {
+    if assumptions.is_empty() {
+        String::new()
+    } else {
+        format!("[assume {}]", assumptions.join("&"))
+    }
+}
+
+fn semantic_arm_assumptions_summary_without_guard(arm: &SemanticBranchArm) -> String {
+    let assumptions = arm
+        .assumptions
+        .iter()
+        .filter(|assumption| *assumption != &arm.guard)
+        .cloned()
+        .collect::<Vec<_>>();
+    semantic_arm_assumptions_summary(&assumptions)
+}
+
 fn semantic_summary(
     metadata: &[TrustMetadata],
     rustc_args: &[OsString],
@@ -2724,7 +2788,11 @@ fn semantic_summary(
                                 .unwrap_or_default();
                             let return_expression =
                                 arm.return_expression.as_deref().unwrap_or("none");
-                            format!("{}{}=>{}", arm.variant, payload, return_expression)
+                            let assumptions = semantic_arm_assumptions_summary(&arm.assumptions);
+                            format!(
+                                "{}{}{}=>{}",
+                                arm.variant, payload, assumptions, return_expression
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join("|");
@@ -2742,7 +2810,8 @@ fn semantic_summary(
                         .map(|arm| {
                             let return_expression =
                                 arm.return_expression.as_deref().unwrap_or("none");
-                            format!("{}=>{}", arm.guard, return_expression)
+                            let assumptions = semantic_arm_assumptions_summary_without_guard(arm);
+                            format!("{}{}=>{}", arm.guard, assumptions, return_expression)
                         })
                         .collect::<Vec<_>>()
                         .join("|");
@@ -3194,10 +3263,12 @@ fn zero_if_positive(_1: i32) -> i32 {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x <= 0".to_string(),
+                        assumptions: vec!["x <= 0".to_string()],
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x > 0".to_string(),
+                        assumptions: vec!["x > 0".to_string()],
                         return_expression: Some("1".to_string()),
                     },
                 ],
@@ -3247,10 +3318,12 @@ fn zero_or_self(_1: i32) -> i32 {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x != 0".to_string(),
+                        assumptions: vec!["x != 0".to_string()],
                         return_expression: Some("x".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x == 0".to_string(),
+                        assumptions: vec!["x == 0".to_string()],
                         return_expression: Some("0".to_string()),
                     },
                 ],
@@ -3297,10 +3370,12 @@ fn zero_or_self(_1: i32) -> i32 {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x == 0".to_string(),
+                        assumptions: vec!["x == 0".to_string()],
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x != 0".to_string(),
+                        assumptions: vec!["x != 0".to_string()],
                         return_expression: Some("x".to_string()),
                     },
                 ],
@@ -3344,14 +3419,80 @@ fn zero_or_self(_1: i32) -> i32 {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x == 0".to_string(),
+                        assumptions: vec!["x == 0".to_string()],
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x != 0".to_string(),
+                        assumptions: vec!["x != 0".to_string()],
                         return_expression: Some("x".to_string()),
                     },
                 ],
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_nested_if_branch_path_assumptions() {
+        let mir = r#"
+fn nested_zero_or_self(_1: i32, _2: bool) -> i32 {
+    debug x => _1;
+    debug flag => _2;
+    let mut _0: i32;
+    let mut _3: bool;
+
+    bb0: {
+        _3 = Eq(copy _1, const 0_i32);
+        switchInt(move _3) -> [0: bb4, otherwise: bb1];
+    }
+
+    bb1: {
+        switchInt(copy _2) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb5;
+    }
+
+    bb3: {
+        _0 = const 0_i32;
+        goto -> bb5;
+    }
+
+    bb4: {
+        _0 = copy _1;
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
+        let summary =
+            extract_mir_function_summary(mir, "nested_zero_or_self").expect("MIR summary");
+        let branch = summary
+            .semantic_branches(&[])
+            .into_iter()
+            .find(|branch| branch.condition == "flag")
+            .expect("inner flag branch");
+
+        assert_eq!(
+            branch.arms,
+            vec![
+                SemanticBranchArm {
+                    guard: "flag == 0".to_string(),
+                    assumptions: vec!["x == 0".to_string(), "flag == 0".to_string()],
+                    return_expression: Some("0".to_string()),
+                },
+                SemanticBranchArm {
+                    guard: "flag != 0".to_string(),
+                    assumptions: vec!["x == 0".to_string(), "flag != 0".to_string()],
+                    return_expression: Some("0".to_string()),
+                },
+            ]
         );
     }
 
@@ -3406,6 +3547,7 @@ fn unwrap_or_zero(_1: Option<i32>) -> i32 {
                         variant: "None".to_string(),
                         discriminant: "0".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticMatchArm {
@@ -3416,6 +3558,7 @@ fn unwrap_or_zero(_1: Option<i32>) -> i32 {
                             field_index: 0,
                             ty: "i32".to_string(),
                         }),
+                        assumptions: Vec::new(),
                         return_expression: Some("v".to_string()),
                     },
                 ],
@@ -3478,12 +3621,14 @@ fn unwrap_or_zero(_1: Result<i32, i32>) -> i32 {
                             field_index: 0,
                             ty: "i32".to_string(),
                         }),
+                        assumptions: Vec::new(),
                         return_expression: Some("v".to_string()),
                     },
                     SemanticMatchArm {
                         variant: "Err".to_string(),
                         discriminant: "1".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                 ],

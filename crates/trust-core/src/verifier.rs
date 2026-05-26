@@ -110,6 +110,7 @@ pub struct SemanticMatchArm {
     pub variant: String,
     pub discriminant: String,
     pub payload: Option<SemanticMatchPayload>,
+    pub assumptions: Vec<String>,
     pub return_expression: Option<String>,
 }
 
@@ -129,6 +130,7 @@ pub struct SemanticBranch {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticBranchArm {
     pub guard: String,
+    pub assumptions: Vec<String>,
     pub return_expression: Option<String>,
 }
 
@@ -1287,11 +1289,15 @@ fn semantic_match_proves_postcondition(
                     .as_ref()
                     .is_some_and(|return_expression| {
                         let return_expression = normalize(return_expression);
+                        let arm_contracts = contracts_with_assumptions(
+                            contracts,
+                            &semantic_arm_assumptions(&arm.assumptions),
+                        );
                         postcondition_proved_by_return_expression_with_assumptions(
                             postcondition,
                             raw_body,
                             &return_expression,
-                            contracts,
+                            &arm_contracts,
                             params,
                             options,
                         )
@@ -1328,7 +1334,13 @@ fn semantic_match_arm_reachable(
 ) -> bool {
     !contracts.iter().any(|contract| {
         semantic_variant_excluded_by_contract(&semantic_match.scrutinee, &arm.variant, contract)
-    })
+    }) && semantic_arm_assumptions(&arm.assumptions)
+        .iter()
+        .all(|assumption| {
+            !contracts
+                .iter()
+                .any(|contract| semantic_condition_excluded_by_contract(assumption, contract))
+        })
 }
 
 fn semantic_variant_excluded_by_contract(scrutinee: &str, variant: &str, contract: &str) -> bool {
@@ -1374,8 +1386,10 @@ fn semantic_branch_proves_postcondition(
                     .as_ref()
                     .is_some_and(|return_expression| {
                         let return_expression = normalize(return_expression);
-                        let branch_contracts =
-                            contracts_with_assumptions(contracts, &[normalize(&arm.guard)]);
+                        let branch_contracts = contracts_with_assumptions(
+                            contracts,
+                            &semantic_branch_arm_assumptions(arm),
+                        );
                         postcondition_proved_by_return_expression_with_assumptions(
                             postcondition,
                             raw_body,
@@ -1395,9 +1409,30 @@ fn semantic_branch_proves_postcondition(
 }
 
 fn semantic_branch_arm_reachable(arm: &SemanticBranchArm, contracts: &[String]) -> bool {
-    !contracts
+    semantic_branch_arm_assumptions(arm)
         .iter()
-        .any(|contract| semantic_condition_excluded_by_contract(&arm.guard, contract))
+        .all(|assumption| {
+            !contracts
+                .iter()
+                .any(|contract| semantic_condition_excluded_by_contract(assumption, contract))
+        })
+}
+
+fn semantic_branch_arm_assumptions(arm: &SemanticBranchArm) -> Vec<String> {
+    let mut assumptions = vec![arm.guard.clone()];
+    assumptions.extend(arm.assumptions.iter().cloned());
+    semantic_arm_assumptions(&assumptions)
+}
+
+fn semantic_arm_assumptions(assumptions: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for assumption in assumptions {
+        push_unique(&mut normalized, normalize(assumption));
+        if let Some(reversed) = reversed_condition(assumption) {
+            push_unique(&mut normalized, normalize(&reversed));
+        }
+    }
+    normalized
 }
 
 fn semantic_condition_excluded_by_contract(condition: &str, contract: &str) -> bool {
@@ -6018,10 +6053,12 @@ mod tests {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "n > 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: None,
                     },
                     SemanticBranchArm {
                         guard: "n <= 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: None,
                     },
                 ],
@@ -6874,12 +6911,14 @@ mod tests {
                         variant: "None".to_string(),
                         discriminant: "0".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticMatchArm {
                         variant: "Some".to_string(),
                         discriminant: "1".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                 ],
@@ -6927,6 +6966,7 @@ mod tests {
                         variant: "None".to_string(),
                         discriminant: "0".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticMatchArm {
@@ -6937,6 +6977,7 @@ mod tests {
                             field_index: 0,
                             ty: "i32".to_string(),
                         }),
+                        assumptions: Vec::new(),
                         return_expression: Some("v".to_string()),
                     },
                 ],
@@ -6980,6 +7021,7 @@ mod tests {
                         variant: "None".to_string(),
                         discriminant: "0".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticMatchArm {
@@ -6990,6 +7032,7 @@ mod tests {
                             field_index: 0,
                             ty: "i32".to_string(),
                         }),
+                        assumptions: Vec::new(),
                         return_expression: Some("v".to_string()),
                     },
                 ],
@@ -7034,6 +7077,7 @@ mod tests {
                         variant: "None".to_string(),
                         discriminant: "0".to_string(),
                         payload: None,
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticMatchArm {
@@ -7044,6 +7088,7 @@ mod tests {
                             field_index: 0,
                             ty: "i32".to_string(),
                         }),
+                        assumptions: Vec::new(),
                         return_expression: Some("v".to_string()),
                     },
                 ],
@@ -7085,10 +7130,12 @@ mod tests {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x > 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x <= 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                 ],
@@ -7133,10 +7180,12 @@ mod tests {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x == 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x != 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("x".to_string()),
                     },
                 ],
@@ -7178,10 +7227,12 @@ mod tests {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x == 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x != 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("x".to_string()),
                     },
                 ],
@@ -7222,10 +7273,12 @@ mod tests {
                 arms: vec![
                     SemanticBranchArm {
                         guard: "x == 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("0".to_string()),
                     },
                     SemanticBranchArm {
                         guard: "x != 0".to_string(),
+                        assumptions: Vec::new(),
                         return_expression: Some("x".to_string()),
                     },
                 ],
@@ -7236,6 +7289,58 @@ mod tests {
             verify_total(&metadata),
             Err(VerificationError::PostconditionUnproved { .. })
         ));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_branch_path_assumptions_can_prove_nested_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "nested_zero_or_self",
+            "pub fn nested_zero_or_self(x: i32, flag: bool) -> i32 { if x == 0 { if flag { 0 } else { 0 } } else { x } }",
+            &["out == x"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "nested_zero_or_self".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "flag".to_string(),
+                    ty: "bool".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "flag".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "flag == 0".to_string(),
+                        assumptions: vec!["x == 0".to_string(), "flag == 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "flag != 0".to_string(),
+                        assumptions: vec!["x == 0".to_string(), "flag != 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                ],
+            }],
+        };
+
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
