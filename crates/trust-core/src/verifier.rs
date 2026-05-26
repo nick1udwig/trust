@@ -528,27 +528,28 @@ fn verify_total_with_env(
             function: metadata.rust_function_path.clone(),
         });
     }
-    if let Some(callee) = unsupported_semantic_call(semantics, env, &metadata.rust_function_path) {
-        let callee = unsupported_call(
-            raw_body,
-            &params,
-            &call_env,
-            &metadata.rust_function_path,
-            semantics,
-        )
-        .unwrap_or(callee);
-        return Err(VerificationError::UnsupportedCall {
-            function: metadata.rust_function_path.clone(),
-            callee,
-        });
-    }
-    if let Some(callee) = unsupported_call(
+    let token_unsupported_call = unsupported_call(
         raw_body,
         &params,
         &call_env,
         &metadata.rust_function_path,
         semantics,
-    ) {
+    );
+    if let Some(callee) = unsupported_semantic_call(semantics, env, &metadata.rust_function_path) {
+        let callee = token_unsupported_call.unwrap_or(callee);
+        return Err(VerificationError::UnsupportedCall {
+            function: metadata.rust_function_path.clone(),
+            callee,
+        });
+    }
+    if let Some(callee) = token_unsupported_call {
+        if semantics.is_some() {
+            return Err(VerificationError::SemanticExtractionIncomplete {
+                function: metadata.rust_function_path.clone(),
+                category: "unsupported call".to_string(),
+                expression: callee,
+            });
+        }
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
             callee,
@@ -9350,6 +9351,48 @@ mod tests {
             Err(VerificationError::UnsupportedCall {
                 function: "abs_value".to_string(),
                 callee: "core::num::<impl i32>::abs".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_semantic_unsupported_call_fails_closed() {
+        let metadata = metadata_named(
+            "abs_value",
+            "pub fn abs_value(x: i32) -> i32 { x.abs() }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "abs_value".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedCall {
+                function: "abs_value".to_string(),
+                callee: "x.abs".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "abs_value".to_string(),
+                category: "unsupported call".to_string(),
+                expression: "x.abs".to_string(),
             })
         );
     }
