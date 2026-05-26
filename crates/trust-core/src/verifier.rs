@@ -9,6 +9,7 @@ pub struct TrustFunctionSemantics {
     pub rust_function_path: String,
     pub params: Vec<SemanticParam>,
     pub return_type: String,
+    pub contract_bindings: Vec<SemanticContractBinding>,
     pub return_expression: Option<String>,
     pub arithmetic_operations: Vec<SemanticArithmeticOperation>,
     pub slice_indexes: Vec<SemanticSliceIndex>,
@@ -22,6 +23,21 @@ pub struct TrustFunctionSemantics {
 pub struct SemanticParam {
     pub name: String,
     pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticContractBinding {
+    pub expression: String,
+    pub name: String,
+    pub kind: SemanticContractBindingKind,
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticContractBindingKind {
+    Param,
+    Result,
+    Field,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -792,6 +808,17 @@ fn verification_value_params(
         value_params.push(Param {
             name: field.expression.clone(),
             ty: field.field_type.clone(),
+        });
+    }
+    for binding in &semantics.contract_bindings {
+        if binding.kind != SemanticContractBindingKind::Field
+            || value_params.iter().any(|param| param.name == binding.name)
+        {
+            continue;
+        }
+        value_params.push(Param {
+            name: binding.name.clone(),
+            ty: binding.ty.clone(),
         });
     }
 
@@ -4132,6 +4159,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4167,6 +4195,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("acct.balance".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4197,6 +4226,51 @@ mod tests {
     }
 
     #[test]
+    fn semantic_contract_field_binding_adds_typed_value_param() {
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "reward".to_string(),
+            params: vec![SemanticParam {
+                name: "acct".to_string(),
+                ty: "Account".to_string(),
+            }],
+            return_type: "i64".to_string(),
+            contract_bindings: vec![SemanticContractBinding {
+                expression: "acct.balance < i64::MAX".to_string(),
+                name: "acct.balance".to_string(),
+                kind: SemanticContractBindingKind::Field,
+                ty: "i64".to_string(),
+            }],
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verification_value_params(
+                &[Param {
+                    name: "acct".to_string(),
+                    ty: "Account".to_string(),
+                }],
+                Some(&semantics),
+            ),
+            vec![
+                Param {
+                    name: "acct".to_string(),
+                    ty: "Account".to_string(),
+                },
+                Param {
+                    name: "acct.balance".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn semantic_field_addition_requires_typed_overflow_proof() {
         let account = model_metadata("Account");
         let metadata = metadata_named(
@@ -4211,6 +4285,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("acct.balance + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
@@ -4261,6 +4336,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("acct.balance + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
@@ -4308,6 +4384,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4359,6 +4436,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4410,6 +4488,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4461,6 +4540,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4507,6 +4587,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -4556,6 +4637,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("x + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
@@ -4593,6 +4675,7 @@ mod tests {
             rust_function_path: "overflow".to_string(),
             params: Vec::new(),
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("i32::MAX + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
@@ -4630,6 +4713,7 @@ mod tests {
             rust_function_path: "safe_add".to_string(),
             params: Vec::new(),
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("40 + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
@@ -4663,6 +4747,7 @@ mod tests {
             rust_function_path: "negate".to_string(),
             params: Vec::new(),
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("-i32::MIN".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Neg,
@@ -4703,6 +4788,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Add,
@@ -4749,6 +4835,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("x / y".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
@@ -4795,6 +4882,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("x / y".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
                 kind: SemanticArithmeticKind::Div,
@@ -4837,6 +4925,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("xs[i]".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: vec![SemanticSliceIndex {
@@ -4884,6 +4973,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: vec![SemanticSliceIndex {
@@ -4931,6 +5021,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("xs[i]".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: vec![SemanticSliceIndex {
@@ -4973,6 +5064,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("inc(x)".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -5015,6 +5107,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("verified::inc(x)".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -5061,6 +5154,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),
@@ -5099,6 +5193,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
             slice_indexes: Vec::new(),

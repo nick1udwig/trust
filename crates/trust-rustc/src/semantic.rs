@@ -10,8 +10,9 @@ use trust_core::{
     metadata::TrustMetadata,
     verifier::{
         SemanticArithmeticKind, SemanticArithmeticOperation, SemanticBranch, SemanticBranchArm,
-        SemanticCall, SemanticFieldAccess, SemanticMatch, SemanticMatchArm, SemanticMatchPayload,
-        SemanticParam, SemanticSliceIndex, SemanticTrustCallee, TrustFunctionSemantics,
+        SemanticCall, SemanticContractBinding, SemanticContractBindingKind, SemanticFieldAccess,
+        SemanticMatch, SemanticMatchArm, SemanticMatchPayload, SemanticParam, SemanticSliceIndex,
+        SemanticTrustCallee, TrustFunctionSemantics,
     },
 };
 
@@ -88,21 +89,6 @@ struct ModelFieldMap {
 struct ModelField {
     name: String,
     ty: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ContractBinding {
-    expression: String,
-    name: String,
-    kind: ContractBindingKind,
-    ty: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContractBindingKind {
-    Param,
-    Result,
-    Field,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +233,9 @@ fn verifier_semantics(
         .filter(|item| item.item_kind == "total" && item.hir_match)
         .filter_map(|item| {
             let mir_function = item.mir_function.as_ref()?;
+            let metadata_item = metadata.iter().find(|metadata_item| {
+                metadata_item.item_kind == "total" && metadata_item.item_id == item.item_id
+            })?;
             Some(TrustFunctionSemantics {
                 rust_function_path: item.rust_function_path.clone(),
                 params: mir_function
@@ -261,6 +250,11 @@ fn verifier_semantics(
                     })
                     .collect(),
                 return_type: mir_function.return_type.clone(),
+                contract_bindings: semantic_contract_bindings(
+                    metadata_item,
+                    mir_function,
+                    &model_fields,
+                ),
                 return_expression: mir_function
                     .normalized_return_expression_with_models(&model_fields),
                 arithmetic_operations: mir_function
@@ -319,7 +313,7 @@ fn semantic_contract_bindings(
     item: &TrustMetadata,
     mir_function: &MirFunctionSummary,
     model_fields: &[ModelFieldMap],
-) -> Vec<ContractBinding> {
+) -> Vec<SemanticContractBinding> {
     let params = mir_function
         .args
         .iter()
@@ -362,7 +356,7 @@ fn contract_bindings_for_expression(
     params: &[SemanticParam],
     return_type: &str,
     model_fields: &[ModelFieldMap],
-) -> Vec<ContractBinding> {
+) -> Vec<SemanticContractBinding> {
     let tokens = contract_tokens(expression);
     let mut bindings = Vec::new();
 
@@ -372,10 +366,10 @@ fn contract_bindings_for_expression(
         }
 
         if let Some(param) = params.iter().find(|param| param.name == *token) {
-            bindings.push(ContractBinding {
+            bindings.push(SemanticContractBinding {
                 expression: expression.to_string(),
                 name: param.name.clone(),
-                kind: ContractBindingKind::Param,
+                kind: SemanticContractBindingKind::Param,
                 ty: param.ty.clone(),
             });
             if let Some(field_binding) = contract_field_binding(
@@ -392,10 +386,10 @@ fn contract_bindings_for_expression(
         }
 
         if class.starts_with("gives") && token == "out" {
-            bindings.push(ContractBinding {
+            bindings.push(SemanticContractBinding {
                 expression: expression.to_string(),
                 name: "out".to_string(),
-                kind: ContractBindingKind::Result,
+                kind: SemanticContractBindingKind::Result,
                 ty: return_type.to_string(),
             });
             if let Some(field_binding) =
@@ -416,7 +410,7 @@ fn contract_field_binding(
     base_name: &str,
     base_ty: &str,
     model_fields: &[ModelFieldMap],
-) -> Option<ContractBinding> {
+) -> Option<SemanticContractBinding> {
     if tokens.get(base_idx + 1)? != "." {
         return None;
     }
@@ -432,15 +426,15 @@ fn contract_field_binding(
         .iter()
         .find(|model_field| model_field.name == *field)?;
 
-    Some(ContractBinding {
+    Some(SemanticContractBinding {
         expression: expression.to_string(),
         name: format!("{base_name}.{field}"),
-        kind: ContractBindingKind::Field,
+        kind: SemanticContractBindingKind::Field,
         ty: model_field.ty.clone(),
     })
 }
 
-fn dedup_contract_bindings(bindings: Vec<ContractBinding>) -> Vec<ContractBinding> {
+fn dedup_contract_bindings(bindings: Vec<SemanticContractBinding>) -> Vec<SemanticContractBinding> {
     let mut deduped = Vec::new();
     for binding in bindings {
         if deduped.iter().any(|existing| existing == &binding) {
@@ -451,7 +445,7 @@ fn dedup_contract_bindings(bindings: Vec<ContractBinding>) -> Vec<ContractBindin
     deduped
 }
 
-fn contract_binding_summary(bindings: &[ContractBinding]) -> String {
+fn contract_binding_summary(bindings: &[SemanticContractBinding]) -> String {
     bindings
         .iter()
         .map(|binding| {
@@ -467,11 +461,11 @@ fn contract_binding_summary(bindings: &[ContractBinding]) -> String {
         .join("|")
 }
 
-fn contract_binding_kind_name(kind: ContractBindingKind) -> &'static str {
+fn contract_binding_kind_name(kind: SemanticContractBindingKind) -> &'static str {
     match kind {
-        ContractBindingKind::Param => "param",
-        ContractBindingKind::Result => "result",
-        ContractBindingKind::Field => "field",
+        SemanticContractBindingKind::Param => "param",
+        SemanticContractBindingKind::Result => "result",
+        SemanticContractBindingKind::Field => "field",
     }
 }
 
@@ -2943,46 +2937,46 @@ fn verified::caller(_1: i32) -> i32 {
         assert_eq!(
             semantic_contract_bindings(&item, &mir_function, &model_fields),
             vec![
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "account.balance >= amount".to_string(),
                     name: "account".to_string(),
-                    kind: ContractBindingKind::Param,
+                    kind: SemanticContractBindingKind::Param,
                     ty: "Account".to_string(),
                 },
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "account.balance >= amount".to_string(),
                     name: "account.balance".to_string(),
-                    kind: ContractBindingKind::Field,
+                    kind: SemanticContractBindingKind::Field,
                     ty: "i64".to_string(),
                 },
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "account.balance >= amount".to_string(),
                     name: "amount".to_string(),
-                    kind: ContractBindingKind::Param,
+                    kind: SemanticContractBindingKind::Param,
                     ty: "i64".to_string(),
                 },
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "out.id == account.id".to_string(),
                     name: "out".to_string(),
-                    kind: ContractBindingKind::Result,
+                    kind: SemanticContractBindingKind::Result,
                     ty: "Account".to_string(),
                 },
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "out.id == account.id".to_string(),
                     name: "out.id".to_string(),
-                    kind: ContractBindingKind::Field,
+                    kind: SemanticContractBindingKind::Field,
                     ty: "u64".to_string(),
                 },
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "out.id == account.id".to_string(),
                     name: "account".to_string(),
-                    kind: ContractBindingKind::Param,
+                    kind: SemanticContractBindingKind::Param,
                     ty: "Account".to_string(),
                 },
-                ContractBinding {
+                SemanticContractBinding {
                     expression: "out.id == account.id".to_string(),
                     name: "account.id".to_string(),
-                    kind: ContractBindingKind::Field,
+                    kind: SemanticContractBindingKind::Field,
                     ty: "u64".to_string(),
                 },
             ]
