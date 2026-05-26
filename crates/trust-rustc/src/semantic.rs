@@ -11,7 +11,7 @@ use trust_core::{
     verifier::{
         SemanticArithmeticKind, SemanticArithmeticOperation, SemanticBranch, SemanticBranchArm,
         SemanticCall, SemanticFieldAccess, SemanticMatch, SemanticMatchArm, SemanticMatchPayload,
-        SemanticParam, SemanticSliceIndex, TrustFunctionSemantics,
+        SemanticParam, SemanticSliceIndex, SemanticTrustCallee, TrustFunctionSemantics,
     },
 };
 
@@ -221,6 +221,7 @@ fn verifier_semantics(
     item_matches: &[SemanticItemMatch],
 ) -> Vec<TrustFunctionSemantics> {
     let model_fields = model_field_maps(metadata);
+    let trust_callees = semantic_trust_callees(metadata, item_matches);
     item_matches
         .iter()
         .filter(|item| item.item_kind == "total" && item.hir_match)
@@ -245,13 +246,66 @@ fn verifier_semantics(
                 arithmetic_operations: mir_function
                     .semantic_arithmetic_operations_with_models(&model_fields),
                 slice_indexes: mir_function.semantic_slice_indexes_with_models(&model_fields),
-                calls: mir_function.semantic_calls_with_models(&model_fields),
+                calls: mir_function.semantic_calls_with_models(&model_fields, &trust_callees),
                 field_accesses: mir_function.semantic_field_accesses(&model_fields),
                 matches: mir_function.semantic_matches(&model_fields),
                 branches: mir_function.semantic_branches(&model_fields),
             })
         })
         .collect()
+}
+
+fn semantic_trust_callees(
+    metadata: &[TrustMetadata],
+    item_matches: &[SemanticItemMatch],
+) -> Vec<SemanticTrustCallee> {
+    item_matches
+        .iter()
+        .filter(|item| item.item_kind == "total" && item.hir_match)
+        .filter_map(|item| {
+            let metadata_item = metadata.iter().find(|metadata_item| {
+                metadata_item.item_kind == "total" && metadata_item.item_id == item.item_id
+            })?;
+            let mir_function = item.mir_function.as_ref()?;
+            Some(SemanticTrustCallee {
+                rust_function_path: item.rust_function_path.clone(),
+                params: mir_function
+                    .args
+                    .iter()
+                    .map(|arg| SemanticParam {
+                        name: mir_function
+                            .local_name_for_place(&arg.place)
+                            .unwrap_or(&arg.place)
+                            .to_string(),
+                        ty: arg.ty.clone(),
+                    })
+                    .collect(),
+                preconditions: trust_preconditions(metadata_item),
+            })
+        })
+        .collect()
+}
+
+fn trust_preconditions(item: &TrustMetadata) -> Vec<String> {
+    item.contracts_original
+        .iter()
+        .zip(item.contract_classes.iter())
+        .filter(|(_contract, class)| matches!(class.as_str(), "given executable" | "given ghost"))
+        .map(|(contract, _class)| contract.clone())
+        .collect()
+}
+
+fn trust_callee_for_call(
+    callee: &str,
+    trust_callees: &[SemanticTrustCallee],
+) -> Option<SemanticTrustCallee> {
+    trust_callees
+        .iter()
+        .find(|trust_callee| {
+            trust_callee.rust_function_path == callee
+                || function_leaf_name(callee) == trust_callee.rust_function_path
+        })
+        .cloned()
 }
 
 fn reject_unmatched_total_items(item_matches: &[SemanticItemMatch]) -> Result<(), String> {
@@ -761,16 +815,21 @@ impl MirFunctionSummary {
 
     #[cfg(test)]
     fn semantic_calls(&self) -> Vec<SemanticCall> {
-        self.semantic_calls_with_models(&[])
+        self.semantic_calls_with_models(&[], &[])
     }
 
-    fn semantic_calls_with_models(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticCall> {
+    fn semantic_calls_with_models(
+        &self,
+        model_fields: &[ModelFieldMap],
+        trust_callees: &[SemanticTrustCallee],
+    ) -> Vec<SemanticCall> {
         self.assignments
             .iter()
             .filter_map(|assignment| {
                 let (callee, args) = mir_call(&assignment.expression)?;
                 Some(SemanticCall {
                     callee: callee.to_string(),
+                    trust_callee: trust_callee_for_call(callee, trust_callees),
                     args: args
                         .iter()
                         .map(|arg| self.normalized_mir_expression_with_models(arg, model_fields))
@@ -1519,6 +1578,7 @@ fn semantic_summary(
     rustc_version: &str,
 ) -> String {
     let model_fields = model_field_maps(metadata);
+    let trust_callees = semantic_trust_callees(metadata, item_matches);
     let mut summary = String::new();
     summary.push_str("format=trust-semantic-dump-v1\n");
     summary.push_str(&format!("rustc_version={rustc_version}\n"));
@@ -1575,10 +1635,17 @@ fn semantic_summary(
                 .collect::<Vec<_>>()
                 .join(",");
             let calls = mir_function
-                .semantic_calls_with_models(&model_fields)
+                .semantic_calls_with_models(&model_fields, &trust_callees)
                 .iter()
                 .map(|call| {
-                    let call_expr = format!("{}({})", call.callee, call.args.join(","));
+                    let mut call_expr = format!("{}({})", call.callee, call.args.join(","));
+                    if let Some(trust_callee) = &call.trust_callee {
+                        call_expr.push_str(&format!(
+                            " trust_callee={} preconditions={}",
+                            trust_callee.rust_function_path,
+                            trust_callee.preconditions.join("&")
+                        ));
+                    }
                     if call.guards.is_empty() {
                         call_expr
                     } else {
@@ -2464,6 +2531,44 @@ fn verified::caller(_1: i32) -> i32 {
                 callee: "verified::inc".to_string(),
                 args: vec!["x".to_string()],
                 guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn attaches_trust_callee_contract_metadata_to_call_summary() {
+        let mir = r#"
+fn verified::caller(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = verified::inc(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+        let trust_callee = SemanticTrustCallee {
+            rust_function_path: "inc".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            preconditions: vec!["x < i32::MAX".to_string()],
+        };
+        let summary = extract_mir_function_summary(mir, "caller").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls_with_models(&[], &[trust_callee.clone()]),
+            vec![SemanticCall {
+                callee: "verified::inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: Some(trust_callee),
             }]
         );
     }
@@ -2504,6 +2609,7 @@ fn verified::caller(_1: i32) -> i32 {
                 callee: "verified::inc".to_string(),
                 args: vec!["x".to_string()],
                 guards: vec!["x < i32::MAX".to_string()],
+                trust_callee: None,
             }]
         );
     }

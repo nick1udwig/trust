@@ -60,6 +60,14 @@ pub struct SemanticCall {
     pub callee: String,
     pub args: Vec<String>,
     pub guards: Vec<String>,
+    pub trust_callee: Option<SemanticTrustCallee>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticTrustCallee {
+    pub rust_function_path: String,
+    pub params: Vec<SemanticParam>,
+    pub preconditions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -403,6 +411,7 @@ fn verify_total_with_env(
         .collect::<Vec<_>>();
     contracts.extend(loop_facts.iter().cloned());
     let postcondition_assumptions = contracts_with_assumptions(&given_contracts, &loop_facts);
+    let call_env = verification_call_env(env, semantics);
 
     if contains_unchecked_unwrap(body) {
         return Err(VerificationError::UncheckedUnwrap {
@@ -420,14 +429,14 @@ fn verify_total_with_env(
         });
     }
     if let Some(callee) = unsupported_semantic_call(semantics, env, &metadata.rust_function_path) {
-        let callee =
-            unsupported_call(body, &params, env, &metadata.rust_function_path).unwrap_or(callee);
+        let callee = unsupported_call(body, &params, &call_env, &metadata.rust_function_path)
+            .unwrap_or(callee);
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
             callee,
         });
     }
-    if let Some(callee) = unsupported_call(body, &params, env, &metadata.rust_function_path) {
+    if let Some(callee) = unsupported_call(body, &params, &call_env, &metadata.rust_function_path) {
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
             callee,
@@ -518,7 +527,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_call_obligations(body, env, semantics) {
+    for obligation in verification_call_obligations(body, &call_env, semantics) {
         let contracts = contracts_with_assumptions(&given_contracts, &obligation.assumptions);
         if !callee_precondition_proved(&obligation.condition, &contracts, &value_params, options) {
             return Err(VerificationError::CalleePreconditionUnproved {
@@ -2153,6 +2162,9 @@ fn unsupported_semantic_call(
             if function_name_matches_call(function, &call.callee) {
                 return Some(call.callee.clone());
             }
+            if call.trust_callee.is_some() {
+                return None;
+            }
             if env
                 .iter()
                 .any(|callee| function_name_matches_call(&callee.name, &call.callee))
@@ -2305,9 +2317,7 @@ fn semantic_call_obligations(
         .into_iter()
         .flat_map(|semantics| semantics.calls.iter())
         .filter_map(|call| {
-            let callee = env
-                .iter()
-                .find(|function| function_name_matches_call(&function.name, &call.callee))?;
+            let callee = semantic_call_callee(call, env)?;
             if call.args.len() != callee.params.len() {
                 return None;
             }
@@ -2325,6 +2335,62 @@ fn semantic_call_obligations(
         })
         .flatten()
         .collect()
+}
+
+fn semantic_call_callee(
+    call: &SemanticCall,
+    env: &[TrustFunctionSummary],
+) -> Option<TrustFunctionSummary> {
+    if let Some(callee) = &call.trust_callee {
+        return Some(trust_callee_summary(callee));
+    }
+
+    env.iter()
+        .find(|function| function_name_matches_call(&function.name, &call.callee))
+        .cloned()
+}
+
+fn verification_call_env(
+    env: &[TrustFunctionSummary],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Vec<TrustFunctionSummary> {
+    let mut call_env = env.to_vec();
+
+    for trust_callee in semantics
+        .into_iter()
+        .flat_map(|semantics| semantics.calls.iter())
+        .filter_map(|call| call.trust_callee.as_ref())
+    {
+        let summary = trust_callee_summary(trust_callee);
+        if call_env
+            .iter()
+            .any(|function| function_name_matches_call(&function.name, &summary.name))
+        {
+            continue;
+        }
+        call_env.push(summary);
+    }
+
+    call_env
+}
+
+fn trust_callee_summary(callee: &SemanticTrustCallee) -> TrustFunctionSummary {
+    TrustFunctionSummary {
+        name: callee.rust_function_path.clone(),
+        params: callee
+            .params
+            .iter()
+            .map(|param| Param {
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+            })
+            .collect(),
+        preconditions: callee
+            .preconditions
+            .iter()
+            .map(|precondition| normalize(precondition))
+            .collect(),
+    }
 }
 
 fn function_name_matches_call(function: &str, call: &str) -> bool {
@@ -4914,6 +4980,7 @@ mod tests {
                 callee: "inc".to_string(),
                 args: vec!["x".to_string()],
                 guards: Vec::new(),
+                trust_callee: None,
             }],
             field_accesses: Vec::new(),
             matches: Vec::new(),
@@ -4930,6 +4997,47 @@ mod tests {
                 &[semantics],
                 VerificationOptions::default()
             ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_call_uses_embedded_trust_callee_contract_metadata() {
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(x: i32) -> i32 { verified::inc({ x }) }",
+            &["x < i32::MAX"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "caller".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            return_expression: Some("verified::inc(x)".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "verified::inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: Some(SemanticTrustCallee {
+                    rust_function_path: "inc".to_string(),
+                    params: vec![SemanticParam {
+                        name: "x".to_string(),
+                        ty: "i32".to_string(),
+                    }],
+                    preconditions: vec!["x < i32::MAX".to_string()],
+                }),
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[caller], &[semantics], VerificationOptions::default()),
             Ok(())
         );
     }
@@ -4960,6 +5068,7 @@ mod tests {
                 callee: "inc".to_string(),
                 args: vec!["x".to_string()],
                 guards: vec!["x < i32::MAX".to_string()],
+                trust_callee: None,
             }],
             field_accesses: Vec::new(),
             matches: Vec::new(),
@@ -4997,6 +5106,7 @@ mod tests {
                 callee: "core::num::<impl i32>::abs".to_string(),
                 args: vec!["x".to_string()],
                 guards: Vec::new(),
+                trust_callee: None,
             }],
             field_accesses: Vec::new(),
             matches: Vec::new(),

@@ -1193,16 +1193,36 @@ fn pass_semantic_block_slice_precondition_uses_mir_index_fact() {
 #[test]
 fn pass_semantic_block_call_precondition_uses_mir_call_args() {
     let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_call_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
     let output = run_fixture_with_cache_and_env(
         "pass_semantic_block_call_precondition",
         Expected::Pass,
         &format!("pass_semantic_block_call_precondition_{suffix}"),
         &format!("pass_semantic_block_call_precondition_{suffix}"),
-        &[("TRUST_SEMANTIC_VERIFY", "1")],
+        &[
+            ("TRUST_SEMANTIC_VERIFY", "1"),
+            ("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str),
+        ],
     );
 
     output.assert_contains("trust: extracted HIR/MIR for 2 total functions");
     output.assert_contains("trust: proved 2 total functions");
+
+    let dumps = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries");
+    let summary_path = dumps
+        .iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("trust_callee=inc"));
+    assert!(summary.contains("preconditions=x < i32::MAX"));
 }
 
 #[test]

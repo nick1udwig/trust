@@ -39,10 +39,10 @@ Still intentionally limited:
 - verification still mostly uses the metadata/token verifier plus default
   HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic
   operations with concrete Rust integer types, slice index facts with element and
-  index types, call arguments with simple branch guards,
-  `if` branch return facts, Option/Result match arms, and TrustModel field
-  projections, field types, path guards, and struct returns into verification,
-  but it is not the primary VC generator yet
+  index types, call arguments with simple branch guards and attached Trust
+  callee preconditions, `if` branch return facts, Option/Result match arms, and
+  TrustModel field projections, field types, path guards, and struct returns
+  into verification, but it is not the primary VC generator yet
 
 ## Toolchain
 
@@ -130,9 +130,10 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   By default, Trust extracts HIR/MIR for Trust verification items and feeds
   supported facts, including return expressions, guarded arithmetic operations,
   concrete Rust integer types for arithmetic obligations, guarded slice indexes
-  with element and index types, guarded call arguments, `if` branch return facts,
-  Option/Result match arms, and TrustModel field projections in returns and path
-  guards plus field types for arithmetic obligations, into verification.
+  with element and index types, guarded call arguments with attached Trust
+  callee preconditions, `if` branch return facts, Option/Result match arms, and
+  TrustModel field projections in returns and path guards plus field types for
+  arithmetic obligations, into verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 
