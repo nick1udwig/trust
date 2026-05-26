@@ -1360,11 +1360,16 @@ fn verification_addition_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<AddObligation> {
     let semantic_obligations = semantic_addition_obligations(semantics, params);
-    if semantic_obligations.is_empty() {
-        addition_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        addition_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn semantic_addition_obligations(
@@ -1395,11 +1400,16 @@ fn verification_subtraction_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<SubObligation> {
     let semantic_obligations = semantic_subtraction_obligations(semantics, params);
-    if semantic_obligations.is_empty() {
-        subtraction_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        subtraction_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn semantic_subtraction_obligations(
@@ -1430,11 +1440,16 @@ fn verification_negation_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<NegObligation> {
     let semantic_obligations = semantic_negation_obligations(semantics, params);
-    if semantic_obligations.is_empty() {
-        negation_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        negation_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn semantic_negation_obligations(
@@ -1469,11 +1484,16 @@ fn verification_multiplication_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<MulObligation> {
     let semantic_obligations = semantic_multiplication_obligations(semantics, params);
-    if semantic_obligations.is_empty() {
-        multiplication_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        multiplication_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn semantic_multiplication_obligations(
@@ -1516,11 +1536,16 @@ fn verification_division_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<DenominatorObligation> {
     let semantic_obligations = semantic_division_obligations(semantics);
-    if semantic_obligations.is_empty() {
-        division_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        division_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn verification_remainder_obligations(
@@ -1529,11 +1554,16 @@ fn verification_remainder_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<DenominatorObligation> {
     let semantic_obligations = semantic_remainder_obligations(semantics);
-    if semantic_obligations.is_empty() {
-        remainder_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        remainder_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn semantic_arithmetic_operations(
@@ -1791,7 +1821,7 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
             continue;
         }
 
-        let index = token_expression(&tokens[idx + 2..end]);
+        let index = simple_grouped_value_expression(&tokens[idx + 2..end]);
         obligations.push(SliceIndexObligation {
             base: base.clone(),
             index: index.clone(),
@@ -1810,11 +1840,16 @@ fn verification_slice_index_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<SliceIndexObligation> {
     let semantic_obligations = semantic_slice_index_obligations(semantics);
-    if semantic_obligations.is_empty() {
-        slice_index_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        slice_index_obligations(body, params),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
 }
 
 fn semantic_slice_index_obligations(
@@ -1894,12 +1929,11 @@ fn verification_field_access_obligations(
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<FieldAccessObligation> {
-    let semantic_obligations = semantic_field_access_obligations(semantics);
-    if semantic_obligations.is_empty() {
-        field_access_obligations(body, params)
-    } else {
-        semantic_obligations
-    }
+    extend_unique_by(
+        semantic_field_access_obligations(semantics),
+        field_access_obligations(body, params),
+        |existing, fallback| existing.ty == fallback.ty,
+    )
 }
 
 fn semantic_field_access_obligations(
@@ -2316,7 +2350,7 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
 
         let args = split_arguments(&tokens[idx + 2..end])
             .iter()
-            .map(|tokens| token_expression(tokens))
+            .map(|tokens| simple_grouped_value_expression(tokens))
             .collect::<Vec<_>>();
         if args.len() == callee.params.len() {
             for precondition in &callee.preconditions {
@@ -2332,6 +2366,17 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
     }
 
     obligations
+}
+
+fn simple_grouped_value_expression(tokens: &[String]) -> String {
+    if tokens.len() == 3
+        && ((tokens[0] == "{" && tokens[2] == "}") || (tokens[0] == "(" && tokens[2] == ")"))
+        && is_value_operand(&tokens[1])
+    {
+        return tokens[1].clone();
+    }
+
+    token_expression(tokens)
 }
 
 fn verification_call_obligations(
@@ -2466,6 +2511,42 @@ fn contracts_with_assumptions(contracts: &[String], assumptions: &[String]) -> V
     let mut combined = contracts.to_vec();
     combined.extend(assumptions.iter().cloned());
     combined
+}
+
+fn extend_unique_by<T>(
+    mut primary: Vec<T>,
+    fallback: Vec<T>,
+    same_obligation: impl Fn(&T, &T) -> bool,
+) -> Vec<T> {
+    for obligation in fallback {
+        if primary
+            .iter()
+            .any(|existing| same_obligation(existing, &obligation))
+        {
+            continue;
+        }
+        primary.push(obligation);
+    }
+
+    primary
+}
+
+fn mergeable_token_fallback_obligations<T>(
+    semantic_obligations: &[T],
+    fallback_obligations: Vec<T>,
+    expression: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    if semantic_obligations.is_empty() {
+        return fallback_obligations;
+    }
+
+    fallback_obligations
+        .into_iter()
+        .filter(|obligation| {
+            let expression = expression(obligation);
+            !expression.contains('{') && !expression.contains('}')
+        })
+        .collect()
 }
 
 fn addition_obligation_proved(
@@ -4748,6 +4829,52 @@ mod tests {
     }
 
     #[test]
+    fn partial_semantic_arithmetic_does_not_suppress_token_obligations() {
+        let metadata = metadata_named(
+            "add_both",
+            "pub fn add_both(x: i32, y: i32) -> i32 { let _a = x + 1; y + 1 }",
+            &["x < i32::MAX"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "add_both".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "y".to_string(),
+                    ty: "i32".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("y + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add_both".to_string(),
+                expression: "y + 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn semantic_arithmetic_uses_mir_type_for_constant_addition_overflow() {
         let metadata = metadata_named(
             "overflow",
@@ -4992,7 +5119,7 @@ mod tests {
     fn semantic_slice_index_proves_block_index_precondition() {
         let metadata = metadata_named(
             "get",
-            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[{ i }] }",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[{ let j = i; j }] }",
             &["i < xs.len()"],
         );
         let semantics = TrustFunctionSemantics {
@@ -5033,6 +5160,57 @@ mod tests {
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn partial_semantic_slice_indexes_do_not_suppress_token_obligations() {
+        let metadata = metadata_named(
+            "get_second",
+            "pub fn get_second(xs: &[i32], i: usize, j: usize) -> i32 { let _a = xs[i]; xs[j] }",
+            &["i < xs.len()"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get_second".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "&[i32]".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+                SemanticParam {
+                    name: "j".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("xs[j]".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
+                index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "i32".to_string(),
+                expression: "xs[i]".to_string(),
+                guards: Vec::new(),
+            }],
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SliceIndexOutOfBounds {
+                function: "get_second".to_string(),
+                expression: "xs[j]".to_string(),
+            })
         );
     }
 
@@ -5088,7 +5266,7 @@ mod tests {
     fn semantic_slice_index_requires_matching_element_type() {
         let metadata = metadata_named(
             "get",
-            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[{ i }] }",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[{ let j = i; j }] }",
             &["i < xs.len()"],
         );
         let semantics = TrustFunctionSemantics {
@@ -5137,7 +5315,7 @@ mod tests {
         );
         let caller = metadata_named(
             "caller",
-            "pub fn caller(x: i32) -> i32 { inc({ x }) }",
+            "pub fn caller(x: i32) -> i32 { inc({ let y = x; y }) }",
             &["x < i32::MAX"],
         );
         let semantics = TrustFunctionSemantics {
