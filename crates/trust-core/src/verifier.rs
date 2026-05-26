@@ -499,7 +499,16 @@ fn verify_total_with_env(
         &value_params,
         options,
     )?;
-    let loop_postcondition_facts = loop_postcondition_facts(&loop_facts);
+    if !postconditions(metadata).is_empty() {
+        if let Some(expression) = semantic_loop_exit_extraction_gap(&loop_facts, semantics) {
+            return Err(VerificationError::SemanticExtractionIncomplete {
+                function: metadata.rust_function_path.clone(),
+                category: "loop exit".to_string(),
+                expression,
+            });
+        }
+    }
+    let loop_postcondition_facts = loop_postcondition_facts(&loop_facts, semantics.is_some());
     let postcondition_assumptions =
         contracts_with_assumptions(&given_contracts, &loop_postcondition_facts);
     let call_env = verification_call_env(env, semantics);
@@ -1306,6 +1315,7 @@ fn postcondition_proved(
         contracts,
         params,
         options,
+        semantics.is_none(),
     );
     if fallback_proved && semantics.is_some() {
         return PostconditionProof::SemanticExtractionIncomplete {
@@ -1332,6 +1342,7 @@ fn semantic_return_proves_postcondition(
             contracts,
             params,
             options,
+            false,
         )
     })
 }
@@ -1382,6 +1393,7 @@ fn semantic_match_proves_postcondition(
                             &arm_contracts,
                             params,
                             options,
+                            false,
                         )
                     })
             }) {
@@ -1479,6 +1491,7 @@ fn semantic_branch_proves_postcondition(
                             &branch_contracts,
                             params,
                             options,
+                            false,
                         )
                     })
             }) {
@@ -1598,6 +1611,7 @@ fn postcondition_proved_by_return_expression(
     postcondition: &Contract,
     raw_body: &str,
     return_expression: &str,
+    allow_token_loop_exit: bool,
 ) -> bool {
     let Some((left, right)) = postcondition.normalized.split_once("==") else {
         return false;
@@ -1605,8 +1619,12 @@ fn postcondition_proved_by_return_expression(
 
     (left == "out" && right == return_expression)
         || (right == "out" && left == return_expression)
-        || (left == "out" && loop_exit_proves_value(raw_body, &return_expression, right))
-        || (right == "out" && loop_exit_proves_value(raw_body, &return_expression, left))
+        || (allow_token_loop_exit
+            && left == "out"
+            && loop_exit_proves_value(raw_body, &return_expression, right))
+        || (allow_token_loop_exit
+            && right == "out"
+            && loop_exit_proves_value(raw_body, &return_expression, left))
         || output_field_equals_return_field(left, right, &return_expression)
         || output_field_equals_return_field(right, left, &return_expression)
 }
@@ -1618,8 +1636,14 @@ fn postcondition_proved_by_return_expression_with_assumptions(
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
+    allow_token_loop_exit: bool,
 ) -> bool {
-    if postcondition_proved_by_return_expression(postcondition, raw_body, return_expression) {
+    if postcondition_proved_by_return_expression(
+        postcondition,
+        raw_body,
+        return_expression,
+        allow_token_loop_exit,
+    ) {
         return true;
     }
     if postcondition_proved_by_assumptions(postcondition, return_expression, contracts, params) {
@@ -3641,15 +3665,17 @@ fn reversed_condition(condition: &str) -> Option<String> {
     None
 }
 
-fn loop_postcondition_facts(facts: &[LoopFact]) -> Vec<String> {
+fn loop_postcondition_facts(facts: &[LoopFact], semantic_available: bool) -> Vec<String> {
     let mut postcondition_facts = Vec::new();
 
     for fact in facts {
         for invariant in &fact.invariants {
             push_unique(&mut postcondition_facts, canonical_condition(invariant));
         }
-        if let Some(exit_fact) = loop_exit_fact(&fact.condition) {
-            push_unique(&mut postcondition_facts, exit_fact);
+        if !semantic_available {
+            if let Some(exit_fact) = loop_exit_fact(&fact.condition) {
+                push_unique(&mut postcondition_facts, exit_fact);
+            }
         }
         for exit_fact in &fact.semantic_exit_facts {
             push_unique(&mut postcondition_facts, canonical_condition(exit_fact));
@@ -3681,6 +3707,20 @@ fn semantic_loop_exit_facts(
     }
 
     facts
+}
+
+fn semantic_loop_exit_extraction_gap(
+    facts: &[LoopFact],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
+    semantics?;
+
+    facts
+        .iter()
+        .find(|fact| {
+            loop_exit_fact(&fact.condition).is_some() && fact.semantic_exit_facts.is_empty()
+        })
+        .map(|fact| fact.condition.clone())
 }
 
 fn loop_exit_fact(condition: &str) -> Option<String> {
@@ -5635,7 +5675,21 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
-            branches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "n > 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "n > 0".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                    SemanticBranchArm {
+                        guard: "n <= 0".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                ],
+            }],
         };
 
         assert_eq!(
@@ -6480,7 +6534,21 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
-            branches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "n > 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "n > 0".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                    SemanticBranchArm {
+                        guard: "n <= 0".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                ],
+            }],
         };
 
         assert_eq!(
@@ -6497,10 +6565,10 @@ mod tests {
     }
 
     #[test]
-    fn loop_exit_assumption_proves_unsigned_zero_postcondition() {
+    fn partial_semantic_loop_exit_fails_closed() {
         let metadata = metadata_named_with_classes(
             "countdown",
-            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while 0 < n { n -= 1; } n }",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { n -= 1; } n }",
             &["out == 0"],
             &["gives executable"],
         );
@@ -6521,7 +6589,7 @@ mod tests {
                 left: "n".to_string(),
                 right: Some("1".to_string()),
                 expression: "n - 1".to_string(),
-                guards: vec!["0 < n".to_string()],
+                guards: vec!["n > 0".to_string()],
             }],
             slice_indexes: Vec::new(),
             calls: Vec::new(),
@@ -6532,7 +6600,11 @@ mod tests {
 
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
-            Ok(())
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "countdown".to_string(),
+                category: "loop exit".to_string(),
+                expression: "n>0".to_string(),
+            })
         );
     }
 
@@ -6642,7 +6714,21 @@ mod tests {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             matches: Vec::new(),
-            branches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "i > 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "i > 0".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                    SemanticBranchArm {
+                        guard: "i <= 0".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                ],
+            }],
         };
 
         assert_eq!(

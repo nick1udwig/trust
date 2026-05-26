@@ -26,9 +26,9 @@ Implemented:
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
 - cfg-aware source-token fallback for supported `#[cfg]` predicates, aligned with
   the rustc-selected body used by HIR/MIR extraction
-- MIR-backed arithmetic, slice-index, Trust-call, field-access, and return
-  postcondition VCs when semantic extraction is available, with fail-closed
-  diagnostics for token-only gaps
+- MIR-backed arithmetic, slice-index, Trust-call, field-access, loop-exit, and
+  return postcondition VCs when semantic extraction is available, with
+  fail-closed diagnostics for token-only gaps
 - runtime public precondition assertions
 - MVP checks for `i32`, `i64`, `u32`, `u64`, and `usize` integer overflow,
   signed division/remainder overflow, division and remainder by zero, slice bounds,
@@ -64,8 +64,9 @@ Still intentionally limited:
   signature/source-local type checks, opaque contract-reasoning checks, path
   guards, and struct returns into verification; cfg-disabled source is pruned
   from token fallback for supported predicates, and arithmetic, slice-index,
-  Trust-call, field-access, and return-postcondition VCs are generated from MIR
-  facts when available, but HIR/MIR is not the primary VC generator yet
+  Trust-call, field-access, loop-exit, and return-postcondition VCs are
+  generated from MIR facts when available, but HIR/MIR is not the primary VC
+  generator yet
 
 ## Toolchain
 
@@ -169,9 +170,10 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   shift/bitwise/cast-operation, signature/source-local type checks, and opaque
   contract-reasoning checks, into verification. Source-token fallback prunes
   cfg-disabled body fragments for supported `#[cfg]` predicates. Arithmetic,
-  slice-index, Trust-call, field-access, and return-postcondition VCs come from
-  MIR facts when semantic extraction is available; token-only obligations or
-  proofs in those categories fail closed as incomplete semantic extraction.
+  slice-index, Trust-call, field-access, loop-exit, and return-postcondition VCs
+  come from MIR facts when semantic extraction is available; token-only
+  obligations or proofs in those categories fail closed as incomplete semantic
+  extraction.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 
