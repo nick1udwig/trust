@@ -3567,6 +3567,79 @@ fn unwrap_or_zero(_1: Option<i32>) -> i32 {
     }
 
     #[test]
+    fn extracts_nested_match_path_assumptions() {
+        let mir = r#"
+fn nested_match_zero_or_self(_1: i32, _2: Option<i32>) -> i32 {
+    debug x => _1;
+    debug choice => _2;
+    let mut _0: i32;
+    let mut _3: bool;
+    let mut _4: isize;
+
+    bb0: {
+        _3 = Eq(copy _1, const 0_i32);
+        switchInt(move _3) -> [0: bb4, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = discriminant(_2);
+        switchInt(move _4) -> [0: bb2, 1: bb3, otherwise: bb5];
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb6;
+    }
+
+    bb3: {
+        _0 = const 0_i32;
+        goto -> bb6;
+    }
+
+    bb4: {
+        _0 = copy _1;
+        goto -> bb6;
+    }
+
+    bb5: {
+        unreachable;
+    }
+
+    bb6: {
+        return;
+    }
+}
+"#;
+
+        let summary =
+            extract_mir_function_summary(mir, "nested_match_zero_or_self").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_matches(&[]),
+            vec![SemanticMatch {
+                scrutinee: "choice".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        assumptions: vec!["x == 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: None,
+                        assumptions: vec!["x == 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
     fn extracts_result_match_variants_and_payload() {
         let mir = r#"
 fn unwrap_or_zero(_1: Result<i32, i32>) -> i32 {

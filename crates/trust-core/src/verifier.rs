@@ -7103,6 +7103,63 @@ mod tests {
     }
 
     #[test]
+    fn semantic_match_path_assumptions_can_prove_nested_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "nested_match_zero_or_self",
+            "pub fn nested_match_zero_or_self(x: i32, choice: Option<i32>) -> i32 { if x == 0 { match choice { Some(_) => 0, None => 0 } } else { x } }",
+            &["out == x"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "nested_match_zero_or_self".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "choice".to_string(),
+                    ty: "Option<i32>".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: vec![SemanticMatch {
+                scrutinee: "choice".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        assumptions: vec!["x == 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: None,
+                        assumptions: vec!["x == 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                ],
+            }],
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn semantic_branch_arms_can_prove_postcondition() {
         let metadata = metadata_named_with_classes(
             "zero_for_any_i32",
