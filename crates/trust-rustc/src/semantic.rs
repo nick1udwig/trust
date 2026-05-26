@@ -204,7 +204,6 @@ fn semantic_item_matches(
         .iter()
         .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
         .map(|item| {
-            let leaf = function_leaf_name(&item.rust_function_path);
             let mir_function = extract_mir_function_summary(mir, &item.rust_function_path);
             SemanticItemMatch {
                 item_kind: item.item_kind.clone(),
@@ -214,7 +213,7 @@ fn semantic_item_matches(
                     .as_ref()
                     .map(|mir_function| mir_function.path.clone()),
                 source_span: item.source_span.clone(),
-                hir_match: hir_contains_function(hir, leaf),
+                hir_match: hir_contains_function(hir, &item.rust_function_path),
                 mir_match: mir_function.is_some(),
                 mir_function,
             }
@@ -605,8 +604,39 @@ fn type_name_tail(ty: &str) -> String {
         .to_string()
 }
 
-fn hir_contains_function(hir: &str, name: &str) -> bool {
-    hir.contains(&format!("ident: {name}#"))
+fn hir_contains_function(hir: &str, expected_path: &str) -> bool {
+    let matches = hir
+        .lines()
+        .filter_map(hir_owner_path)
+        .filter(|path| hir_function_path_matches(path, expected_path))
+        .collect::<Vec<_>>();
+
+    if expected_path.contains("::") {
+        !matches.is_empty()
+    } else {
+        matches.len() == 1
+    }
+}
+
+fn hir_owner_path(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if !line.starts_with("DefId(") || !line.contains("=> OwnerNodes") {
+        return None;
+    }
+
+    let (_prefix, rest) = line.split_once(" ~ ")?;
+    let (path, _suffix) = rest.split_once(") => OwnerNodes")?;
+    Some(path.trim())
+}
+
+fn hir_function_path_matches(path: &str, expected_path: &str) -> bool {
+    if expected_path.contains("::") {
+        path == expected_path
+            || path.ends_with(&format!("::{expected_path}"))
+            || expected_path.ends_with(&format!("::{path}"))
+    } else {
+        function_leaf_name(path) == expected_path
+    }
 }
 
 fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSummary> {
@@ -2028,6 +2058,51 @@ fn write_semantic_dump(path: &PathBuf, contents: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hir_function_match_uses_qualified_owner_path() {
+        let hir = r#"
+DefId(0:0 ~ sample[abcd]) => OwnerNodes {
+}
+DefId(0:1 ~ sample[abcd]::left::same) => OwnerNodes {
+}
+DefId(0:2 ~ sample[abcd]::right::same) => OwnerNodes {
+}
+"#;
+
+        assert!(hir_contains_function(hir, "left::same"));
+        assert!(hir_contains_function(hir, "right::same"));
+        assert!(!hir_contains_function(hir, "other::same"));
+    }
+
+    #[test]
+    fn hir_function_match_requires_unique_unqualified_leaf() {
+        let duplicate_hir = r#"
+DefId(0:1 ~ sample[abcd]::left::same) => OwnerNodes {
+}
+DefId(0:2 ~ sample[abcd]::right::same) => OwnerNodes {
+}
+"#;
+        let unique_hir = r#"
+DefId(0:1 ~ sample[abcd]::only::same) => OwnerNodes {
+}
+"#;
+
+        assert!(!hir_contains_function(duplicate_hir, "same"));
+        assert!(hir_contains_function(unique_hir, "same"));
+    }
+
+    #[test]
+    fn hir_function_match_ignores_metadata_string_payloads() {
+        let hir = r#"
+DefId(0:1 ~ sample[abcd]::__TRUST_META_same_1234) => OwnerNodes {
+    "{\"rust_function_path\":\"left::same\",\"function_source\":\"pub fn same(x: i32) -> i32 { x }\"}",
+}
+"#;
+
+        assert!(!hir_contains_function(hir, "left::same"));
+        assert!(!hir_contains_function(hir, "same"));
+    }
 
     #[test]
     fn extracts_mir_function_summary() {
