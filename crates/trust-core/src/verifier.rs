@@ -2195,10 +2195,7 @@ fn unsupported_semantic_call(
             if call.trust_callee.is_some() {
                 return None;
             }
-            if env
-                .iter()
-                .any(|callee| function_name_matches_call(&callee.name, &call.callee))
-            {
+            if unique_semantic_function_for_call(env, &call.callee).is_some() {
                 return None;
             }
             if allowed_builtin_call(function_leaf_name(&call.callee)) {
@@ -2378,9 +2375,29 @@ fn semantic_call_callee(
         return Some(trust_callee_summary(callee));
     }
 
-    env.iter()
-        .find(|function| function_name_matches_call(&function.name, &call.callee))
-        .cloned()
+    unique_semantic_function_for_call(env, &call.callee)
+}
+
+fn unique_semantic_function_for_call(
+    env: &[TrustFunctionSummary],
+    call: &str,
+) -> Option<TrustFunctionSummary> {
+    let mut matches = env
+        .iter()
+        .filter(|function| semantic_function_name_matches_call(&function.name, call))
+        .cloned();
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn semantic_function_name_matches_call(function: &str, call: &str) -> bool {
+    function == call
+        || function.ends_with(&format!("::{call}"))
+        || call.ends_with(&format!("::{function}"))
 }
 
 fn verification_call_env(

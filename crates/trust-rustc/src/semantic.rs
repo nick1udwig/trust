@@ -513,15 +513,20 @@ fn trust_callee_for_call(
     callee: &str,
     trust_callees: &[SemanticTrustCallee],
 ) -> Option<SemanticTrustCallee> {
-    trust_callees
+    let mut matches = trust_callees
         .iter()
-        .find(|trust_callee| {
-            trust_callee.rust_function_path == callee
-                || function_leaf_name(callee) == trust_callee.rust_function_path
-                || function_leaf_name(callee)
-                    == function_leaf_name(&trust_callee.rust_function_path)
-        })
-        .cloned()
+        .filter(|trust_callee| semantic_path_matches_call(&trust_callee.rust_function_path, callee))
+        .cloned();
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn semantic_path_matches_call(path: &str, call: &str) -> bool {
+    path == call || path.ends_with(&format!("::{call}")) || call.ends_with(&format!("::{path}"))
 }
 
 fn reject_unmatched_total_items(item_matches: &[SemanticItemMatch]) -> Result<(), String> {
@@ -2938,6 +2943,52 @@ fn verified::caller(_1: i32) -> i32 {
                 args: vec!["x".to_string()],
                 guards: Vec::new(),
                 trust_callee: Some(trust_callee),
+            }]
+        );
+    }
+
+    #[test]
+    fn trust_callee_metadata_uses_unique_mir_path_suffix() {
+        let mir = r#"
+fn left::caller(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = left::inc(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+        let left_callee = SemanticTrustCallee {
+            rust_function_path: "outer::left::inc".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            preconditions: vec!["x > 0".to_string()],
+        };
+        let right_callee = SemanticTrustCallee {
+            rust_function_path: "outer::right::inc".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            preconditions: vec!["x < 0".to_string()],
+        };
+        let summary = extract_mir_function_summary(mir, "outer::left::caller")
+            .expect("outer::left::caller summary");
+
+        assert_eq!(
+            summary.semantic_calls_with_models(&[], &[left_callee.clone(), right_callee]),
+            vec![SemanticCall {
+                callee: "left::inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: Some(left_callee),
             }]
         );
     }
