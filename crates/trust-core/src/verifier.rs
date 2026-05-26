@@ -467,6 +467,13 @@ fn verify_total_with_env(
     }
 
     let source = normalize(&metadata.function_source);
+    if let Some(expression) = semantic_parameter_extraction_gap(&source, semantics) {
+        return Err(VerificationError::SemanticExtractionIncomplete {
+            function: metadata.rust_function_path.clone(),
+            category: "function parameter".to_string(),
+            expression,
+        });
+    }
     let contracts = executable_preconditions(metadata);
     let given_contracts = given_preconditions(metadata);
     let params = verification_params(&source, semantics);
@@ -1022,6 +1029,27 @@ fn verification_params(source: &str, semantics: Option<&TrustFunctionSemantics>)
     } else {
         semantic_params
     }
+}
+
+fn semantic_parameter_extraction_gap(
+    source: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
+    let semantics = semantics?;
+    let source_params = parse_params(source);
+    if source_params.is_empty() {
+        return None;
+    }
+
+    source_params
+        .into_iter()
+        .find(|param| {
+            !semantics
+                .params
+                .iter()
+                .any(|semantic_param| semantic_param.name == param.name)
+        })
+        .map(|param| param.name)
 }
 
 fn verification_return_type(source: &str, semantics: Option<&TrustFunctionSemantics>) -> String {
@@ -6503,6 +6531,35 @@ mod tests {
             Err(VerificationError::UnsupportedType {
                 function: "keep".to_string(),
                 ty: "f32".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_semantic_parameters_fail_closed() {
+        let metadata = metadata_named("id_i32", "pub fn id_i32(x: i32) -> i32 { x }", &[]);
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "id_i32".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "id_i32".to_string(),
+                category: "function parameter".to_string(),
+                expression: "x".to_string(),
             })
         );
     }
