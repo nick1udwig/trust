@@ -504,7 +504,7 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
             } else {
                 return Err("error[trust]: `gives` must be `gives executable` or `gives ghost`");
             };
-        let Some((_binder, after_binder)) = extract_pipe_binder(after_kind.trim_start()) else {
+        let Some((binder, after_binder)) = extract_pipe_binder(after_kind.trim_start()) else {
             return Err("error[trust]: `gives` requires a result binder like `|out|`");
         };
         let Some((block, after_block)) = extract_braced(after_binder.trim_start()) else {
@@ -512,10 +512,12 @@ fn parse_total_source(source: &str) -> Result<TotalExpansion, &'static str> {
         };
 
         for expression in split_contract_expressions(block) {
+            let expression_display = normalize_contract_display(&expression);
+            let expression_code = replace_contract_ident(&expression, binder, "out");
             contracts.push(Contract {
                 class,
-                expression_display: normalize_contract_display(&expression),
-                expression_code: expression,
+                expression_display,
+                expression_code,
             });
         }
         rest = after_block.trim_start();
@@ -1520,7 +1522,7 @@ fn metadata_json(
         contracts_normalized = json_string_array(
             contracts
                 .iter()
-                .map(|contract| contract.expression_display.as_str())
+                .map(|contract| contract.expression_code.as_str())
         ),
         contract_classes = json_string_array(contracts.iter().map(|contract| contract.class)),
         loop_specs = json_string_array(loop_specs.iter().map(String::as_str)),
@@ -1625,7 +1627,7 @@ fn proof_metadata_json(proof: &ProofExpansion, source: &str) -> String {
             proof
                 .contracts
                 .iter()
-                .map(|contract| contract.expression_display.as_str())
+                .map(|contract| contract.expression_code.as_str())
         ),
         contract_classes = json_string_array(proof.contracts.iter().map(|contract| contract.class)),
     )
@@ -1707,11 +1709,15 @@ fn normalize_contract_display(expression: &str) -> String {
 }
 
 fn replace_result_binder(expression: &str) -> String {
+    replace_contract_ident(expression, "out", "__trust_out")
+}
+
+fn replace_contract_ident(expression: &str, from: &str, to: &str) -> String {
     let tokens = lex(expression);
     let mut out = String::new();
     for token in tokens {
         match token {
-            LexToken::Ident(ident) if ident == "out" => out.push_str("__trust_out"),
+            LexToken::Ident(ident) if ident == from => out.push_str(to),
             LexToken::Ident(ident) => out.push_str(&ident),
             LexToken::Punct(punct) => out.push(punct),
         }
@@ -2201,6 +2207,30 @@ mod tests {
         assert!(!function.contains("assert_precondition"));
         assert!(function.contains("assert_postcondition"));
         assert!(function.contains("__trust_out==x"));
+    }
+
+    #[test]
+    fn total_canonicalizes_custom_result_binder_for_metadata_and_runtime() {
+        let source =
+            "gives executable | result | { result == x; } pub fn id_i32(x: i32) -> i32 { x }";
+        let total = parse_total_source(source).unwrap();
+
+        assert_eq!(total.contracts[0].expression_display, "result == x");
+        assert_eq!(total.contracts[0].expression_code, "out==x");
+
+        let function = render_function(&total);
+        assert!(function.contains("__trust_out==x"));
+        assert!(!function.contains("result==x"));
+
+        let metadata = metadata_json(
+            &total.fn_info,
+            total.module_path.as_deref(),
+            source,
+            &total.fn_source,
+            &total.contracts,
+        );
+        assert!(metadata.contains("\"contracts_original\":[\"result == x\"]"));
+        assert!(metadata.contains("\"contracts_normalized\":[\"out==x\"]"));
     }
 
     #[test]

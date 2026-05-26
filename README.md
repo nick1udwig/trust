@@ -45,8 +45,8 @@ Implemented:
 - MVP checks for `i32`, `i64`, `u32`, `u64`, and `usize` integer overflow,
   signed division/remainder overflow, division and remainder by zero, slice bounds,
   Trust-to-Trust callee preconditions, executable Trust spec calls, simple
-  postconditions, proof assertions, loop invariants/decreases, and required
-  `TrustModel` field reasoning
+  postconditions with user-chosen result binders, proof assertions, loop
+  invariants/decreases, and required `TrustModel` field reasoning
 
 Still intentionally limited:
 

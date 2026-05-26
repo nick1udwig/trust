@@ -1026,9 +1026,10 @@ fn executable_preconditions(metadata: &TrustMetadata) -> Vec<String> {
     metadata
         .contracts_original
         .iter()
+        .zip(metadata.contracts_normalized.iter())
         .zip(metadata.contract_classes.iter())
-        .filter(|(_contract, class)| class.as_str() == "given executable")
-        .map(|(contract, _class)| normalize(contract))
+        .filter(|((_original, _normalized), class)| class.as_str() == "given executable")
+        .map(|((_original, normalized), _class)| normalize(normalized))
         .collect()
 }
 
@@ -1036,9 +1037,12 @@ fn given_preconditions(metadata: &TrustMetadata) -> Vec<String> {
     metadata
         .contracts_original
         .iter()
+        .zip(metadata.contracts_normalized.iter())
         .zip(metadata.contract_classes.iter())
-        .filter(|(_contract, class)| matches!(class.as_str(), "given executable" | "given ghost"))
-        .map(|(contract, _class)| normalize(contract))
+        .filter(|((_original, _normalized), class)| {
+            matches!(class.as_str(), "given executable" | "given ghost")
+        })
+        .map(|((_original, normalized), _class)| normalize(normalized))
         .collect()
 }
 
@@ -1046,11 +1050,14 @@ fn postconditions(metadata: &TrustMetadata) -> Vec<Contract> {
     metadata
         .contracts_original
         .iter()
+        .zip(metadata.contracts_normalized.iter())
         .zip(metadata.contract_classes.iter())
-        .filter(|(_contract, class)| matches!(class.as_str(), "gives executable" | "gives ghost"))
-        .map(|(contract, _class)| Contract {
-            original: contract.clone(),
-            normalized: normalize(&remove_old_wrappers(&remove_int_wrappers(contract))),
+        .filter(|((_original, _normalized), class)| {
+            matches!(class.as_str(), "gives executable" | "gives ghost")
+        })
+        .map(|((original, normalized), _class)| Contract {
+            original: original.clone(),
+            normalized: normalize(&remove_old_wrappers(&remove_int_wrappers(normalized))),
         })
         .collect()
 }
@@ -6099,6 +6106,19 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn normalized_result_binder_drives_postcondition_proof() {
+        let mut metadata = metadata_named_with_classes(
+            "id",
+            "pub fn id(x: i32) -> i32 { x }",
+            &["result == x"],
+            &["gives ghost"],
+        );
+        metadata.contracts_normalized = vec!["out == x".to_string()];
+
+        assert_eq!(verify_total(&metadata), Ok(()));
     }
 
     #[test]

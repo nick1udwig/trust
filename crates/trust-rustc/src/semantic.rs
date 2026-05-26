@@ -363,17 +363,23 @@ fn semantic_contract_bindings(
         .collect::<Vec<_>>();
     let mut bindings = Vec::new();
 
-    for (expression, class) in item
+    for ((original, normalized), class) in item
         .contracts_original
         .iter()
+        .zip(item.contracts_normalized.iter())
         .zip(item.contract_classes.iter())
-        .filter(|(_expression, class)| {
+        .filter(|((_original, _normalized), class)| {
             matches!(
                 class.as_str(),
                 "given executable" | "given ghost" | "gives executable" | "gives ghost"
             )
         })
     {
+        let expression = if class.starts_with("gives") {
+            normalized
+        } else {
+            original
+        };
         bindings.extend(contract_bindings_for_expression(
             expression,
             class,
@@ -5790,6 +5796,76 @@ fn left::caller(_1: i32) -> i32 {
                     name: "account.id".to_string(),
                     kind: SemanticContractBindingKind::Field,
                     ty: "u64".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_custom_result_binder_from_normalized_contract_metadata() {
+        let item = TrustMetadata {
+            schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "unknown".to_string(),
+            item_kind: "total".to_string(),
+            item_id: "total:balance:test".to_string(),
+            source_span: "unknown".to_string(),
+            rust_function_path: "balance".to_string(),
+            visibility: "public".to_string(),
+            contracts_original: vec!["result == account.balance".to_string()],
+            contracts_normalized: vec!["out == account.balance".to_string()],
+            contract_classes: vec!["gives ghost".to_string()],
+            assertion_policy: "always".to_string(),
+            function_source: "pub fn balance(account: Account) -> i64 { account.balance }"
+                .to_string(),
+            loop_specs: Vec::new(),
+            body_hash_placeholder: "test".to_string(),
+            trust_model_dependencies: Vec::new(),
+        };
+        let mir_function = MirFunctionSummary {
+            path: "verified::balance".to_string(),
+            args: vec![MirArg {
+                place: "_1".to_string(),
+                ty: "Account".to_string(),
+            }],
+            return_type: "i64".to_string(),
+            locals: Vec::new(),
+            debug_locals: vec![MirDebugLocal {
+                name: "account".to_string(),
+                place: "_1".to_string(),
+            }],
+            assignments: Vec::new(),
+            terminators: Vec::new(),
+            return_expr: None,
+        };
+        let model_fields = vec![ModelFieldMap {
+            ty: "Account".to_string(),
+            fields: vec![ModelField {
+                name: "balance".to_string(),
+                ty: "i64".to_string(),
+            }],
+        }];
+
+        assert_eq!(
+            semantic_contract_bindings(&item, &mir_function, &model_fields),
+            vec![
+                SemanticContractBinding {
+                    expression: "out == account.balance".to_string(),
+                    name: "out".to_string(),
+                    kind: SemanticContractBindingKind::Result,
+                    ty: "i64".to_string(),
+                },
+                SemanticContractBinding {
+                    expression: "out == account.balance".to_string(),
+                    name: "account".to_string(),
+                    kind: SemanticContractBindingKind::Param,
+                    ty: "Account".to_string(),
+                },
+                SemanticContractBinding {
+                    expression: "out == account.balance".to_string(),
+                    name: "account.balance".to_string(),
+                    kind: SemanticContractBindingKind::Field,
+                    ty: "i64".to_string(),
                 },
             ]
         );

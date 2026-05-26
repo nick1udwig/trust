@@ -858,6 +858,14 @@ fn pass_id_postcondition_proves_executable_postcondition() {
 }
 
 #[test]
+fn pass_custom_result_binder_proves_executable_postcondition() {
+    let output = run_fixture("pass_custom_result_binder", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_add_one_postcondition_proves_ghost_arithmetic_postcondition() {
     let output = run_fixture("pass_add_one_postcondition", Expected::Pass);
 
