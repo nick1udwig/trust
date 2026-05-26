@@ -440,6 +440,7 @@ fn verification_error_item_name(err: &VerificationError) -> Option<&str> {
         | VerificationError::UnsupportedIndex { function, .. }
         | VerificationError::CalleePreconditionUnproved { function, .. }
         | VerificationError::MissingTrustModel { function, .. }
+        | VerificationError::UnsupportedType { function, .. }
         | VerificationError::LoopMissingSpec { function }
         | VerificationError::LoopAmbiguousSpec { function }
         | VerificationError::LoopMissingDecreases { function }
@@ -488,6 +489,7 @@ fn verification_error_expression(err: &VerificationError) -> Option<&str> {
             callee: keyword, ..
         } => Some(keyword),
         VerificationError::MissingTrustModel { .. }
+        | VerificationError::UnsupportedType { .. }
         | VerificationError::LoopMissingSpec { .. }
         | VerificationError::LoopAmbiguousSpec { .. }
         | VerificationError::LoopMissingDecreases { .. }
@@ -542,6 +544,9 @@ fn diagnostic_help(err: &VerificationError) -> Option<&'static str> {
         }
         VerificationError::MissingTrustModel { .. } => {
             Some("derive TrustModel for the type if it satisfies the MVP model restrictions")
+        }
+        VerificationError::UnsupportedType { .. } => {
+            Some("use an MVP-supported type or introduce an explicit TrustModel where structural reasoning is supported")
         }
         VerificationError::CalleePreconditionUnproved { .. } => {
             Some("strengthen the caller preconditions or prove the callee requirement before the call")

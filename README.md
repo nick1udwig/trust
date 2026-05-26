@@ -49,8 +49,9 @@ Still intentionally limited:
   simple branch guards and attached Trust callee preconditions, `if` branch
   return facts, Option/Result match arms, and TrustModel field projections,
   including through simple local aliases, field types, missing-TrustModel field
-  checks, unsupported shift/bitwise/cast-operation checks, path guards, and
-  struct returns into verification, but it is not the primary VC generator yet
+  checks, unsupported shift/bitwise/cast-operation and signature type checks,
+  path guards, and struct returns into verification, but it is not the primary
+  VC generator yet
 
 ## Toolchain
 
@@ -145,7 +146,7 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   facts, Option/Result match arms, and TrustModel field projections in
   returns, local aliases, and path guards plus field types for arithmetic
   obligations, missing-TrustModel checks, and unsupported
-  shift/bitwise/cast-operation checks, into verification.
+  shift/bitwise/cast-operation and signature type checks, into verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 

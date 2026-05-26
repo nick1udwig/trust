@@ -180,6 +180,10 @@ pub enum VerificationError {
         function: String,
         ty: String,
     },
+    UnsupportedType {
+        function: String,
+        ty: String,
+    },
     LoopMissingSpec {
         function: String,
     },
@@ -312,6 +316,9 @@ impl fmt::Display for VerificationError {
                 f,
                 "type {ty} must derive TrustModel before Trust may reason about its fields"
             ),
+            VerificationError::UnsupportedType { function, ty } => {
+                write!(f, "unsupported type in `{function}`: `{ty}`")
+            }
             VerificationError::LoopMissingSpec { function } => {
                 write!(f, "loop in `{function}` requires loop_spec")
             }
@@ -437,6 +444,13 @@ fn verify_total_with_env(
     let mut contracts = executable_preconditions(metadata);
     let given_contracts = given_preconditions(metadata);
     let params = verification_params(&source, semantics);
+    let return_type = verification_return_type(&source, semantics);
+    if let Some(ty) = unsupported_signature_type(&params, &return_type, model_types) {
+        return Err(VerificationError::UnsupportedType {
+            function: metadata.rust_function_path.clone(),
+            ty,
+        });
+    }
     let value_params = verification_value_params(&params, semantics);
     let raw_body = body(&metadata.function_source);
     let body = body(&source);
@@ -873,6 +887,121 @@ fn verification_params(source: &str, semantics: Option<&TrustFunctionSemantics>)
     } else {
         semantic_params
     }
+}
+
+fn verification_return_type(source: &str, semantics: Option<&TrustFunctionSemantics>) -> String {
+    semantics
+        .map(|semantics| semantics.return_type.clone())
+        .unwrap_or_else(|| parse_return_type(source))
+}
+
+fn parse_return_type(source: &str) -> String {
+    let Some(params_start) = source.find('(') else {
+        return "()".to_string();
+    };
+    let Some(params_end) = source[params_start + 1..].find(')') else {
+        return "()".to_string();
+    };
+    let after_params = &source[params_start + 1 + params_end + 1..];
+    let Some(after_arrow) = after_params.strip_prefix("->") else {
+        return "()".to_string();
+    };
+    after_arrow
+        .split_once('{')
+        .map(|(ty, _body)| ty)
+        .unwrap_or(after_arrow)
+        .trim()
+        .to_string()
+}
+
+fn unsupported_signature_type(
+    params: &[Param],
+    return_type: &str,
+    model_types: &[String],
+) -> Option<String> {
+    params
+        .iter()
+        .find_map(|param| unsupported_mvp_type(&param.ty, model_types))
+        .or_else(|| unsupported_mvp_type(return_type, model_types))
+}
+
+fn unsupported_mvp_type(ty: &str, model_types: &[String]) -> Option<String> {
+    let ty = ty.trim();
+    if ty.is_empty()
+        || ty == "()"
+        || ty == "bool"
+        || is_supported_integer(ty)
+        || model_types
+            .iter()
+            .any(|model_type| model_type == &type_name_tail(ty))
+    {
+        return None;
+    }
+    if matches!(ty, "f32" | "f64")
+        || ty.starts_with("*const ")
+        || ty.starts_with("*mut ")
+        || ty.starts_with("&mut ")
+        || ty.starts_with("dyn ")
+        || ty.contains(" dyn ")
+    {
+        return Some(ty.to_string());
+    }
+    if let Some(element) = slice_element_type(ty) {
+        return unsupported_mvp_type(element, model_types);
+    }
+    if let Some(inner) = single_type_arg(ty, "Option").or_else(|| single_type_arg(ty, "Some")) {
+        return unsupported_mvp_type(inner, model_types);
+    }
+    if let Some(args) = type_args(ty, "Result") {
+        return split_type_args(args)
+            .into_iter()
+            .find_map(|arg| unsupported_mvp_type(arg, model_types));
+    }
+
+    None
+}
+
+fn single_type_arg<'a>(ty: &'a str, name: &str) -> Option<&'a str> {
+    type_args(ty, name).and_then(|args| {
+        let args = split_type_args(args);
+        (args.len() == 1).then_some(args[0])
+    })
+}
+
+fn type_args<'a>(ty: &'a str, name: &str) -> Option<&'a str> {
+    let ty = ty.trim();
+    let args = ty
+        .strip_prefix(name)
+        .or_else(|| ty.strip_prefix(&format!("core::option::{name}")))
+        .or_else(|| ty.strip_prefix(&format!("std::option::{name}")))
+        .or_else(|| ty.strip_prefix(&format!("core::result::{name}")))
+        .or_else(|| ty.strip_prefix(&format!("std::result::{name}")))?;
+    args.strip_prefix('<')?.strip_suffix('>').map(str::trim)
+}
+
+fn split_type_args(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut angle_depth = 0usize;
+    for (idx, ch) in args.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ',' if angle_depth == 0 => {
+                let part = args[start..idx].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let part = args[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
 }
 
 fn verification_value_params(
@@ -4715,6 +4844,36 @@ mod tests {
         );
 
         assert_eq!(verify_totals(&[account, balance]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unsupported_float_signature_type() {
+        let metadata = metadata_named("id_f32", "pub fn id_f32(x: f32) -> f32 { x }", &[]);
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedType {
+                function: "id_f32".to_string(),
+                ty: "f32".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_nested_float_signature_type() {
+        let metadata = metadata_named(
+            "maybe",
+            "pub fn maybe(x: Option<f32>) -> Option<f32> { x }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedType {
+                function: "maybe".to_string(),
+                ty: "f32".to_string(),
+            })
+        );
     }
 
     #[test]
