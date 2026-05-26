@@ -568,6 +568,13 @@ fn verify_total_with_env(
             expression,
         });
     }
+    if let Some(expression) = semantic_field_access_extraction_gap(raw_body, &params, semantics) {
+        return Err(VerificationError::SemanticExtractionIncomplete {
+            function: metadata.rust_function_path.clone(),
+            category: "field access".to_string(),
+            expression,
+        });
+    }
 
     for obligation in verification_field_access_obligations(raw_body, &params, semantics) {
         if !model_types
@@ -703,7 +710,7 @@ fn verify_total_with_env(
     }
 
     for postcondition in postconditions(metadata) {
-        if !postcondition_proved(
+        match postcondition_proved(
             &postcondition,
             &body,
             raw_body,
@@ -713,14 +720,39 @@ fn verify_total_with_env(
             &value_params,
             options,
         ) {
-            return Err(VerificationError::PostconditionUnproved {
-                function: metadata.rust_function_path.clone(),
-                condition: postcondition.original,
-            });
+            PostconditionProof::Proved => {}
+            PostconditionProof::Unproved => {
+                return Err(VerificationError::PostconditionUnproved {
+                    function: metadata.rust_function_path.clone(),
+                    condition: postcondition.original,
+                });
+            }
+            PostconditionProof::SemanticExtractionIncomplete { expression } => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: metadata.rust_function_path.clone(),
+                    category: "return expression".to_string(),
+                    expression,
+                });
+            }
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostconditionProof {
+    Proved,
+    Unproved,
+    SemanticExtractionIncomplete { expression: String },
+}
+
+fn postcondition_proof(proved: bool) -> PostconditionProof {
+    if proved {
+        PostconditionProof::Proved
+    } else {
+        PostconditionProof::Unproved
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -812,6 +844,12 @@ struct CallObligation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FieldAccessObligation {
     ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenFieldAccess {
+    ty: String,
+    expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1224,7 +1262,7 @@ fn postcondition_proved(
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
-) -> bool {
+) -> PostconditionProof {
     let return_expression = return_expression(body);
     let semantic_return_proved = semantic_return_proves_postcondition(
         postcondition,
@@ -1235,7 +1273,7 @@ fn postcondition_proved(
         options,
     );
     if semantic_return_proved == Some(true) {
-        return true;
+        return PostconditionProof::Proved;
     }
     if let Some(proved) = semantic_match_proves_postcondition(
         postcondition,
@@ -1245,7 +1283,7 @@ fn postcondition_proved(
         params,
         options,
     ) {
-        return proved;
+        return postcondition_proof(proved);
     }
     if let Some(proved) = semantic_branch_proves_postcondition(
         postcondition,
@@ -1255,20 +1293,27 @@ fn postcondition_proved(
         params,
         options,
     ) {
-        return proved;
+        return postcondition_proof(proved);
     }
     if semantic_return_proved == Some(false) {
-        return false;
+        return PostconditionProof::Unproved;
     }
 
-    postcondition_proved_by_return_expression_with_assumptions(
+    let fallback_proved = postcondition_proved_by_return_expression_with_assumptions(
         postcondition,
         raw_body,
         &return_expression,
         contracts,
         params,
         options,
-    )
+    );
+    if fallback_proved && semantics.is_some() {
+        return PostconditionProof::SemanticExtractionIncomplete {
+            expression: return_expression,
+        };
+    }
+
+    postcondition_proof(fallback_proved)
 }
 
 fn semantic_return_proves_postcondition(
@@ -2970,8 +3015,15 @@ fn supported_semantic_index_expression(
 }
 
 fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObligation> {
+    token_field_accesses(body, params)
+        .into_iter()
+        .map(|access| FieldAccessObligation { ty: access.ty })
+        .collect()
+}
+
+fn token_field_accesses(body: &str, params: &[Param]) -> Vec<TokenFieldAccess> {
     let tokens = tokens(body);
-    let mut obligations = Vec::new();
+    let mut accesses = Vec::new();
 
     for (idx, window) in tokens.windows(3).enumerate() {
         let [base, dot, field] = window else {
@@ -2987,12 +3039,13 @@ fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObli
         let Some(param) = params.iter().find(|param| param.name == *base) else {
             continue;
         };
-        obligations.push(FieldAccessObligation {
+        accesses.push(TokenFieldAccess {
             ty: param.ty.clone(),
+            expression: format!("{base}.{field}"),
         });
     }
 
-    obligations
+    accesses
 }
 
 fn verification_field_access_obligations(
@@ -3000,8 +3053,12 @@ fn verification_field_access_obligations(
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<FieldAccessObligation> {
+    let semantic_obligations = semantic_field_access_obligations(semantics);
+    if semantics.is_some() {
+        return semantic_obligations;
+    }
     extend_unique_by(
-        semantic_field_access_obligations(semantics),
+        semantic_obligations,
         field_access_obligations(body, params),
         |existing, fallback| existing.ty == fallback.ty,
     )
@@ -3017,6 +3074,37 @@ fn semantic_field_access_obligations(
             ty: field.owner_type.clone(),
         })
         .collect()
+}
+
+fn semantic_field_access_extraction_gap(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
+    let semantics = semantics?;
+    let semantic_accesses = semantics
+        .field_accesses
+        .iter()
+        .map(|field| {
+            (
+                normalize(&field.expression),
+                type_name_tail(&field.owner_type),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    token_field_accesses(body, params)
+        .into_iter()
+        .find(|access| {
+            let expression = normalize(&access.expression);
+            let ty = type_name_tail(&access.ty);
+            !semantic_accesses
+                .iter()
+                .any(|(semantic_expression, owner_type)| {
+                    semantic_expression == &expression || owner_type == &ty
+                })
+        })
+        .map(|access| access.expression)
 }
 
 fn verify_loops(
@@ -6315,6 +6403,41 @@ mod tests {
     }
 
     #[test]
+    fn partial_semantic_field_accesses_fail_closed() {
+        let balance = metadata_named(
+            "balance",
+            "pub fn balance(acct: Account) -> i64 { acct.balance }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "balance".to_string(),
+            params: vec![SemanticParam {
+                name: "acct".to_string(),
+                ty: "Account".to_string(),
+            }],
+            return_type: "i64".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("acct.balance".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[balance], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "balance".to_string(),
+                category: "field access".to_string(),
+                expression: "acct.balance".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn proves_countdown_loop_decreases_and_postcondition() {
         let metadata = metadata_named_with_classes(
             "countdown",
@@ -7220,6 +7343,40 @@ mod tests {
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Err(VerificationError::PostconditionUnproved { .. })
         ));
+    }
+
+    #[test]
+    fn partial_semantic_return_expression_fails_closed() {
+        let metadata = metadata_named_with_classes(
+            "zero",
+            "pub fn zero() -> i32 { 0 }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "zero".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "zero".to_string(),
+                category: "return expression".to_string(),
+                expression: "0".to_string(),
+            })
+        );
     }
 
     #[test]
