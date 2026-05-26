@@ -1428,9 +1428,76 @@ fn postcondition_proved_by_return_expression_with_assumptions(
     if postcondition_proved_by_return_expression(postcondition, raw_body, return_expression) {
         return true;
     }
+    if postcondition_proved_by_assumptions(postcondition, return_expression, contracts, params) {
+        return true;
+    }
 
     let conclusion = substitute_out(&postcondition.normalized, return_expression);
     z3_proves_conclusion(&conclusion, contracts, params, options).is_some_and(|proved| proved)
+}
+
+fn postcondition_proved_by_assumptions(
+    postcondition: &Contract,
+    return_expression: &str,
+    contracts: &[String],
+    params: &[Param],
+) -> bool {
+    let Some((left, right)) = postcondition.normalized.split_once("==") else {
+        return false;
+    };
+
+    if left == "out" {
+        return expression_equals_expected_from_assumptions(
+            return_expression,
+            right,
+            contracts,
+            params,
+        );
+    }
+    if right == "out" {
+        return expression_equals_expected_from_assumptions(
+            return_expression,
+            left,
+            contracts,
+            params,
+        );
+    }
+
+    false
+}
+
+fn expression_equals_expected_from_assumptions(
+    expression: &str,
+    expected: &str,
+    contracts: &[String],
+    params: &[Param],
+) -> bool {
+    if expected != "0" {
+        return false;
+    }
+    let Some(ty) = param_type(expression, params) else {
+        return false;
+    };
+    if !is_unsigned_integer(ty) {
+        return false;
+    }
+
+    contracts
+        .iter()
+        .any(|contract| contract_proves_unsigned_zero_upper_bound(expression, contract))
+}
+
+fn contract_proves_unsigned_zero_upper_bound(expression: &str, contract: &str) -> bool {
+    let expected = [
+        format!("{expression}==0"),
+        format!("0=={expression}"),
+        format!("{expression}<=0"),
+        format!("0>={expression}"),
+        format!("{expression}<1"),
+        format!("1>{expression}"),
+    ];
+
+    expected.iter().any(|expected| contract == expected)
 }
 
 fn substitute_out(condition: &str, return_expression: &str) -> String {
@@ -2070,11 +2137,20 @@ fn semantic_arithmetic_operations(
 }
 
 fn semantic_guard_assumptions(operation: &SemanticArithmeticOperation) -> Vec<String> {
-    operation
-        .guards
-        .iter()
-        .map(|guard| normalize(guard))
-        .collect()
+    let mut assumptions = Vec::new();
+    for guard in &operation.guards {
+        push_unique(&mut assumptions, normalize(guard));
+        if let Some(reversed) = reversed_condition(guard) {
+            push_unique(&mut assumptions, normalize(&reversed));
+        }
+    }
+    assumptions
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn semantic_denominator_obligations(
@@ -2856,10 +2932,30 @@ fn semantic_increment_amount(
 
 fn semantic_operation_guarded_by(operation: &SemanticArithmeticOperation, condition: &str) -> bool {
     let condition = normalize(condition);
-    operation
-        .guards
-        .iter()
-        .any(|guard| normalize(guard) == condition)
+    operation.guards.iter().any(|guard| {
+        let guard = normalize(guard);
+        guard == condition
+            || reversed_condition(&guard).as_deref() == Some(condition.as_str())
+            || reversed_condition(&condition).as_deref() == Some(guard.as_str())
+    })
+}
+
+fn reversed_condition(condition: &str) -> Option<String> {
+    for (op, reversed) in [
+        ("<=", ">="),
+        (">=", "<="),
+        ("!=", "!="),
+        ("==", "=="),
+        ("<", ">"),
+        (">", "<"),
+    ] {
+        let Some((left, right)) = condition.split_once(op) else {
+            continue;
+        };
+        return Some(format!("{}{}{}", right.trim(), reversed, left.trim()));
+    }
+
+    None
 }
 
 fn loop_exit_fact(condition: &str) -> Option<String> {
@@ -5372,6 +5468,46 @@ mod tests {
                 measure: "n".to_string(),
             })
         );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn loop_exit_assumption_proves_unsigned_zero_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while 0 < n { n -= 1; } n }",
+            &["out == 0"],
+            &["gives executable"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("n".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                ty: Some("usize".to_string()),
+                target: Some("n".to_string()),
+                left: "n".to_string(),
+                right: Some("1".to_string()),
+                expression: "n - 1".to_string(),
+                guards: vec!["0 < n".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
