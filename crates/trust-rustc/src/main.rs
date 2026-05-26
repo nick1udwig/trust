@@ -11,8 +11,8 @@ use trust_core::{
     metadata::{parse_metadata_line, TrustMetadata},
     solver::VerificationOptions,
     verifier::{
-        verify_totals, verify_totals_with_options, verify_totals_with_semantics,
-        TrustFunctionSemantics, VerificationError,
+        verify_totals_with_options, verify_totals_with_semantics, TrustFunctionSemantics,
+        VerificationError,
     },
 };
 use z3::{ast::Bool, Config, SatResult, Solver};
@@ -336,7 +336,7 @@ fn verify_metadata(
             });
         }
 
-        verify_all(metadata, semantics, config)?;
+        verify_all(metadata, semantics, cache_context, config)?;
         write_cache_entry(&cache_file, metadata, semantics, cache_context)?;
         return Ok(CacheStats {
             hits: 0,
@@ -344,7 +344,7 @@ fn verify_metadata(
         });
     }
 
-    verify_all(metadata, semantics, config)?;
+    verify_all(metadata, semantics, cache_context, config)?;
     Ok(CacheStats {
         hits: 0,
         misses: verification_items,
@@ -354,23 +354,41 @@ fn verify_metadata(
 fn verify_all(
     metadata: &[trust_core::metadata::TrustMetadata],
     semantics: &[TrustFunctionSemantics],
+    cache_context: &CacheContext,
     config: &TrustConfig,
 ) -> Result<(), String> {
+    let options = verification_options(config, cache_context);
     let result = match config.solver.as_str() {
-        "mock" if semantics.is_empty() => verify_totals(metadata),
-        "mock" => verify_totals_with_semantics(metadata, semantics, VerificationOptions::default()),
-        "z3" if semantics.is_empty() => {
-            verify_totals_with_options(metadata, VerificationOptions::z3(config.timeout_ms))
-        }
-        "z3" => verify_totals_with_semantics(
-            metadata,
-            semantics,
-            VerificationOptions::z3(config.timeout_ms),
-        ),
+        "mock" if semantics.is_empty() => verify_totals_with_options(metadata, options),
+        "mock" => verify_totals_with_semantics(metadata, semantics, options),
+        "z3" if semantics.is_empty() => verify_totals_with_options(metadata, options),
+        "z3" => verify_totals_with_semantics(metadata, semantics, options),
         solver => return Err(format!("unsupported solver `{solver}`")),
     };
 
     result.map_err(|err| format_verification_error(&err, metadata))
+}
+
+fn verification_options(config: &TrustConfig, cache_context: &CacheContext) -> VerificationOptions {
+    let mut options = match config.solver.as_str() {
+        "z3" => VerificationOptions::z3(config.timeout_ms),
+        _ => VerificationOptions::default(),
+    };
+
+    if let Some(width) = target_pointer_width(&cache_context.pointer_width) {
+        options = options.with_target_pointer_width(width);
+    }
+
+    options
+}
+
+fn target_pointer_width(pointer_width: &str) -> Option<u32> {
+    match pointer_width {
+        "16" => Some(16),
+        "32" => Some(32),
+        "64" => Some(64),
+        _ => None,
+    }
 }
 
 fn format_verification_error(err: &VerificationError, metadata: &[TrustMetadata]) -> String {
@@ -1043,6 +1061,32 @@ mod tests {
         }
     }
 
+    fn trust_config(solver: &str) -> TrustConfig {
+        TrustConfig {
+            assertions: "always".to_string(),
+            solver: solver.to_string(),
+            timeout_ms: 1234,
+            cache: "local".to_string(),
+            silence_assume_warning: false,
+            fingerprint: "test-config".to_string(),
+        }
+    }
+
+    fn cache_context_with_pointer_width(pointer_width: &str) -> CacheContext {
+        CacheContext {
+            rustc_version: "rustc-test".to_string(),
+            target_triple: "i686-unknown-linux-gnu".to_string(),
+            pointer_width: pointer_width.to_string(),
+            endianness: "little".to_string(),
+            target_features: Vec::new(),
+            cargo_features: Vec::new(),
+            solver_name: "z3".to_string(),
+            solver_version: "z3-test".to_string(),
+            solver_options: "timeout_ms=1234;".to_string(),
+            trust_config_fingerprint: "test-config".to_string(),
+        }
+    }
+
     #[test]
     fn wrapper_splits_cargo_style_rustc_args() {
         let (rustc, args) = split_rustc_args(vec![
@@ -1100,6 +1144,28 @@ mod tests {
         assert_eq!(
             reject_ambiguous_metadata_paths(&metadata),
             Err("duplicate Trust metadata path `same`; Trust MVP requires unique total/proof/model paths within a crate so HIR/MIR facts map unambiguously".to_string())
+        );
+    }
+
+    #[test]
+    fn verification_options_use_target_pointer_width() {
+        let config = trust_config("z3");
+        let cache_context = cache_context_with_pointer_width("32");
+
+        assert_eq!(
+            verification_options(&config, &cache_context),
+            VerificationOptions::z3(1234).with_target_pointer_width(32)
+        );
+    }
+
+    #[test]
+    fn verification_options_ignore_unknown_pointer_width() {
+        let config = trust_config("z3");
+        let cache_context = cache_context_with_pointer_width("unknown");
+
+        assert_eq!(
+            verification_options(&config, &cache_context),
+            VerificationOptions::z3(1234)
         );
     }
 

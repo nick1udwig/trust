@@ -483,7 +483,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_addition_obligations(body, &value_params, semantics) {
+    for obligation in verification_addition_obligations(body, &value_params, semantics, options) {
         if !addition_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerAdditionOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -492,7 +492,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_subtraction_obligations(body, &value_params, semantics) {
+    for obligation in verification_subtraction_obligations(body, &value_params, semantics, options)
+    {
         if !subtraction_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerSubtractionOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -501,7 +502,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_negation_obligations(body, &value_params, semantics) {
+    for obligation in verification_negation_obligations(body, &value_params, semantics, options) {
         if !negation_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerNegationOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -510,7 +511,9 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_multiplication_obligations(body, &value_params, semantics) {
+    for obligation in
+        verification_multiplication_obligations(body, &value_params, semantics, options)
+    {
         if !multiplication_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -1416,8 +1419,10 @@ fn verification_addition_obligations(
     body: &str,
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
 ) -> Vec<AddObligation> {
-    let semantic_obligations = semantic_addition_obligations(semantics, params);
+    let semantic_obligations =
+        semantic_addition_obligations(semantics, params, options.target_pointer_width);
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         addition_obligations(body, params),
@@ -1433,6 +1438,7 @@ fn verification_addition_obligations(
 fn semantic_addition_obligations(
     semantics: Option<&TrustFunctionSemantics>,
     params: &[Param],
+    target_pointer_width: Option<u32>,
 ) -> Vec<AddObligation> {
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Add)
         .filter_map(|operation| {
@@ -1443,6 +1449,7 @@ fn semantic_addition_obligations(
                 &operation.expression,
                 params,
                 operation.ty.as_deref(),
+                target_pointer_width,
             )
             .map(|mut obligation| {
                 obligation.assumptions = semantic_guard_assumptions(operation);
@@ -1456,8 +1463,10 @@ fn verification_subtraction_obligations(
     body: &str,
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
 ) -> Vec<SubObligation> {
-    let semantic_obligations = semantic_subtraction_obligations(semantics, params);
+    let semantic_obligations =
+        semantic_subtraction_obligations(semantics, params, options.target_pointer_width);
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         subtraction_obligations(body, params),
@@ -1473,6 +1482,7 @@ fn verification_subtraction_obligations(
 fn semantic_subtraction_obligations(
     semantics: Option<&TrustFunctionSemantics>,
     params: &[Param],
+    target_pointer_width: Option<u32>,
 ) -> Vec<SubObligation> {
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Sub)
         .filter_map(|operation| {
@@ -1483,6 +1493,7 @@ fn semantic_subtraction_obligations(
                 &operation.expression,
                 params,
                 operation.ty.as_deref(),
+                target_pointer_width,
             )
             .map(|mut obligation| {
                 obligation.assumptions = semantic_guard_assumptions(operation);
@@ -1496,8 +1507,10 @@ fn verification_negation_obligations(
     body: &str,
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
 ) -> Vec<NegObligation> {
-    let semantic_obligations = semantic_negation_obligations(semantics, params);
+    let semantic_obligations =
+        semantic_negation_obligations(semantics, params, options.target_pointer_width);
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         negation_obligations(body, params),
@@ -1513,6 +1526,7 @@ fn verification_negation_obligations(
 fn semantic_negation_obligations(
     semantics: Option<&TrustFunctionSemantics>,
     params: &[Param],
+    target_pointer_width: Option<u32>,
 ) -> Vec<NegObligation> {
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Neg)
         .filter_map(|operation| {
@@ -1521,7 +1535,7 @@ fn semantic_negation_obligations(
             if !is_signed_integer(ty) {
                 return None;
             }
-            if integer_constant_value(&operation.left, Some(ty))
+            if integer_constant_value(&operation.left, Some(ty), target_pointer_width)
                 .is_some_and(|value| min_value(ty) != Some(value))
             {
                 return None;
@@ -1540,8 +1554,10 @@ fn verification_multiplication_obligations(
     body: &str,
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
 ) -> Vec<MulObligation> {
-    let semantic_obligations = semantic_multiplication_obligations(semantics, params);
+    let semantic_obligations =
+        semantic_multiplication_obligations(semantics, params, options.target_pointer_width);
     let fallback_obligations = mergeable_token_fallback_obligations(
         &semantic_obligations,
         multiplication_obligations(body, params),
@@ -1557,6 +1573,7 @@ fn verification_multiplication_obligations(
 fn semantic_multiplication_obligations(
     semantics: Option<&TrustFunctionSemantics>,
     params: &[Param],
+    target_pointer_width: Option<u32>,
 ) -> Vec<MulObligation> {
     semantic_arithmetic_operations(semantics, SemanticArithmeticKind::Mul)
         .filter_map(|operation| {
@@ -1567,6 +1584,7 @@ fn semantic_multiplication_obligations(
                 &operation.expression,
                 params,
                 operation.ty.as_deref(),
+                target_pointer_width,
             )
             .map(|mut obligation| {
                 obligation.assumptions = semantic_guard_assumptions(operation);
@@ -1664,15 +1682,25 @@ fn semantic_addition_obligation(
     expression: &str,
     params: &[Param],
     operation_ty: Option<&str>,
+    target_pointer_width: Option<u32>,
 ) -> Option<AddObligation> {
     let operation_ty = supported_operation_type(operation_ty);
-    if typed_constant_binary_is_safe(left, right, operation_ty, i128::checked_add) {
+    if typed_constant_binary_is_safe(
+        left,
+        right,
+        operation_ty,
+        i128::checked_add,
+        target_pointer_width,
+    ) {
         return None;
     }
 
     let left_ty = param_type(left, params).or(operation_ty);
     let right_ty = param_type(right, params).or(operation_ty);
-    if let (Some(ty), Some(constant)) = (left_ty, integer_constant_value(right, left_ty)) {
+    if let (Some(ty), Some(constant)) = (
+        left_ty,
+        integer_constant_value(right, left_ty, target_pointer_width),
+    ) {
         return Some(AddObligation {
             variable: left.to_string(),
             ty: Some(ty.to_string()),
@@ -1681,7 +1709,10 @@ fn semantic_addition_obligation(
             assumptions: Vec::new(),
         });
     }
-    if let (Some(constant), Some(ty)) = (integer_constant_value(left, right_ty), right_ty) {
+    if let (Some(constant), Some(ty)) = (
+        integer_constant_value(left, right_ty, target_pointer_width),
+        right_ty,
+    ) {
         return Some(AddObligation {
             variable: right.to_string(),
             ty: Some(ty.to_string()),
@@ -1712,14 +1743,24 @@ fn semantic_subtraction_obligation(
     expression: &str,
     params: &[Param],
     operation_ty: Option<&str>,
+    target_pointer_width: Option<u32>,
 ) -> Option<SubObligation> {
     let operation_ty = supported_operation_type(operation_ty);
-    if typed_constant_binary_is_safe(left, right, operation_ty, i128::checked_sub) {
+    if typed_constant_binary_is_safe(
+        left,
+        right,
+        operation_ty,
+        i128::checked_sub,
+        target_pointer_width,
+    ) {
         return None;
     }
 
     let left_ty = param_type(left, params).or(operation_ty);
-    if let (Some(ty), Some(constant)) = (left_ty, integer_constant_value(right, left_ty)) {
+    if let (Some(ty), Some(constant)) = (
+        left_ty,
+        integer_constant_value(right, left_ty, target_pointer_width),
+    ) {
         if constant > 0 {
             return Some(SubObligation {
                 variable: left.to_string(),
@@ -1752,15 +1793,25 @@ fn semantic_multiplication_obligation(
     expression: &str,
     params: &[Param],
     operation_ty: Option<&str>,
+    target_pointer_width: Option<u32>,
 ) -> Option<MulObligation> {
     let operation_ty = supported_operation_type(operation_ty);
-    if typed_constant_binary_is_safe(left, right, operation_ty, i128::checked_mul) {
+    if typed_constant_binary_is_safe(
+        left,
+        right,
+        operation_ty,
+        i128::checked_mul,
+        target_pointer_width,
+    ) {
         return None;
     }
 
     let left_ty = param_type(left, params).or(operation_ty);
     let right_ty = param_type(right, params).or(operation_ty);
-    if let (Some(ty), Some(constant)) = (left_ty, integer_constant_value(right, left_ty)) {
+    if let (Some(ty), Some(constant)) = (
+        left_ty,
+        integer_constant_value(right, left_ty, target_pointer_width),
+    ) {
         if constant > 1 {
             return Some(MulObligation {
                 variable: left.to_string(),
@@ -1770,7 +1821,10 @@ fn semantic_multiplication_obligation(
                 assumptions: Vec::new(),
             });
         }
-    } else if let (Some(constant), Some(ty)) = (integer_constant_value(left, right_ty), right_ty) {
+    } else if let (Some(constant), Some(ty)) = (
+        integer_constant_value(left, right_ty, target_pointer_width),
+        right_ty,
+    ) {
         if constant > 1 {
             return Some(MulObligation {
                 variable: right.to_string(),
@@ -2718,7 +2772,7 @@ fn addition_obligation_proved(
     let Some(ty) = &obligation.ty else {
         return false;
     };
-    let Some(max) = max_value(ty) else {
+    let Some(max) = max_value(ty, options.target_pointer_width) else {
         return false;
     };
     let required_bound = max - constant;
@@ -2742,6 +2796,7 @@ fn addition_obligation_proved(
             constant,
             contracts,
             &params,
+            options.target_pointer_width,
             options.timeout_ms,
         ) {
             ProofResult::Proved => return true,
@@ -2883,7 +2938,7 @@ fn multiplication_obligation_proved(
     let Some(ty) = &obligation.ty else {
         return false;
     };
-    let Some(max) = max_value(ty) else {
+    let Some(max) = max_value(ty, options.target_pointer_width) else {
         return false;
     };
     let upper_symbolic = format!("{}<={}::MAX/{}", obligation.variable, ty, constant);
@@ -2949,7 +3004,13 @@ fn z3_proves_conclusion(
         .filter(|param| is_supported_integer(&param.ty))
         .map(|param| (param.name.clone(), param.ty.clone()))
         .collect::<Vec<_>>();
-    match solver::prove_integer_predicate(contracts, conclusion, &params, options.timeout_ms) {
+    match solver::prove_integer_predicate(
+        contracts,
+        conclusion,
+        &params,
+        options.target_pointer_width,
+        options.timeout_ms,
+    ) {
         ProofResult::Proved => Some(true),
         ProofResult::Unproved => Some(false),
         ProofResult::Unsupported => None,
@@ -3039,14 +3100,18 @@ fn supported_operation_type(ty: Option<&str>) -> Option<&str> {
     ty.filter(|ty| is_supported_integer(ty))
 }
 
-fn integer_constant_value(token: &str, ty: Option<&str>) -> Option<i128> {
+fn integer_constant_value(
+    token: &str,
+    ty: Option<&str>,
+    target_pointer_width: Option<u32>,
+) -> Option<i128> {
     if let Ok(value) = token.parse::<i128>() {
         return Some(value);
     }
 
     let ty = ty?;
     if token == format!("{ty}::MAX") {
-        return max_value(ty);
+        return max_value(ty, target_pointer_width);
     }
     if token == format!("{ty}::MIN") {
         return min_value(ty);
@@ -3060,13 +3125,14 @@ fn typed_constant_binary_is_safe(
     right: &str,
     ty: Option<&str>,
     operation: fn(i128, i128) -> Option<i128>,
+    target_pointer_width: Option<u32>,
 ) -> bool {
     let Some(ty) = ty else {
         return false;
     };
     let (Some(left), Some(right)) = (
-        integer_constant_value(left, Some(ty)),
-        integer_constant_value(right, Some(ty)),
+        integer_constant_value(left, Some(ty), target_pointer_width),
+        integer_constant_value(right, Some(ty), target_pointer_width),
     ) else {
         return false;
     };
@@ -3076,7 +3142,7 @@ fn typed_constant_binary_is_safe(
     let Some(min) = min_value(ty) else {
         return false;
     };
-    let Some(max) = max_value(ty) else {
+    let Some(max) = max_value(ty, target_pointer_width) else {
         return false;
     };
 
@@ -3156,12 +3222,21 @@ fn is_signed_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64")
 }
 
-fn max_value(ty: &str) -> Option<i128> {
+fn max_value(ty: &str, target_pointer_width: Option<u32>) -> Option<i128> {
     match ty {
         "i32" => Some(i32::MAX as i128),
         "i64" => Some(i64::MAX as i128),
-        "usize" => Some(usize::MAX as i128),
+        "usize" => Some(usize_max_value(target_pointer_width)),
         _ => None,
+    }
+}
+
+fn usize_max_value(target_pointer_width: Option<u32>) -> i128 {
+    match target_pointer_width {
+        Some(16) => u16::MAX as i128,
+        Some(32) => u32::MAX as i128,
+        Some(64) => u64::MAX as i128,
+        _ => usize::MAX as i128,
     }
 }
 
@@ -3605,6 +3680,33 @@ mod tests {
         assert_eq!(
             verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn target_pointer_width_controls_usize_addition_bounds() {
+        let metadata = metadata_named(
+            "inc",
+            "pub fn inc(n: usize) -> usize { n + 1 }",
+            &["n <= 5000000000"],
+        );
+
+        assert_eq!(
+            verify_totals_with_options(
+                &[metadata.clone()],
+                VerificationOptions::z3(5000).with_target_pointer_width(64),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_totals_with_options(
+                &[metadata],
+                VerificationOptions::z3(5000).with_target_pointer_width(32),
+            ),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "inc".to_string(),
+                expression: "n + 1".to_string(),
+            })
         );
     }
 

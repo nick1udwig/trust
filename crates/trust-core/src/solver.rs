@@ -19,6 +19,7 @@ pub enum SolverBackend {
 pub struct VerificationOptions {
     pub solver: SolverBackend,
     pub timeout_ms: u64,
+    pub target_pointer_width: Option<u32>,
 }
 
 impl VerificationOptions {
@@ -26,7 +27,13 @@ impl VerificationOptions {
         Self {
             solver: SolverBackend::Z3,
             timeout_ms,
+            target_pointer_width: None,
         }
+    }
+
+    pub fn with_target_pointer_width(mut self, pointer_width: u32) -> Self {
+        self.target_pointer_width = Some(pointer_width);
+        self
     }
 }
 
@@ -35,6 +42,7 @@ impl Default for VerificationOptions {
         Self {
             solver: SolverBackend::Internal,
             timeout_ms: 5000,
+            target_pointer_width: None,
         }
     }
 }
@@ -52,12 +60,13 @@ pub fn prove_addition_overflow_safety(
     constant: i128,
     contracts: &[String],
     params: &[(String, String)],
+    target_pointer_width: Option<u32>,
     timeout_ms: u64,
 ) -> ProofResult {
     if constant < 0 {
         return ProofResult::Unsupported;
     }
-    let Some(max) = max_value(ty) else {
+    let Some(max) = max_value(ty, target_pointer_width) else {
         return ProofResult::Unsupported;
     };
     let Some(required_bound) = max.checked_sub(constant) else {
@@ -72,6 +81,7 @@ pub fn prove_addition_overflow_safety(
             right: Expr::Const(required_bound),
         },
         params,
+        target_pointer_width,
         timeout_ms,
     )
 }
@@ -80,24 +90,32 @@ pub fn prove_integer_predicate(
     assumptions: &[String],
     conclusion: &str,
     params: &[(String, String)],
+    target_pointer_width: Option<u32>,
     timeout_ms: u64,
 ) -> ProofResult {
-    let Some(conclusion) = parse_predicate(conclusion) else {
+    let Some(conclusion) = parse_predicate(conclusion, target_pointer_width) else {
         return ProofResult::Unsupported;
     };
 
-    prove_integer_implication(assumptions, &conclusion, params, timeout_ms)
+    prove_integer_implication(
+        assumptions,
+        &conclusion,
+        params,
+        target_pointer_width,
+        timeout_ms,
+    )
 }
 
 fn prove_integer_implication(
     assumptions: &[String],
     conclusion: &Predicate,
     params: &[(String, String)],
+    target_pointer_width: Option<u32>,
     timeout_ms: u64,
 ) -> ProofResult {
     let parsed_assumptions = assumptions
         .iter()
-        .filter_map(|assumption| parse_predicate(assumption))
+        .filter_map(|assumption| parse_predicate(assumption, target_pointer_width))
         .collect::<Vec<_>>();
     if predicate_uses_unknown_variable(conclusion, params)
         || parsed_assumptions
@@ -113,7 +131,7 @@ fn prove_integer_implication(
 
     z3::with_z3_config(&cfg, || {
         let solver = Solver::new_for_logic("QF_LIA").unwrap_or_else(Solver::new);
-        let mut env = Z3Env::new(params);
+        let mut env = Z3Env::new(params, target_pointer_width);
         for assertion in env.domain_assertions() {
             solver.assert(&assertion);
         }
@@ -170,10 +188,11 @@ fn dump_smt_if_requested(
 struct Z3Env {
     declarations: HashMap<String, Int>,
     integer_params: Vec<(String, String)>,
+    target_pointer_width: Option<u32>,
 }
 
 impl Z3Env {
-    fn new(params: &[(String, String)]) -> Self {
+    fn new(params: &[(String, String)], target_pointer_width: Option<u32>) -> Self {
         Self {
             declarations: HashMap::new(),
             integer_params: params
@@ -181,6 +200,7 @@ impl Z3Env {
                 .filter(|(_name, ty)| is_supported_integer(ty))
                 .cloned()
                 .collect(),
+            target_pointer_width,
         }
     }
 
@@ -200,7 +220,7 @@ impl Z3Env {
             if let Some(min) = min_value(&ty).and_then(int_literal) {
                 assertions.push(variable.ge(&min));
             }
-            if let Some(max) = max_value(&ty).and_then(int_literal) {
+            if let Some(max) = max_value(&ty, self.target_pointer_width).and_then(int_literal) {
                 assertions.push(variable.le(&max));
             }
         }
@@ -255,7 +275,7 @@ impl Expr {
     }
 }
 
-fn parse_predicate(input: &str) -> Option<Predicate> {
+fn parse_predicate(input: &str, target_pointer_width: Option<u32>) -> Option<Predicate> {
     for (needle, op) in [
         ("<=", CmpOp::Le),
         (">=", CmpOp::Ge),
@@ -268,18 +288,18 @@ fn parse_predicate(input: &str) -> Option<Predicate> {
             continue;
         };
         return Some(Predicate {
-            left: parse_expr(left)?,
+            left: parse_expr(left, target_pointer_width)?,
             op,
-            right: parse_expr(right)?,
+            right: parse_expr(right, target_pointer_width)?,
         });
     }
 
     None
 }
 
-fn parse_expr(input: &str) -> Option<Expr> {
+fn parse_expr(input: &str, target_pointer_width: Option<u32>) -> Option<Expr> {
     let input = input.trim();
-    if let Some(value) = parse_const_expr(input) {
+    if let Some(value) = parse_const_expr(input, target_pointer_width) {
         return Some(Expr::Const(value));
     }
     if input
@@ -292,18 +312,18 @@ fn parse_expr(input: &str) -> Option<Expr> {
     None
 }
 
-fn parse_const_expr(input: &str) -> Option<i128> {
+fn parse_const_expr(input: &str, target_pointer_width: Option<u32>) -> Option<i128> {
     if let Ok(value) = input.parse::<i128>() {
         return Some(value);
     }
-    if let Some(value) = rust_integer_bound(input) {
+    if let Some(value) = rust_integer_bound(input, target_pointer_width) {
         return Some(value);
     }
 
     for op in ['+', '-', '/'] {
         for idx in operator_indices(input, op).into_iter().rev() {
-            let left = parse_const_expr(&input[..idx])?;
-            let right = parse_const_expr(&input[idx + 1..])?;
+            let left = parse_const_expr(&input[..idx], target_pointer_width)?;
+            let right = parse_const_expr(&input[idx + 1..], target_pointer_width)?;
             return match op {
                 '+' => left.checked_add(right),
                 '-' => left.checked_sub(right),
@@ -356,11 +376,11 @@ fn is_supported_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64" | "usize")
 }
 
-fn max_value(ty: &str) -> Option<i128> {
+fn max_value(ty: &str, target_pointer_width: Option<u32>) -> Option<i128> {
     match ty {
         "i32" => Some(i32::MAX as i128),
         "i64" => Some(i64::MAX as i128),
-        "usize" => Some(usize::MAX as i128),
+        "usize" => Some(usize_max_value(target_pointer_width)),
         _ => None,
     }
 }
@@ -374,15 +394,24 @@ fn min_value(ty: &str) -> Option<i128> {
     }
 }
 
-fn rust_integer_bound(input: &str) -> Option<i128> {
+fn rust_integer_bound(input: &str, target_pointer_width: Option<u32>) -> Option<i128> {
     match input {
         "i32::MAX" => Some(i32::MAX as i128),
         "i32::MIN" => Some(i32::MIN as i128),
         "i64::MAX" => Some(i64::MAX as i128),
         "i64::MIN" => Some(i64::MIN as i128),
-        "usize::MAX" => Some(usize::MAX as i128),
+        "usize::MAX" => Some(usize_max_value(target_pointer_width)),
         "usize::MIN" => Some(0),
         _ => None,
+    }
+}
+
+fn usize_max_value(target_pointer_width: Option<u32>) -> i128 {
+    match target_pointer_width {
+        Some(16) => u16::MAX as i128,
+        Some(32) => u32::MAX as i128,
+        Some(64) => u64::MAX as i128,
+        _ => usize::MAX as i128,
     }
 }
 
@@ -406,14 +435,29 @@ mod tests {
 
     #[test]
     fn parses_rust_bounds_as_constants() {
-        assert_eq!(parse_const_expr("i32::MAX-1"), Some(2147483646));
-        assert_eq!(parse_const_expr("i32::MIN+1"), Some(-2147483647));
-        assert_eq!(parse_const_expr("i64::MAX/2"), Some(i64::MAX as i128 / 2));
+        assert_eq!(parse_const_expr("i32::MAX-1", None), Some(2147483646));
+        assert_eq!(parse_const_expr("i32::MIN+1", None), Some(-2147483647));
+        assert_eq!(
+            parse_const_expr("i64::MAX/2", None),
+            Some(i64::MAX as i128 / 2)
+        );
+    }
+
+    #[test]
+    fn parses_usize_bounds_for_target_pointer_width() {
+        assert_eq!(
+            parse_const_expr("usize::MAX", Some(32)),
+            Some(u32::MAX as i128)
+        );
+        assert_eq!(
+            parse_const_expr("usize::MAX/2", Some(16)),
+            Some(u16::MAX as i128 / 2)
+        );
     }
 
     #[test]
     fn parses_simple_predicate_variables() {
-        let predicate = parse_predicate("x<2147483647").unwrap();
+        let predicate = parse_predicate("x<2147483647", None).unwrap();
 
         assert_eq!(
             referenced_variables(&predicate),
@@ -426,7 +470,7 @@ mod tests {
         let contracts = vec!["x<2147483647".to_string()];
 
         assert_eq!(
-            prove_addition_overflow_safety("x", "i32", 1, &contracts, &i32_param("x"), 5000),
+            prove_addition_overflow_safety("x", "i32", 1, &contracts, &i32_param("x"), None, 5000),
             ProofResult::Proved
         );
     }
@@ -434,7 +478,7 @@ mod tests {
     #[test]
     fn z3_rejects_unbounded_add_one() {
         assert_eq!(
-            prove_addition_overflow_safety("x", "i32", 1, &[], &i32_param("x"), 5000),
+            prove_addition_overflow_safety("x", "i32", 1, &[], &i32_param("x"), None, 5000),
             ProofResult::Unproved
         );
     }
@@ -442,7 +486,7 @@ mod tests {
     #[test]
     fn z3_rejects_unknown_variables_in_conclusion() {
         assert_eq!(
-            prove_integer_predicate(&[], "y>0", &i32_param("x"), 5000),
+            prove_integer_predicate(&[], "y>0", &i32_param("x"), None, 5000),
             ProofResult::Unsupported
         );
     }
@@ -452,7 +496,7 @@ mod tests {
         let contracts = vec!["y==x".to_string()];
 
         assert_eq!(
-            prove_integer_predicate(&contracts, "x==x", &i32_param("x"), 5000),
+            prove_integer_predicate(&contracts, "x==x", &i32_param("x"), None, 5000),
             ProofResult::Unsupported
         );
     }
@@ -462,7 +506,7 @@ mod tests {
         let contracts = vec!["y>=1".to_string()];
 
         assert_eq!(
-            prove_integer_predicate(&contracts, "y!=0", &i32_param("y"), 5000),
+            prove_integer_predicate(&contracts, "y!=0", &i32_param("y"), None, 5000),
             ProofResult::Proved
         );
     }

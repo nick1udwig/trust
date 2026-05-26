@@ -21,6 +21,7 @@ Implemented:
 - package config under `[package.metadata.trust]`
 - local proof cache with target, rustc, solver, config, contract, and body invalidation
 - crate-backed vendored Z3 backend, plus mock solver status tests
+- target-aware `usize` proof bounds using the rustc target pointer width
 - optional SMT-LIB query dumps with `TRUST_SMT_DUMP_DIR`
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
 - runtime public precondition assertions
