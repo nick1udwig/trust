@@ -445,14 +445,26 @@ fn verify_total_with_env(
         });
     }
     if let Some(callee) = unsupported_semantic_call(semantics, env, &metadata.rust_function_path) {
-        let callee = unsupported_call(body, &params, &call_env, &metadata.rust_function_path)
-            .unwrap_or(callee);
+        let callee = unsupported_call(
+            body,
+            &params,
+            &call_env,
+            &metadata.rust_function_path,
+            semantics,
+        )
+        .unwrap_or(callee);
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
             callee,
         });
     }
-    if let Some(callee) = unsupported_call(body, &params, &call_env, &metadata.rust_function_path) {
+    if let Some(callee) = unsupported_call(
+        body,
+        &params,
+        &call_env,
+        &metadata.rust_function_path,
+        semantics,
+    ) {
         return Err(VerificationError::UnsupportedCall {
             function: metadata.rust_function_path.clone(),
             callee,
@@ -2171,6 +2183,7 @@ fn unsupported_call(
     params: &[Param],
     env: &[TrustFunctionSummary],
     function: &str,
+    semantics: Option<&TrustFunctionSemantics>,
 ) -> Option<String> {
     let tokens = tokens(body);
 
@@ -2181,7 +2194,7 @@ fn unsupported_call(
         if dot != "." || open != "(" || !is_ident(method) {
             continue;
         }
-        if method == "len" && is_read_only_slice_param(base, params) {
+        if method == "len" && supported_len_method(base, params, semantics) {
             continue;
         }
 
@@ -2224,6 +2237,19 @@ fn unsupported_call(
     None
 }
 
+fn supported_len_method(
+    receiver: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> bool {
+    is_read_only_slice_param(receiver, params)
+        || semantics.into_iter().any(|semantics| {
+            semantics.calls.iter().any(|call| {
+                call.callee == "<slice>.len" && call.args.iter().any(|arg| arg == receiver)
+            })
+        })
+}
+
 fn unsupported_semantic_call(
     semantics: Option<&TrustFunctionSemantics>,
     env: &[TrustFunctionSummary],
@@ -2235,6 +2261,9 @@ fn unsupported_semantic_call(
                 return Some(call.callee.clone());
             }
             if call.trust_callee.is_some() {
+                return None;
+            }
+            if call.callee == "<slice>.len" {
                 return None;
             }
             if unique_semantic_function_for_call(env, &call.callee).is_some() {
@@ -4278,6 +4307,62 @@ mod tests {
         let metadata = metadata_named("len", "pub fn len(xs: &[i32]) -> usize { xs.len() }", &[]);
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn semantic_len_call_allows_slice_alias_method() {
+        let metadata = metadata_named(
+            "get_or_zero",
+            "pub fn get_or_zero(xs: &[i32], i: usize) -> i32 { let ys = xs; if i < ys.len() { xs[i] } else { 0 } }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get_or_zero".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "&[i32]".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
+                index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "i32".to_string(),
+                expression: "xs[i]".to_string(),
+                guards: vec!["i < xs.len()".to_string()],
+            }],
+            calls: vec![SemanticCall {
+                callee: "<slice>.len".to_string(),
+                args: vec!["ys".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedCall {
+                function: "get_or_zero".to_string(),
+                callee: "ys.len".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
     }
 
     #[test]

@@ -704,6 +704,20 @@ impl MirFunctionSummary {
             .map(|local| local.name.as_str())
     }
 
+    fn local_names_for_place(&self, place: &str) -> Vec<&str> {
+        let mut names = Vec::new();
+        for local in self
+            .debug_locals
+            .iter()
+            .filter(|local| local.place == place)
+        {
+            if !names.contains(&local.name.as_str()) {
+                names.push(local.name.as_str());
+            }
+        }
+        names
+    }
+
     fn type_for_place(&self, place: &str) -> Option<&str> {
         self.args
             .iter()
@@ -1109,7 +1123,8 @@ impl MirFunctionSummary {
         model_fields: &[ModelFieldMap],
         trust_callees: &[SemanticTrustCallee],
     ) -> Vec<SemanticCall> {
-        self.assignments
+        let mut calls = self
+            .assignments
             .iter()
             .filter_map(|assignment| {
                 let (callee, args) = mir_call(&assignment.expression)?;
@@ -1127,7 +1142,56 @@ impl MirFunctionSummary {
                         .unwrap_or_default(),
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        calls.extend(self.semantic_len_calls_with_models(model_fields));
+        calls
+    }
+
+    fn semantic_len_calls_with_models(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticCall> {
+        let mut calls = Vec::new();
+
+        for assignment in &self.assignments {
+            let Some(base) = mir_ptr_metadata(&assignment.expression) else {
+                continue;
+            };
+            let base_place = strip_mir_move_or_copy(base);
+            let Some(base_type) = self.type_for_place(base_place) else {
+                continue;
+            };
+            if slice_element_type(base_type).is_none() {
+                continue;
+            }
+
+            let mut receivers = self
+                .local_names_for_place(base_place)
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if let Some(normalized) = self.normalized_mir_expression_with_models(base, model_fields)
+            {
+                if !receivers.contains(&normalized) {
+                    receivers.push(normalized);
+                }
+            }
+
+            for receiver in receivers {
+                if calls.iter().any(|call: &SemanticCall| {
+                    call.callee == "<slice>.len"
+                        && call.args.len() == 1
+                        && call.args.first() == Some(&receiver)
+                }) {
+                    continue;
+                }
+                calls.push(SemanticCall {
+                    callee: "<slice>.len".to_string(),
+                    trust_callee: None,
+                    args: vec![receiver],
+                    guards: Vec::new(),
+                });
+            }
+        }
+
+        calls
     }
 
     fn semantic_field_accesses(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticFieldAccess> {
@@ -1661,6 +1725,13 @@ fn mir_call(expr: &str) -> Option<(&str, Vec<String>)> {
     let (callee, args) = call.split_once('(')?;
     let args = args.strip_suffix(')')?;
     Some((callee.trim(), parse_mir_call_args(args)))
+}
+
+fn mir_ptr_metadata(expr: &str) -> Option<&str> {
+    expr.trim()
+        .strip_prefix("PtrMetadata(")?
+        .strip_suffix(')')
+        .map(str::trim)
 }
 
 fn parse_mir_call_args(input: &str) -> Vec<String> {
@@ -2983,6 +3054,62 @@ fn verified::get_or_zero(_1: &[i32], _2: usize) -> i32 {
                 expression: "xs[i]".to_string(),
                 guards: vec!["i < xs.len()".to_string()],
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_supported_slice_len_alias_calls() {
+        let mir = r#"
+fn get_or_zero(_1: &[i32], _2: usize) -> i32 {
+    debug xs => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: bool;
+    let mut _4: usize;
+    scope 1 {
+        debug ys => _1;
+    }
+
+    bb0: {
+        _4 = PtrMetadata(copy _1);
+        _3 = Lt(copy _2, move _4);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy (*_1)[_2];
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "get_or_zero").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![
+                SemanticCall {
+                    callee: "<slice>.len".to_string(),
+                    args: vec!["xs".to_string()],
+                    guards: Vec::new(),
+                    trust_callee: None,
+                },
+                SemanticCall {
+                    callee: "<slice>.len".to_string(),
+                    args: vec!["ys".to_string()],
+                    guards: Vec::new(),
+                    trust_callee: None,
+                },
+            ]
         );
     }
 
