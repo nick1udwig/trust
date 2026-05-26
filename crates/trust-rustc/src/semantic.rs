@@ -736,13 +736,19 @@ impl MirFunctionSummary {
             .iter()
             .filter_map(|assignment| {
                 let expr = strip_mir_move_or_copy(&assignment.expression);
-                let (base, index) = mir_slice_index(expr)?;
-                let base = self.normalized_mir_expression_with_models(base, model_fields)?;
-                let index = self.normalized_mir_expression_with_models(index, model_fields)?;
+                let (base_place, index_expr) = mir_slice_index(expr)?;
+                let base_type = self.type_for_place(base_place)?.to_string();
+                let element_type = slice_element_type(&base_type)?.to_string();
+                let index_type = self.mir_expression_type(index_expr, model_fields)?;
+                let base = self.normalized_mir_expression_with_models(base_place, model_fields)?;
+                let index = self.normalized_mir_expression_with_models(index_expr, model_fields)?;
                 Some(SemanticSliceIndex {
                     expression: format!("{base}[{index}]"),
                     base,
+                    base_type,
                     index,
+                    index_type,
+                    element_type,
                     guards: assignment
                         .block
                         .as_deref()
@@ -1287,6 +1293,13 @@ fn mir_slice_base_place(base: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+fn slice_element_type(ty: &str) -> Option<&str> {
+    ty.trim()
+        .strip_prefix("&[")?
+        .strip_suffix(']')
+        .map(str::trim)
+}
+
 fn mir_call(expr: &str) -> Option<(&str, Vec<String>)> {
     let (call, _target) = expr.split_once(" -> ")?;
     let (callee, args) = call.split_once('(')?;
@@ -1549,10 +1562,14 @@ fn semantic_summary(
                 .semantic_slice_indexes_with_models(&model_fields)
                 .iter()
                 .map(|index| {
+                    let index_expr = format!(
+                        "{} element_type={} index_type={}",
+                        index.expression, index.element_type, index.index_type
+                    );
                     if index.guards.is_empty() {
-                        index.expression.clone()
+                        index_expr
                     } else {
-                        format!("{} guarded_by {}", index.expression, index.guards.join("&"))
+                        format!("{} guarded_by {}", index_expr, index.guards.join("&"))
                     }
                 })
                 .collect::<Vec<_>>()
@@ -2358,7 +2375,10 @@ fn verified::get(_1: &[i32], _2: usize) -> i32 {
             summary.semantic_slice_indexes(),
             vec![SemanticSliceIndex {
                 base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
                 index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "i32".to_string(),
                 expression: "xs[i]".to_string(),
                 guards: Vec::new(),
             }]
@@ -2409,7 +2429,10 @@ fn verified::get_or_zero(_1: &[i32], _2: usize) -> i32 {
             summary.semantic_slice_indexes(),
             vec![SemanticSliceIndex {
                 base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
                 index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "i32".to_string(),
                 expression: "xs[i]".to_string(),
                 guards: vec!["i < xs.len()".to_string()],
             }]

@@ -47,7 +47,10 @@ pub enum SemanticArithmeticKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticSliceIndex {
     pub base: String,
+    pub base_type: String,
     pub index: String,
+    pub index_type: String,
+    pub element_type: String,
     pub expression: String,
     pub guards: Vec<String>,
 }
@@ -1776,6 +1779,7 @@ fn semantic_slice_index_obligations(
     semantics
         .into_iter()
         .flat_map(|semantics| semantics.slice_indexes.iter())
+        .filter(|index| semantic_slice_index_supported(index))
         .map(|index| SliceIndexObligation {
             base: index.base.clone(),
             index: index.index.clone(),
@@ -1783,6 +1787,12 @@ fn semantic_slice_index_obligations(
             assumptions: index.guards.iter().map(|guard| normalize(guard)).collect(),
         })
         .collect()
+}
+
+fn semantic_slice_index_supported(index: &SemanticSliceIndex) -> bool {
+    index.index_type == "usize"
+        && slice_element_type(&index.base_type)
+            .is_some_and(|element_type| element_type == index.element_type)
 }
 
 fn unsupported_index_expression(body: &str, params: &[Param]) -> Option<String> {
@@ -2804,6 +2814,13 @@ fn is_read_only_slice_param(name: &str, params: &[Param]) -> bool {
     params
         .iter()
         .any(|param| param.name == name && param.ty.starts_with("&[") && param.ty.ends_with(']'))
+}
+
+fn slice_element_type(ty: &str) -> Option<&str> {
+    ty.trim()
+        .strip_prefix("&[")?
+        .strip_suffix(']')
+        .map(str::trim)
 }
 
 fn type_name_tail(ty: &str) -> String {
@@ -4758,7 +4775,10 @@ mod tests {
             arithmetic_operations: Vec::new(),
             slice_indexes: vec![SemanticSliceIndex {
                 base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
                 index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "i32".to_string(),
                 expression: "xs[i]".to_string(),
                 guards: Vec::new(),
             }],
@@ -4802,7 +4822,10 @@ mod tests {
             arithmetic_operations: Vec::new(),
             slice_indexes: vec![SemanticSliceIndex {
                 base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
                 index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "i32".to_string(),
                 expression: "xs[i]".to_string(),
                 guards: vec!["i < xs.len()".to_string()],
             }],
@@ -4820,6 +4843,49 @@ mod tests {
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
         );
+    }
+
+    #[test]
+    fn semantic_slice_index_requires_matching_element_type() {
+        let metadata = metadata_named(
+            "get",
+            "pub fn get(xs: &[i32], i: usize) -> i32 { xs[{ i }] }",
+            &["i < xs.len()"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "&[i32]".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            return_expression: Some("xs[i]".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: vec![SemanticSliceIndex {
+                base: "xs".to_string(),
+                base_type: "&[i32]".to_string(),
+                index: "i".to_string(),
+                index_type: "usize".to_string(),
+                element_type: "u8".to_string(),
+                expression: "xs[i]".to_string(),
+                guards: Vec::new(),
+            }],
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert!(matches!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SliceIndexOutOfBounds { .. })
+        ));
     }
 
     #[test]
