@@ -91,6 +91,21 @@ struct ModelField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ContractBinding {
+    expression: String,
+    name: String,
+    kind: ContractBindingKind,
+    ty: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractBindingKind {
+    Param,
+    Result,
+    Field,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MirVariantProjection {
     place: String,
     variant: String,
@@ -298,6 +313,206 @@ fn trust_preconditions(item: &TrustMetadata) -> Vec<String> {
         .filter(|(_contract, class)| matches!(class.as_str(), "given executable" | "given ghost"))
         .map(|(contract, _class)| contract.clone())
         .collect()
+}
+
+fn semantic_contract_bindings(
+    item: &TrustMetadata,
+    mir_function: &MirFunctionSummary,
+    model_fields: &[ModelFieldMap],
+) -> Vec<ContractBinding> {
+    let params = mir_function
+        .args
+        .iter()
+        .map(|arg| SemanticParam {
+            name: mir_function
+                .local_name_for_place(&arg.place)
+                .unwrap_or(&arg.place)
+                .to_string(),
+            ty: arg.ty.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut bindings = Vec::new();
+
+    for (expression, class) in item
+        .contracts_original
+        .iter()
+        .zip(item.contract_classes.iter())
+        .filter(|(_expression, class)| {
+            matches!(
+                class.as_str(),
+                "given executable" | "given ghost" | "gives executable" | "gives ghost"
+            )
+        })
+    {
+        bindings.extend(contract_bindings_for_expression(
+            expression,
+            class,
+            &params,
+            &mir_function.return_type,
+            model_fields,
+        ));
+    }
+
+    dedup_contract_bindings(bindings)
+}
+
+fn contract_bindings_for_expression(
+    expression: &str,
+    class: &str,
+    params: &[SemanticParam],
+    return_type: &str,
+    model_fields: &[ModelFieldMap],
+) -> Vec<ContractBinding> {
+    let tokens = contract_tokens(expression);
+    let mut bindings = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_ident_token(token) || token_is_path_segment(&tokens, idx) {
+            continue;
+        }
+
+        if let Some(param) = params.iter().find(|param| param.name == *token) {
+            bindings.push(ContractBinding {
+                expression: expression.to_string(),
+                name: param.name.clone(),
+                kind: ContractBindingKind::Param,
+                ty: param.ty.clone(),
+            });
+            if let Some(field_binding) = contract_field_binding(
+                expression,
+                &tokens,
+                idx,
+                &param.name,
+                &param.ty,
+                model_fields,
+            ) {
+                bindings.push(field_binding);
+            }
+            continue;
+        }
+
+        if class.starts_with("gives") && token == "out" {
+            bindings.push(ContractBinding {
+                expression: expression.to_string(),
+                name: "out".to_string(),
+                kind: ContractBindingKind::Result,
+                ty: return_type.to_string(),
+            });
+            if let Some(field_binding) =
+                contract_field_binding(expression, &tokens, idx, "out", return_type, model_fields)
+            {
+                bindings.push(field_binding);
+            }
+        }
+    }
+
+    bindings
+}
+
+fn contract_field_binding(
+    expression: &str,
+    tokens: &[String],
+    base_idx: usize,
+    base_name: &str,
+    base_ty: &str,
+    model_fields: &[ModelFieldMap],
+) -> Option<ContractBinding> {
+    if tokens.get(base_idx + 1)? != "." {
+        return None;
+    }
+    let field = tokens.get(base_idx + 2)?;
+    if !is_ident_token(field) || tokens.get(base_idx + 3).is_some_and(|token| token == "(") {
+        return None;
+    }
+    let model = model_fields
+        .iter()
+        .find(|model| model.ty == type_name_tail(base_ty))?;
+    let model_field = model
+        .fields
+        .iter()
+        .find(|model_field| model_field.name == *field)?;
+
+    Some(ContractBinding {
+        expression: expression.to_string(),
+        name: format!("{base_name}.{field}"),
+        kind: ContractBindingKind::Field,
+        ty: model_field.ty.clone(),
+    })
+}
+
+fn dedup_contract_bindings(bindings: Vec<ContractBinding>) -> Vec<ContractBinding> {
+    let mut deduped = Vec::new();
+    for binding in bindings {
+        if deduped.iter().any(|existing| existing == &binding) {
+            continue;
+        }
+        deduped.push(binding);
+    }
+    deduped
+}
+
+fn contract_binding_summary(bindings: &[ContractBinding]) -> String {
+    bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "{}:{}:{}:{}",
+                binding.expression,
+                binding.name,
+                contract_binding_kind_name(binding.kind),
+                binding.ty
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn contract_binding_kind_name(kind: ContractBindingKind) -> &'static str {
+    match kind {
+        ContractBindingKind::Param => "param",
+        ContractBindingKind::Result => "result",
+        ContractBindingKind::Field => "field",
+    }
+}
+
+fn contract_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+            continue;
+        }
+        if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        if !ch.is_whitespace() {
+            tokens.push(ch.to_string());
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn is_ident_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn token_is_path_segment(tokens: &[String], idx: usize) -> bool {
+    tokens.get(idx.checked_sub(2).unwrap_or(usize::MAX)) == Some(&":".to_string())
+        && tokens.get(idx.checked_sub(1).unwrap_or(usize::MAX)) == Some(&":".to_string())
+        || tokens.get(idx + 1) == Some(&":".to_string())
+            && tokens.get(idx + 2) == Some(&":".to_string())
 }
 
 fn trust_callee_for_call(
@@ -1611,6 +1826,16 @@ fn semantic_summary(
             item.mir_match
         ));
         if let Some(mir_function) = &item.mir_function {
+            let contract_bindings = metadata
+                .iter()
+                .find(|metadata_item| {
+                    metadata_item.item_kind == item.item_kind
+                        && metadata_item.item_id == item.item_id
+                })
+                .map(|metadata_item| {
+                    semantic_contract_bindings(metadata_item, mir_function, &model_fields)
+                })
+                .unwrap_or_default();
             let return_expr = mir_function
                 .normalized_return_expression_with_models(&model_fields)
                 .or_else(|| mir_function.return_expr.clone())
@@ -1720,7 +1945,7 @@ fn semantic_summary(
                 .collect::<Vec<_>>()
                 .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={} branches={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} contract_bindings={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={} branches={}\n",
                 mir_function.path,
                 mir_function
                     .args
@@ -1735,6 +1960,7 @@ fn semantic_summary(
                     .map(|local| local.name.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
+                contract_binding_summary(&contract_bindings),
                 return_expr,
                 arithmetic_ops,
                 slice_indexes,
@@ -2643,6 +2869,123 @@ fn verified::caller(_1: i32) -> i32 {
                 }],
                 preconditions: vec!["x < i32::MAX".to_string()],
             }]
+        );
+    }
+
+    #[test]
+    fn maps_contract_identifiers_to_typed_program_entities() {
+        let item = TrustMetadata {
+            schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "unknown".to_string(),
+            item_kind: "total".to_string(),
+            item_id: "total:withdraw:test".to_string(),
+            source_span: "unknown".to_string(),
+            rust_function_path: "withdraw".to_string(),
+            visibility: "public".to_string(),
+            contracts_original: vec![
+                "account.balance >= amount".to_string(),
+                "out.id == account.id".to_string(),
+            ],
+            contracts_normalized: vec![
+                "account.balance >= amount".to_string(),
+                "out.id == account.id".to_string(),
+            ],
+            contract_classes: vec!["given executable".to_string(), "gives ghost".to_string()],
+            assertion_policy: "always".to_string(),
+            function_source:
+                "pub fn withdraw(account: Account, amount: i64) -> Account { account }".to_string(),
+            body_hash_placeholder: "test".to_string(),
+            trust_model_dependencies: Vec::new(),
+        };
+        let mir_function = MirFunctionSummary {
+            path: "verified::withdraw".to_string(),
+            args: vec![
+                MirArg {
+                    place: "_1".to_string(),
+                    ty: "Account".to_string(),
+                },
+                MirArg {
+                    place: "_2".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ],
+            return_type: "Account".to_string(),
+            locals: Vec::new(),
+            debug_locals: vec![
+                MirDebugLocal {
+                    name: "account".to_string(),
+                    place: "_1".to_string(),
+                },
+                MirDebugLocal {
+                    name: "amount".to_string(),
+                    place: "_2".to_string(),
+                },
+            ],
+            assignments: Vec::new(),
+            terminators: Vec::new(),
+            return_expr: None,
+        };
+        let model_fields = vec![ModelFieldMap {
+            ty: "Account".to_string(),
+            fields: vec![
+                ModelField {
+                    name: "id".to_string(),
+                    ty: "u64".to_string(),
+                },
+                ModelField {
+                    name: "balance".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ],
+        }];
+
+        assert_eq!(
+            semantic_contract_bindings(&item, &mir_function, &model_fields),
+            vec![
+                ContractBinding {
+                    expression: "account.balance >= amount".to_string(),
+                    name: "account".to_string(),
+                    kind: ContractBindingKind::Param,
+                    ty: "Account".to_string(),
+                },
+                ContractBinding {
+                    expression: "account.balance >= amount".to_string(),
+                    name: "account.balance".to_string(),
+                    kind: ContractBindingKind::Field,
+                    ty: "i64".to_string(),
+                },
+                ContractBinding {
+                    expression: "account.balance >= amount".to_string(),
+                    name: "amount".to_string(),
+                    kind: ContractBindingKind::Param,
+                    ty: "i64".to_string(),
+                },
+                ContractBinding {
+                    expression: "out.id == account.id".to_string(),
+                    name: "out".to_string(),
+                    kind: ContractBindingKind::Result,
+                    ty: "Account".to_string(),
+                },
+                ContractBinding {
+                    expression: "out.id == account.id".to_string(),
+                    name: "out.id".to_string(),
+                    kind: ContractBindingKind::Field,
+                    ty: "u64".to_string(),
+                },
+                ContractBinding {
+                    expression: "out.id == account.id".to_string(),
+                    name: "account".to_string(),
+                    kind: ContractBindingKind::Param,
+                    ty: "Account".to_string(),
+                },
+                ContractBinding {
+                    expression: "out.id == account.id".to_string(),
+                    name: "account.id".to_string(),
+                    kind: ContractBindingKind::Field,
+                    ty: "u64".to_string(),
+                },
+            ]
         );
     }
 

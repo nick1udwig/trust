@@ -1221,6 +1221,7 @@ fn pass_semantic_block_call_precondition_uses_mir_call_args() {
         .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
         .expect("expected Trust semantic summary");
     let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("contract_bindings=x < i32::MAX:x:param:i32"));
     assert!(summary.contains("trust_callee=inc"));
     assert!(summary.contains("preconditions=x < i32::MAX"));
 }
