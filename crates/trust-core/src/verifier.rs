@@ -1187,15 +1187,16 @@ fn postcondition_proved(
     options: VerificationOptions,
 ) -> bool {
     let return_expression = return_expression(body);
-    if let Some(proved) = semantic_return_proves_postcondition(
+    let semantic_return_proved = semantic_return_proves_postcondition(
         postcondition,
         raw_body,
         semantic_return_expression,
         contracts,
         params,
         options,
-    ) {
-        return proved;
+    );
+    if semantic_return_proved == Some(true) {
+        return true;
     }
     if let Some(proved) = semantic_match_proves_postcondition(
         postcondition,
@@ -1216,6 +1217,9 @@ fn postcondition_proved(
         options,
     ) {
         return proved;
+    }
+    if semantic_return_proved == Some(false) {
+        return false;
     }
 
     postcondition_proved_by_return_expression_with_assumptions(
@@ -7184,6 +7188,54 @@ mod tests {
             }],
         };
 
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_branch_can_prove_postcondition_after_local_return_expression() {
+        let metadata = metadata_named_with_classes(
+            "zero_or_self_via_local",
+            "pub fn zero_or_self_via_local(x: i32) -> i32 { let mut y = x; if x == 0 { y = 0; } else { y = x; } y }",
+            &["out == x"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "zero_or_self_via_local".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: vec!["i32".to_string()],
+            contract_bindings: Vec::new(),
+            return_expression: Some("y".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "x == 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x == 0".to_string(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x != 0".to_string(),
+                        return_expression: Some("x".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::PostconditionUnproved { .. })
+        ));
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())

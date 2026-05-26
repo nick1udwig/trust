@@ -47,9 +47,10 @@ Still intentionally limited:
   index types, supported slice `len` receiver and slice-index base alias
   resolution, resolved primitive integer `checked_add` calls, call arguments with
   simple branch guards and attached Trust callee preconditions, `if` branch
-  return facts, Option/Result match arms, loop decreases targets and loop exit
-  facts from compiler branch guards, source-local type bindings for local loop
-  measures, and TrustModel field projections,
+  return facts, branch-assignment return facts at simple MIR joins,
+  Option/Result match arms, loop decreases targets and loop exit facts from
+  compiler branch guards, source-local type bindings for local loop measures,
+  and TrustModel field projections,
   including through unambiguous local aliases, field types, missing-TrustModel
   field checks, unsupported shift/bitwise/cast-operation and
   signature/source-local type checks, opaque contract-reasoning checks, path
@@ -146,10 +147,11 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   with element and index types, supported slice `len` receiver and slice-index
   base alias resolution, resolved primitive integer `checked_add` calls, guarded
   call arguments with attached Trust callee preconditions, `if` branch return
-  facts, Option/Result match arms, loop decreases targets, loop exit facts, and
-  source-local type bindings for local loop measures, and TrustModel field
-  projections in returns, unambiguous local aliases, and path guards plus field
-  types for arithmetic obligations, missing-TrustModel checks, and unsupported
+  facts, branch-assignment return facts at simple MIR joins, Option/Result match
+  arms, loop decreases targets, loop exit facts, and source-local type bindings
+  for local loop measures, and TrustModel field projections in returns,
+  unambiguous local aliases, and path guards plus field types for arithmetic
+  obligations, missing-TrustModel checks, and unsupported
   shift/bitwise/cast-operation, signature/source-local type checks, and opaque
   contract-reasoning checks, into verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.

@@ -1474,6 +1474,21 @@ fn pass_semantic_if_guard_postcondition_uses_mir_branch_assumption() {
 }
 
 #[test]
+fn pass_semantic_if_assignment_postcondition_uses_mir_join() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_if_assignment_postcondition",
+        Expected::Pass,
+        &format!("pass_semantic_if_assignment_postcondition_{suffix}"),
+        &format!("pass_semantic_if_assignment_postcondition_{suffix}"),
+        &[("TRUST_SEMANTIC_VERIFY", "1")],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_semantic_branch_guard_add_uses_mir_path_condition() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(

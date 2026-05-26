@@ -1860,6 +1860,39 @@ impl MirFunctionSummary {
             .and_then(|assignment| {
                 self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
             })
+            .or_else(|| self.semantic_join_return_expression_for_block(block, model_fields))
+    }
+
+    fn semantic_join_return_expression_for_block(
+        &self,
+        block: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        let join_block = self.goto_target_for_block(block)?;
+        let return_place = self.return_source_place_for_block(join_block)?;
+        let assignment = self.assignments.iter().rev().find(|assignment| {
+            assignment.block.as_deref() == Some(block) && assignment.place == return_place
+        })?;
+
+        self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
+    }
+
+    fn goto_target_for_block(&self, block: &str) -> Option<&str> {
+        self.terminators
+            .iter()
+            .find(|terminator| terminator.block.as_deref() == Some(block))
+            .and_then(|terminator| terminator.expression.strip_prefix("goto -> "))
+            .map(str::trim)
+    }
+
+    fn return_source_place_for_block(&self, block: &str) -> Option<&str> {
+        self.assignments
+            .iter()
+            .find(|assignment| {
+                assignment.block.as_deref() == Some(block) && assignment.place == "_0"
+            })
+            .map(|assignment| strip_mir_move_or_copy(&assignment.expression))
+            .filter(|place| place.starts_with('_'))
     }
 }
 
@@ -3114,6 +3147,59 @@ fn zero_if_positive(_1: i32) -> i32 {
                     SemanticBranchArm {
                         guard: "x > 0".to_string(),
                         return_expression: Some("1".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_if_branch_assignment_return_expressions() {
+        let mir = r#"
+fn zero_or_self(_1: i32) -> i32 {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: i32;
+    let mut _2: i32;
+    let mut _3: bool;
+
+    bb0: {
+        _2 = copy _1;
+        _3 = Eq(copy _1, const 0_i32);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _2 = const 0_i32;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _2 = copy _1;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "zero_or_self").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_branches(&[]),
+            vec![SemanticBranch {
+                condition: "x == 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x != 0".to_string(),
+                        return_expression: Some("x".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x == 0".to_string(),
+                        return_expression: Some("0".to_string()),
                     },
                 ],
             }]
