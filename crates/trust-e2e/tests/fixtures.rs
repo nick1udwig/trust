@@ -69,6 +69,7 @@ fn pass_total_identity_writes_hir_mir_semantic_dumps_when_requested() {
     assert!(summary.contains("args=_1: i32"));
     assert!(summary.contains("return_type=i32"));
     assert!(summary.contains("debug_locals=x"));
+    assert!(summary.contains("local_types=i32"));
     assert!(summary.contains("return_expr=x"));
 }
 
@@ -1031,6 +1032,21 @@ fn fail_semantic_float_signature_is_rejected_by_mir_verifier() {
 
     output.assert_contains("trust: extracted HIR/MIR for 1 total function");
     output.assert_contains("error[trust]: unsupported type in `verified::id_f32`: `f32`");
+}
+
+#[test]
+fn fail_semantic_float_local_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_float_local",
+        Expected::Fail,
+        &format!("fail_semantic_float_local_{suffix}"),
+        &format!("fail_semantic_float_local_{suffix}"),
+        &[],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: unsupported type in `verified::keep_i32`: `f32`");
 }
 
 #[test]

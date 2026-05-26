@@ -249,6 +249,7 @@ fn verifier_semantics(
                     })
                     .collect(),
                 return_type: mir_function.return_type.clone(),
+                local_types: mir_function.source_local_types(),
                 contract_bindings: semantic_contract_bindings(
                     metadata_item,
                     mir_function,
@@ -779,6 +780,19 @@ impl MirFunctionSummary {
             }
         }
         names
+    }
+
+    fn source_local_types(&self) -> Vec<String> {
+        let mut types = Vec::new();
+        for local in &self.debug_locals {
+            let Some(ty) = self.mir_expression_type(&local.place, &[]) else {
+                continue;
+            };
+            if !types.iter().any(|existing| existing == &ty) {
+                types.push(ty);
+            }
+        }
+        types
     }
 
     fn local_aliases_for_place_with_models(
@@ -1895,9 +1909,19 @@ fn mir_const_type(expr: &str) -> Option<String> {
         return bound.split_once("::").map(|(ty, _)| ty.to_string());
     }
 
+    if value == "true" || value == "false" {
+        return Some("bool".to_string());
+    }
+
+    for ty in ["i32", "i64", "u32", "u64", "usize", "f32", "f64", "bool"] {
+        if value.ends_with(ty) {
+            return Some(ty.to_string());
+        }
+    }
+
     let (_value, ty) = value.rsplit_once('_')?;
     let ty = ty.trim();
-    if supported_mir_integer_type(ty) {
+    if supported_mir_integer_type(ty) || matches!(ty, "f32" | "f64" | "bool") {
         Some(ty.to_string())
     } else {
         None
@@ -2398,7 +2422,7 @@ fn semantic_summary(
                 .collect::<Vec<_>>()
                 .join(",");
             summary.push_str(&format!(
-                "mir_function path={} args={} return_type={} debug_locals={} contract_bindings={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={} branches={}\n",
+                "mir_function path={} args={} return_type={} debug_locals={} local_types={} contract_bindings={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={} branches={}\n",
                 mir_function.path,
                 mir_function
                     .args
@@ -2413,6 +2437,7 @@ fn semantic_summary(
                     .map(|local| local.name.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
+                mir_function.source_local_types().join(","),
                 contract_binding_summary(&contract_bindings),
                 return_expr,
                 arithmetic_ops,
@@ -3298,6 +3323,32 @@ fn overflow() -> i32 {
                 expression: "i32::MAX + 1".to_string(),
                 guards: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_source_local_types_from_mir_debug_locals() {
+        let mir = r#"
+fn keep(_1: i32) -> i32 {
+    debug x => _1;
+    debug y => const 1f32;
+    debug count => _2;
+    let mut _0: i32;
+    let _2: u32;
+
+    bb0: {
+        _2 = const 1_u32;
+        _0 = copy _1;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "keep").expect("MIR summary");
+
+        assert_eq!(
+            summary.source_local_types(),
+            vec!["i32".to_string(), "f32".to_string(), "u32".to_string()]
         );
     }
 

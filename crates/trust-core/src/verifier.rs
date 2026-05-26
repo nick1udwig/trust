@@ -9,6 +9,7 @@ pub struct TrustFunctionSemantics {
     pub rust_function_path: String,
     pub params: Vec<SemanticParam>,
     pub return_type: String,
+    pub local_types: Vec<String>,
     pub contract_bindings: Vec<SemanticContractBinding>,
     pub return_expression: Option<String>,
     pub arithmetic_operations: Vec<SemanticArithmeticOperation>,
@@ -445,7 +446,8 @@ fn verify_total_with_env(
     let given_contracts = given_preconditions(metadata);
     let params = verification_params(&source, semantics);
     let return_type = verification_return_type(&source, semantics);
-    if let Some(ty) = unsupported_signature_type(&params, &return_type, model_types) {
+    let local_types = verification_local_types(semantics);
+    if let Some(ty) = unsupported_function_type(&params, &return_type, &local_types, model_types) {
         return Err(VerificationError::UnsupportedType {
             function: metadata.rust_function_path.clone(),
             ty,
@@ -895,6 +897,12 @@ fn verification_return_type(source: &str, semantics: Option<&TrustFunctionSemant
         .unwrap_or_else(|| parse_return_type(source))
 }
 
+fn verification_local_types(semantics: Option<&TrustFunctionSemantics>) -> Vec<String> {
+    semantics
+        .map(|semantics| semantics.local_types.clone())
+        .unwrap_or_default()
+}
+
 fn parse_return_type(source: &str) -> String {
     let Some(params_start) = source.find('(') else {
         return "()".to_string();
@@ -914,15 +922,21 @@ fn parse_return_type(source: &str) -> String {
         .to_string()
 }
 
-fn unsupported_signature_type(
+fn unsupported_function_type(
     params: &[Param],
     return_type: &str,
+    local_types: &[String],
     model_types: &[String],
 ) -> Option<String> {
     params
         .iter()
         .find_map(|param| unsupported_mvp_type(&param.ty, model_types))
         .or_else(|| unsupported_mvp_type(return_type, model_types))
+        .or_else(|| {
+            local_types
+                .iter()
+                .find_map(|ty| unsupported_mvp_type(ty, model_types))
+        })
 }
 
 fn unsupported_mvp_type(ty: &str, model_types: &[String]) -> Option<String> {
@@ -4877,6 +4891,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_semantic_local_float_type() {
+        let metadata = metadata_named(
+            "keep",
+            "pub fn keep(x: i32) -> i32 { let y = 1.0f32; let _ = y; x }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "keep".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: vec!["i32".to_string(), "f32".to_string()],
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::UnsupportedType {
+                function: "keep".to_string(),
+                ty: "f32".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_field_access_without_trust_model_type() {
         let balance = metadata_named(
             "balance",
@@ -5166,6 +5214,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5223,6 +5272,7 @@ mod tests {
                 },
             ],
             return_type: "Option<i32>".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x.checked_add(y)".to_string()),
             arithmetic_operations: Vec::new(),
@@ -5323,6 +5373,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
@@ -5358,6 +5409,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
@@ -5391,6 +5443,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("acct.balance".to_string()),
             arithmetic_operations: Vec::new(),
@@ -5430,6 +5483,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            local_types: Vec::new(),
             contract_bindings: vec![SemanticContractBinding {
                 expression: "acct.balance < i64::MAX".to_string(),
                 name: "acct.balance".to_string(),
@@ -5481,6 +5535,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("acct.balance + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -5532,6 +5587,7 @@ mod tests {
                 ty: "Account".to_string(),
             }],
             return_type: "i64".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("acct.balance + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -5580,6 +5636,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5632,6 +5689,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5684,6 +5742,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5737,6 +5796,7 @@ mod tests {
                 ty: "Option<i32>".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5789,6 +5849,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5836,6 +5897,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5880,6 +5942,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -5930,6 +5993,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -5977,6 +6041,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("y + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6014,6 +6079,7 @@ mod tests {
             rust_function_path: "overflow".to_string(),
             params: Vec::new(),
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("i32::MAX + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6052,6 +6118,7 @@ mod tests {
             rust_function_path: "overflow_u32".to_string(),
             params: Vec::new(),
             return_type: "u32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("u32::MAX + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6090,6 +6157,7 @@ mod tests {
             rust_function_path: "safe_add".to_string(),
             params: Vec::new(),
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("40 + 1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6124,6 +6192,7 @@ mod tests {
             rust_function_path: "negate".to_string(),
             params: Vec::new(),
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("-i32::MIN".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6165,6 +6234,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6212,6 +6282,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x / y".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6259,6 +6330,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x / y".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6292,6 +6364,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x / -1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6333,6 +6406,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x / -1".to_string()),
             arithmetic_operations: vec![SemanticArithmeticOperation {
@@ -6376,6 +6450,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("xs[i]".to_string()),
             arithmetic_operations: Vec::new(),
@@ -6428,6 +6503,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("xs[j]".to_string()),
             arithmetic_operations: Vec::new(),
@@ -6475,6 +6551,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -6523,6 +6600,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("xs[i]".to_string()),
             arithmetic_operations: Vec::new(),
@@ -6566,6 +6644,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("inc(x)".to_string()),
             arithmetic_operations: Vec::new(),
@@ -6620,6 +6699,7 @@ mod tests {
                 },
             ],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -6681,6 +6761,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -6720,6 +6801,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("verified::inc(x)".to_string()),
             arithmetic_operations: Vec::new(),
@@ -6800,6 +6882,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: None,
             arithmetic_operations: Vec::new(),
@@ -6839,6 +6922,7 @@ mod tests {
                 ty: "i32".to_string(),
             }],
             return_type: "i32".to_string(),
+            local_types: Vec::new(),
             contract_bindings: Vec::new(),
             return_expression: Some("x".to_string()),
             arithmetic_operations: Vec::new(),
