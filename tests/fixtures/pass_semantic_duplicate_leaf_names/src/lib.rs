@@ -1,5 +1,12 @@
 #[trust::module]
 mod left {
+    use trust::TrustModel;
+
+    #[derive(TrustModel)]
+    pub struct Account {
+        pub balance: i64,
+    }
+
     trust::total! {
         pub fn same(x: i32) -> i32 { x }
     }
@@ -11,6 +18,13 @@ mod left {
 
 #[trust::module]
 mod right {
+    use trust::TrustModel;
+
+    #[derive(TrustModel)]
+    pub struct Account {
+        pub balance: i64,
+    }
+
     trust::total! {
         pub fn same(x: i32) -> i32 { x }
     }

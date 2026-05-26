@@ -36,6 +36,7 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         short_hash(&source)
     );
     let item = inject_module_path_markers(&source, &module.name);
+    let item = inject_trust_model_module_path_attrs(&item, &module.name);
     let expanded = format!(
         r###"
         {item}
@@ -237,7 +238,7 @@ pub fn loop_spec(input: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
-#[proc_macro_derive(TrustModel)]
+#[proc_macro_derive(TrustModel, attributes(trust_module_path))]
 pub fn derive_trust_model(input: TokenStream) -> TokenStream {
     if !wrapper_active() {
         return compile_error("error[trust]: Trust verification requires trust-rustc");
@@ -293,7 +294,9 @@ struct FnInfo {
 
 #[derive(Debug)]
 struct ModelInfo {
+    module_path: Option<String>,
     name: String,
+    source: String,
 }
 
 #[derive(Debug)]
@@ -574,6 +577,49 @@ fn strip_internal_module_path(input: &str) -> Result<(Option<String>, String), &
     }
 }
 
+fn strip_trust_model_module_path_attr(
+    input: &str,
+) -> Result<(Option<String>, String), &'static str> {
+    let input = input.trim();
+    let Some((attr_content, rest)) = take_leading_attribute(input) else {
+        return Ok((None, input.to_string()));
+    };
+    let Some(after_name) = strip_keyword(attr_content.trim(), "trust_module_path") else {
+        return Ok((None, input.to_string()));
+    };
+    let Some(after_equals) = after_name.trim_start().strip_prefix('=') else {
+        return Err("error[trust]: malformed TrustModel module path marker");
+    };
+    let value = after_equals.trim_start();
+    let Some(after_open_quote) = value.strip_prefix('"') else {
+        return Err("error[trust]: malformed TrustModel module path marker");
+    };
+    let Some(close_quote) = after_open_quote.find('"') else {
+        return Err("error[trust]: malformed TrustModel module path marker");
+    };
+    let module_path = &after_open_quote[..close_quote];
+    if module_path.is_empty()
+        || !module_path
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':'))
+    {
+        return Err("error[trust]: malformed TrustModel module path marker");
+    }
+    if !after_open_quote[close_quote + 1..].trim().is_empty() {
+        return Err("error[trust]: malformed TrustModel module path marker");
+    }
+
+    Ok((Some(module_path.to_string()), rest.trim_start().to_string()))
+}
+
+fn take_leading_attribute(input: &str) -> Option<(&str, &str)> {
+    let after_hash = input.strip_prefix('#')?.trim_start();
+    let after_open = after_hash.strip_prefix('[')?;
+    let close_idx = after_open.find(']')?;
+
+    Some((&after_open[..close_idx], &after_open[close_idx + 1..]))
+}
+
 fn inject_module_path_markers(source: &str, module_path: &str) -> String {
     let mut output = String::new();
     let mut remaining = source;
@@ -591,6 +637,82 @@ fn inject_module_path_markers(source: &str, module_path: &str) -> String {
 
     output.push_str(remaining);
     output
+}
+
+fn inject_trust_model_module_path_attrs(source: &str, module_path: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0usize;
+    let mut search_start = 0usize;
+
+    while let Some((insertion_idx, struct_end)) =
+        find_next_trust_model_derive_struct(&source[search_start..])
+    {
+        let insertion_idx = search_start + insertion_idx;
+        let struct_end = search_start + struct_end;
+        output.push_str(&source[cursor..insertion_idx]);
+        output.push_str("#[trust_module_path = \"");
+        output.push_str(module_path);
+        output.push_str("\"] ");
+        cursor = insertion_idx;
+        search_start = struct_end;
+    }
+
+    output.push_str(&source[cursor..]);
+    output
+}
+
+fn find_next_trust_model_derive_struct(input: &str) -> Option<(usize, usize)> {
+    let mut search_start = 0usize;
+    while let Some(relative_idx) = input[search_start..].find("struct") {
+        let struct_idx = search_start + relative_idx;
+        let struct_end = struct_idx + "struct".len();
+        if !is_ident_start_boundary(input, struct_idx) || !is_ident_end_boundary(input, struct_end)
+        {
+            search_start = struct_end;
+            continue;
+        }
+
+        let item_start = input[..struct_idx]
+            .rfind(|ch| matches!(ch, '{' | '}' | ';'))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let item_prefix = &input[item_start..struct_idx];
+        if item_prefix.contains("derive")
+            && item_prefix.contains("TrustModel")
+            && !item_prefix.contains("trust_module_path")
+        {
+            let attr_start = item_prefix.find('#').map(|idx| item_start + idx)?;
+            return Some((attr_start, struct_end));
+        }
+
+        search_start = struct_end;
+    }
+
+    None
+}
+
+fn is_ident_start_boundary(input: &str, idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+
+    !input
+        .as_bytes()
+        .get(idx - 1)
+        .copied()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn is_ident_end_boundary(input: &str, idx: usize) -> bool {
+    if idx >= input.len() {
+        return true;
+    }
+
+    !input
+        .as_bytes()
+        .get(idx)
+        .copied()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn find_next_trust_macro_open(input: &str) -> Option<(usize, usize)> {
@@ -861,7 +983,8 @@ fn proof_contract_kind<'a>(
 }
 
 fn parse_trust_model_source(source: &str) -> Result<ModelInfo, &'static str> {
-    let tokens = lex(source);
+    let (module_path, source) = strip_trust_model_module_path_attr(source)?;
+    let tokens = lex(&source);
     let Some(struct_idx) = tokens
         .iter()
         .position(|token| matches!(token, LexToken::Ident(ident) if ident == "struct"))
@@ -879,9 +1002,13 @@ fn parse_trust_model_source(source: &str) -> Result<ModelInfo, &'static str> {
     if !has_body_group(&tokens) {
         return Err("error[trust]: TrustModel derive requires a braced struct body");
     }
-    validate_trust_model_fields(source)?;
+    validate_trust_model_fields(&source)?;
 
-    Ok(ModelInfo { name })
+    Ok(ModelInfo {
+        module_path,
+        name,
+        source,
+    })
 }
 
 fn validate_trust_model_fields(source: &str) -> Result<(), &'static str> {
@@ -1198,13 +1325,17 @@ fn module_metadata_json(module: &ModuleInfo, source: &str) -> String {
 
 fn model_metadata_json(model: &ModelInfo, source: &str) -> String {
     let hash = short_hash(source);
+    let module_id = metadata_module_id(model.module_path.as_deref());
+    let rust_function_path = qualified_metadata_path(model.module_path.as_deref(), &model.name);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"unknown\",\"item_id\":\"model:{name}:{hash}\",\"item_kind\":\"trust_model\",\"source_span\":\"unknown\",\"rust_function_path\":\"{name}\",\"visibility\":\"unknown\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"model:{name}:{hash}\",\"item_kind\":\"trust_model\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"unknown\",\"contracts_original\":[],\"contracts_normalized\":[],\"contract_classes\":[],\"assertion_policy\":\"always\",\"function_source\":\"{source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
+        module_id = json_escape(module_id),
         name = json_escape(&model.name),
+        rust_function_path = json_escape(&rust_function_path),
         hash = hash,
-        source = json_escape(source),
+        source = json_escape(&model.source),
     )
 }
 
@@ -1544,6 +1675,16 @@ mod tests {
     }
 
     #[test]
+    fn module_injects_path_attr_into_trust_model_derive() {
+        let source = "mod left { # [derive(TrustModel)] pub struct Account { pub balance : i64 } }";
+
+        assert_eq!(
+            inject_trust_model_module_path_attrs(source, "left"),
+            "mod left { #[trust_module_path = \"left\"] # [derive(TrustModel)] pub struct Account { pub balance : i64 } }"
+        );
+    }
+
+    #[test]
     fn total_metadata_records_internal_module_path() {
         let total =
             parse_total_source("__trust_module_path left; pub fn same(x: i32) -> i32 { x }")
@@ -1591,6 +1732,22 @@ mod tests {
             "pub struct Account { pub id: u64, pub balance: i64 }"
         )
         .contains("\"item_kind\":\"trust_model\""));
+    }
+
+    #[test]
+    fn trust_model_metadata_records_internal_module_path() {
+        let source = "#[trust_module_path = \"left\"] # [derive(TrustModel)] pub struct Account { pub balance: i64 }";
+        let model = parse_trust_model_source(source).unwrap();
+        let metadata = model_metadata_json(&model, source);
+
+        assert_eq!(model.module_path.as_deref(), Some("left"));
+        assert_eq!(
+            model.source,
+            "# [derive(TrustModel)] pub struct Account { pub balance: i64 }"
+        );
+        assert!(metadata.contains("\"module_id\":\"left\""));
+        assert!(metadata.contains("\"rust_function_path\":\"left::Account\""));
+        assert!(metadata.contains("\"function_source\":\"# [derive(TrustModel)] pub struct Account { pub balance: i64 }\""));
     }
 
     #[test]
