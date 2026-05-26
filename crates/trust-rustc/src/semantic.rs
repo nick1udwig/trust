@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -65,18 +65,27 @@ struct MirAssignment {
     block: Option<String>,
     place: String,
     expression: String,
+    statement_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirTerminator {
     block: Option<String>,
     expression: String,
+    statement_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirSwitchTarget {
     value: String,
     block: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirGuardedEdge {
+    predecessor: String,
+    successor: String,
+    guard: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1057,76 +1066,207 @@ impl MirFunctionSummary {
         ))
     }
 
-    fn guards_for_block_with_models(
+    fn guards_for_assignment(
         &self,
-        block: &str,
+        assignment: &MirAssignment,
         model_fields: &[ModelFieldMap],
     ) -> Vec<String> {
-        self.guards_for_block_with_seen(block, &mut Vec::new(), model_fields)
-    }
-
-    fn guards_for_block_with_seen(
-        &self,
-        block: &str,
-        seen: &mut Vec<String>,
-        model_fields: &[ModelFieldMap],
-    ) -> Vec<String> {
-        if seen.iter().any(|seen_block| seen_block == block) {
-            return Vec::new();
-        }
-        seen.push(block.to_string());
-
-        let predecessor_paths = self
-            .terminators
-            .iter()
-            .filter_map(|terminator| {
-                let predecessor = terminator.block.as_deref()?;
-                if is_mir_backedge(predecessor, block) {
-                    return None;
-                }
-                if !mir_successor_targets(&terminator.expression)
-                    .iter()
-                    .any(|target| target == block)
-                {
-                    return None;
-                }
-
-                let mut path_seen = seen.clone();
-                let mut path =
-                    self.guards_for_block_with_seen(predecessor, &mut path_seen, model_fields);
-                path.extend(self.edge_guards_for_successor(terminator, block, model_fields));
-                Some(dedup_strings(path))
-            })
-            .collect::<Vec<_>>();
-
-        common_guards(predecessor_paths)
-    }
-
-    fn edge_guards_for_successor(
-        &self,
-        terminator: &MirTerminator,
-        successor: &str,
-        model_fields: &[ModelFieldMap],
-    ) -> Vec<String> {
-        let Some((condition, targets)) = mir_switch(&terminator.expression) else {
+        let Some(block) = assignment.block.as_deref() else {
             return Vec::new();
         };
-        let explicit_values = explicit_mir_switch_values(&targets);
 
-        targets
-            .iter()
-            .filter_map(|target| {
-                if target.block != successor {
+        self.guards_for_location(block, Some(assignment.statement_index), model_fields)
+    }
+
+    fn guards_for_location(
+        &self,
+        block: &str,
+        statement_index: Option<usize>,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<String> {
+        let dominators = self.block_dominators();
+        self.guarded_edges(model_fields)
+            .into_iter()
+            .filter_map(|edge| {
+                let guard = edge.guard?;
+                if !dominates(&dominators, &edge.successor, block) {
                     return None;
                 }
-                self.guard_for_switch_target(
-                    condition,
-                    &target.value,
-                    &explicit_values,
-                    model_fields,
-                )
+                if self.guard_invalidated_before(
+                    &guard,
+                    &edge.successor,
+                    block,
+                    statement_index,
+                    &dominators,
+                ) {
+                    return None;
+                }
+                Some(guard)
+            })
+            .fold(Vec::new(), |mut guards, guard| {
+                if !guards.iter().any(|existing| existing == &guard) {
+                    guards.push(guard);
+                }
+                guards
+            })
+    }
+
+    fn guarded_edges(&self, model_fields: &[ModelFieldMap]) -> Vec<MirGuardedEdge> {
+        self.terminators
+            .iter()
+            .flat_map(|terminator| self.guarded_edges_for_terminator(terminator, model_fields))
+            .collect()
+    }
+
+    fn guarded_edges_for_terminator(
+        &self,
+        terminator: &MirTerminator,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<MirGuardedEdge> {
+        let Some(predecessor) = terminator.block.as_ref() else {
+            return Vec::new();
+        };
+
+        if let Some((condition, targets)) = mir_switch(&terminator.expression) {
+            let explicit_values = explicit_mir_switch_values(&targets);
+            return targets
+                .iter()
+                .map(|target| MirGuardedEdge {
+                    predecessor: predecessor.clone(),
+                    successor: target.block.clone(),
+                    guard: self.guard_for_switch_target(
+                        condition,
+                        &target.value,
+                        &explicit_values,
+                        model_fields,
+                    ),
+                })
+                .collect();
+        }
+
+        mir_successor_targets(&terminator.expression)
+            .into_iter()
+            .map(|successor| MirGuardedEdge {
+                predecessor: predecessor.clone(),
+                successor,
+                guard: None,
             })
             .collect()
+    }
+
+    fn block_dominators(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let blocks = self.mir_blocks();
+        let Some(entry) = blocks
+            .iter()
+            .find(|block| block.as_str() == "bb0")
+            .or(blocks.first())
+        else {
+            return BTreeMap::new();
+        };
+        let all_blocks = blocks.iter().cloned().collect::<BTreeSet<_>>();
+        let edges = self
+            .terminators
+            .iter()
+            .flat_map(|terminator| self.guarded_edges_for_terminator(terminator, &[]))
+            .collect::<Vec<_>>();
+        let mut dominators = BTreeMap::new();
+
+        for block in &blocks {
+            let mut set = BTreeSet::new();
+            if block == entry {
+                set.insert(block.clone());
+            } else {
+                set = all_blocks.clone();
+            }
+            dominators.insert(block.clone(), set);
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+
+            for block in blocks.iter().filter(|block| *block != entry) {
+                let predecessor_sets = edges
+                    .iter()
+                    .filter(|edge| edge.successor == *block)
+                    .filter_map(|edge| dominators.get(&edge.predecessor))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut next = intersect_sets(&predecessor_sets).unwrap_or_default();
+                next.insert(block.clone());
+
+                if dominators.get(block).is_none_or(|current| current != &next) {
+                    dominators.insert(block.clone(), next);
+                    changed = true;
+                }
+            }
+        }
+
+        dominators
+    }
+
+    fn mir_blocks(&self) -> Vec<String> {
+        let mut blocks = Vec::new();
+        for block in self
+            .assignments
+            .iter()
+            .filter_map(|assignment| assignment.block.as_ref())
+            .chain(
+                self.terminators
+                    .iter()
+                    .filter_map(|terminator| terminator.block.as_ref()),
+            )
+        {
+            push_unique(&mut blocks, block.clone());
+        }
+        for successor in self
+            .terminators
+            .iter()
+            .flat_map(|terminator| mir_successor_targets(&terminator.expression))
+        {
+            push_unique(&mut blocks, successor);
+        }
+        blocks
+    }
+
+    fn guard_invalidated_before(
+        &self,
+        guard: &str,
+        edge_successor: &str,
+        block: &str,
+        statement_index: Option<usize>,
+        dominators: &BTreeMap<String, BTreeSet<String>>,
+    ) -> bool {
+        let guard_variables = guard_variables(guard);
+        if guard_variables.is_empty() {
+            return false;
+        }
+
+        self.assignments.iter().any(|assignment| {
+            let Some(assignment_block) = assignment.block.as_deref() else {
+                return false;
+            };
+            let Some(source_name) = self.local_name_for_place(&assignment.place) else {
+                return false;
+            };
+            if !guard_variables
+                .iter()
+                .any(|variable| variable == source_name)
+            {
+                return false;
+            }
+            if !dominates(dominators, edge_successor, assignment_block)
+                || !dominates(dominators, assignment_block, block)
+            {
+                return false;
+            }
+            if assignment_block == block {
+                return statement_index
+                    .is_some_and(|statement_index| assignment.statement_index < statement_index);
+            }
+
+            true
+        })
     }
 
     fn assignment_for_place(&self, place: &str) -> Option<&MirAssignment> {
@@ -1176,11 +1316,7 @@ impl MirFunctionSummary {
                             expression: format!("{left} {operator} {right}"),
                             left,
                             right: Some(right),
-                            guards: assignment
-                                .block
-                                .as_deref()
-                                .map(|block| self.guards_for_block_with_models(block, model_fields))
-                                .unwrap_or_default(),
+                            guards: self.guards_for_assignment(assignment, model_fields),
                         })
                     }
                     (SemanticArithmeticKind::Neg, [value]) => {
@@ -1193,11 +1329,7 @@ impl MirFunctionSummary {
                             expression: format!("-{value}"),
                             left: value,
                             right: None,
-                            guards: assignment
-                                .block
-                                .as_deref()
-                                .map(|block| self.guards_for_block_with_models(block, model_fields))
-                                .unwrap_or_default(),
+                            guards: self.guards_for_assignment(assignment, model_fields),
                         })
                     }
                     _ => None,
@@ -1243,11 +1375,7 @@ impl MirFunctionSummary {
                 else {
                     return Vec::new();
                 };
-                let guards = assignment
-                    .block
-                    .as_deref()
-                    .map(|block| self.guards_for_block_with_models(block, model_fields))
-                    .unwrap_or_default();
+                let guards = self.guards_for_assignment(assignment, model_fields);
                 self.local_aliases_for_place_with_models(base_place, model_fields)
                     .into_iter()
                     .map(|base| SemanticSliceIndex {
@@ -1329,11 +1457,7 @@ impl MirFunctionSummary {
                         .iter()
                         .map(|arg| self.normalized_mir_expression_with_models(arg, model_fields))
                         .collect::<Option<Vec<_>>>()?,
-                    guards: assignment
-                        .block
-                        .as_deref()
-                        .map(|block| self.guards_for_block_with_models(block, model_fields))
-                        .unwrap_or_default(),
+                    guards: self.guards_for_assignment(assignment, model_fields),
                 })
             })
             .collect::<Vec<_>>();
@@ -1349,11 +1473,7 @@ impl MirFunctionSummary {
         self.assignments
             .iter()
             .flat_map(|assignment| {
-                let guards = assignment
-                    .block
-                    .as_deref()
-                    .map(|block| self.guards_for_block_with_models(block, model_fields))
-                    .unwrap_or_default();
+                let guards = self.guards_for_assignment(assignment, model_fields);
                 let mut calls = Vec::new();
 
                 if let Some((operator, args)) =
@@ -1833,7 +1953,7 @@ fn extract_mir_assignments(lines: &[&str]) -> Vec<MirAssignment> {
     let mut assignments = Vec::new();
     let mut current_block = None;
 
-    for line in lines {
+    for (statement_index, line) in lines.iter().enumerate() {
         let line = line.trim();
         if let Some(block) = mir_block_header(line) {
             current_block = Some(block.to_string());
@@ -1847,6 +1967,7 @@ fn extract_mir_assignments(lines: &[&str]) -> Vec<MirAssignment> {
                 block: current_block.clone(),
                 place: place.trim().to_string(),
                 expression: expression.trim_end_matches(';').trim().to_string(),
+                statement_index,
             });
         }
     }
@@ -1858,7 +1979,7 @@ fn extract_mir_terminators(lines: &[&str]) -> Vec<MirTerminator> {
     let mut terminators = Vec::new();
     let mut current_block = None;
 
-    for line in lines {
+    for (statement_index, line) in lines.iter().enumerate() {
         let line = line.trim();
         if let Some(block) = mir_block_header(line) {
             current_block = Some(block.to_string());
@@ -1872,6 +1993,7 @@ fn extract_mir_terminators(lines: &[&str]) -> Vec<MirTerminator> {
             terminators.push(MirTerminator {
                 block: current_block.clone(),
                 expression: line.trim_end_matches(';').trim().to_string(),
+                statement_index,
             });
         }
     }
@@ -2207,14 +2329,64 @@ fn mir_successor_targets(expr: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_mir_backedge(predecessor: &str, successor: &str) -> bool {
-    mir_block_index(predecessor)
-        .zip(mir_block_index(successor))
-        .is_some_and(|(predecessor, successor)| predecessor >= successor)
+fn dominates(
+    dominators: &BTreeMap<String, BTreeSet<String>>,
+    dominator: &str,
+    block: &str,
+) -> bool {
+    dominators
+        .get(block)
+        .is_some_and(|dominators| dominators.contains(dominator))
 }
 
-fn mir_block_index(block: &str) -> Option<u32> {
-    block.strip_prefix("bb")?.parse().ok()
+fn intersect_sets(sets: &[BTreeSet<String>]) -> Option<BTreeSet<String>> {
+    let (first, rest) = sets.split_first()?;
+    let mut intersection = first.clone();
+    for set in rest {
+        intersection.retain(|value| set.contains(value));
+    }
+    Some(intersection)
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn guard_variables(guard: &str) -> Vec<String> {
+    let mut variables = Vec::new();
+    let mut current = String::new();
+
+    for ch in guard.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+            continue;
+        }
+        push_guard_variable(&mut variables, &mut current);
+    }
+    push_guard_variable(&mut variables, &mut current);
+
+    variables
+}
+
+fn push_guard_variable(variables: &mut Vec<String>, current: &mut String) {
+    if current.is_empty() {
+        return;
+    }
+    let variable = std::mem::take(current);
+    if variable
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit())
+        || matches!(
+            variable.as_str(),
+            "true" | "false" | "i32" | "i64" | "u32" | "u64" | "usize" | "MIN" | "MAX"
+        )
+    {
+        return;
+    }
+    push_unique(variables, variable);
 }
 
 fn negate_predicate(predicate: &str) -> Option<String> {
@@ -2233,31 +2405,6 @@ fn negate_predicate(predicate: &str) -> Option<String> {
     }
 
     None
-}
-
-fn dedup_strings(values: Vec<String>) -> Vec<String> {
-    let mut deduped = Vec::new();
-    for value in values {
-        if !deduped.iter().any(|existing| existing == &value) {
-            deduped.push(value);
-        }
-    }
-    deduped
-}
-
-fn common_guards(paths: Vec<Vec<String>>) -> Vec<String> {
-    let Some((first, rest)) = paths.split_first() else {
-        return Vec::new();
-    };
-
-    first
-        .iter()
-        .filter(|guard| {
-            rest.iter()
-                .all(|path| path.iter().any(|other| other == *guard))
-        })
-        .cloned()
-        .collect()
 }
 
 fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
@@ -2597,6 +2744,7 @@ fn id_i32(_1: i32) -> i32 {
                     block: Some("bb0".to_string()),
                     place: "_0".to_string(),
                     expression: "copy _1".to_string(),
+                    statement_index: 4,
                 }],
                 terminators: Vec::new(),
                 return_expr: Some("copy _1".to_string()),
@@ -3374,6 +3522,112 @@ fn divide_after_countdown(_1: usize) -> usize {
                     guards: vec!["n <= 0".to_string()],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn drops_loop_guard_after_guarded_argument_is_mutated() {
+        let mir = r#"
+fn divide_inside_loop(_1: usize) -> usize {
+    debug n => _1;
+    let mut _0: usize;
+    let mut _2: bool;
+
+    bb0: {
+        _2 = Gt(copy _1, const 0_usize);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _1 = Sub(copy _1, const 1_usize);
+        _0 = Div(const 1_usize, copy _1);
+        return;
+    }
+
+    bb2: {
+        _0 = const 0_usize;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "divide_inside_loop").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Sub,
+                    ty: Some("usize".to_string()),
+                    left: "n".to_string(),
+                    right: Some("1".to_string()),
+                    expression: "n - 1".to_string(),
+                    guards: vec!["n > 0".to_string()],
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Div,
+                    ty: Some("usize".to_string()),
+                    left: "1".to_string(),
+                    right: Some("n".to_string()),
+                    expression: "1 / n".to_string(),
+                    guards: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_branch_guard_from_non_topological_mir_block_order() {
+        let mir = r#"
+fn add_from_late_branch(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: bool;
+    let mut _3: (i32, bool);
+
+    bb0: {
+        goto -> bb3;
+    }
+
+    bb1: {
+        _3 = AddWithOverflow(copy _1, const 1_i32);
+        assert(!move (_3.1: bool), "overflow", copy _1, const 1_i32) -> [success: bb4, unwind continue];
+    }
+
+    bb2: {
+        _0 = copy _1;
+        goto -> bb5;
+    }
+
+    bb3: {
+        _2 = Lt(copy _1, const core::num::<impl i32>::MAX);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb4: {
+        _0 = move (_3.0: i32);
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
+        let summary =
+            extract_mir_function_summary(mir, "add_from_late_branch").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("i32".to_string()),
+                left: "x".to_string(),
+                right: Some("1".to_string()),
+                expression: "x + 1".to_string(),
+                guards: vec!["x < i32::MAX".to_string()],
+            }]
         );
     }
 
