@@ -887,6 +887,13 @@ enum LoopMeasureProof {
     SemanticExtractionIncomplete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopInvariantProof {
+    Proved,
+    Unproved,
+    SemanticExtractionIncomplete,
+}
+
 fn semantic_for<'a>(
     metadata: &TrustMetadata,
     semantics: &'a [TrustFunctionSemantics],
@@ -3291,11 +3298,21 @@ fn verify_loop_spec(
 
     let mut invariants = Vec::new();
     if let Some(invariant) = &spec.invariant {
-        if !loop_invariant_preserved(invariant, condition, loop_body, semantics, params) {
-            return Err(VerificationError::LoopInvariantNotPreserved {
-                function: function.to_string(),
-                invariant: invariant.clone(),
-            });
+        match loop_invariant_preserved(invariant, condition, loop_body, semantics, params) {
+            LoopInvariantProof::Proved => {}
+            LoopInvariantProof::Unproved => {
+                return Err(VerificationError::LoopInvariantNotPreserved {
+                    function: function.to_string(),
+                    invariant: invariant.clone(),
+                });
+            }
+            LoopInvariantProof::SemanticExtractionIncomplete => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: function.to_string(),
+                    category: "loop invariant".to_string(),
+                    expression: invariant.clone(),
+                });
+            }
         }
         push_unique(&mut invariants, canonical_condition(invariant));
     }
@@ -3342,34 +3359,67 @@ fn loop_invariant_preserved(
     loop_body: &[String],
     semantics: Option<&TrustFunctionSemantics>,
     params: &[Param],
-) -> bool {
+) -> LoopInvariantProof {
     let Some((left, op, right)) = comparison_parts(invariant) else {
-        return false;
+        return LoopInvariantProof::Unproved;
     };
 
     if invariant_is_unsigned_nonnegative(&left, &op, &right, params) {
-        return true;
+        return LoopInvariantProof::Proved;
     }
 
     if op == "<=" && conditions_equivalent(condition, &format!("{left}<{right}")) {
-        if let Some(amount) = increment_amount(loop_body, &left)
-            .or_else(|| semantic_increment_amount(semantics, condition, &left))
-        {
-            return amount <= 1;
+        if let Some(amount) = semantic_increment_amount(semantics, condition, &left) {
+            return if amount <= 1 {
+                LoopInvariantProof::Proved
+            } else {
+                LoopInvariantProof::Unproved
+            };
         }
-        return !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]);
+        if let Some(amount) = increment_amount(loop_body, &left) {
+            return token_loop_invariant_proof(amount <= 1, semantics);
+        }
+        return token_loop_invariant_proof(
+            !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]),
+            semantics,
+        );
     }
 
     if op == ">=" && conditions_equivalent(condition, &format!("{left}>{right}")) {
-        if let Some(amount) = decrement_amount(loop_body, &left)
-            .or_else(|| semantic_decrement_amount(semantics, condition, &left))
-        {
-            return amount <= 1;
+        if let Some(amount) = semantic_decrement_amount(semantics, condition, &left) {
+            return if amount <= 1 {
+                LoopInvariantProof::Proved
+            } else {
+                LoopInvariantProof::Unproved
+            };
         }
-        return !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]);
+        if let Some(amount) = decrement_amount(loop_body, &left) {
+            return token_loop_invariant_proof(amount <= 1, semantics);
+        }
+        return token_loop_invariant_proof(
+            !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]),
+            semantics,
+        );
     }
 
-    !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()])
+    token_loop_invariant_proof(
+        !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]),
+        semantics,
+    )
+}
+
+fn token_loop_invariant_proof(
+    proved: bool,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> LoopInvariantProof {
+    if !proved {
+        return LoopInvariantProof::Unproved;
+    }
+    if semantics.is_some() {
+        LoopInvariantProof::SemanticExtractionIncomplete
+    } else {
+        LoopInvariantProof::Proved
+    }
 }
 
 fn loop_invariant_established(
@@ -6643,6 +6693,57 @@ mod tests {
                 function: "countdown".to_string(),
                 category: "loop decreases".to_string(),
                 expression: "n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_semantic_loop_invariant_fails_closed() {
+        let metadata = metadata_named_with_classes(
+            "countdown_with_stable_bound",
+            "pub fn countdown_with_stable_bound(mut i: usize, n: usize) -> usize { let x = 0; trust::loop_spec! { invariant(x <= n); decreases(i); } while i > 0 { i = i - 1; } i }",
+            &[],
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown_with_stable_bound".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+                SemanticParam {
+                    name: "n".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "usize".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("i".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                ty: Some("usize".to_string()),
+                target: Some("i".to_string()),
+                left: "i".to_string(),
+                right: Some("1".to_string()),
+                expression: "i - 1".to_string(),
+                guards: vec!["i > 0".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "countdown_with_stable_bound".to_string(),
+                category: "loop invariant".to_string(),
+                expression: "x<=n".to_string(),
             })
         );
     }
