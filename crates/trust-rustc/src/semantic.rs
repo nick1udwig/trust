@@ -1726,10 +1726,8 @@ impl MirFunctionSummary {
                     .unwrap_or(scrutinee_place)
                     .to_string();
                 let scrutinee_type = self
-                    .args
-                    .iter()
-                    .find(|arg| arg.place == scrutinee_place)
-                    .map(|arg| arg.ty.clone())
+                    .type_for_place(scrutinee_place)
+                    .map(ToString::to_string)
                     .unwrap_or_default();
                 let terminator = self.terminators.iter().find(|terminator| {
                     mir_switch(&terminator.expression).is_some_and(|(condition, _targets)| {
@@ -3541,6 +3539,81 @@ fn unwrap_or_zero(_1: Option<i32>) -> i32 {
             summary.semantic_matches(&[]),
             vec![SemanticMatch {
                 scrutinee: "x".to_string(),
+                scrutinee_type: "Option<i32>".to_string(),
+                arms: vec![
+                    SemanticMatchArm {
+                        variant: "None".to_string(),
+                        discriminant: "0".to_string(),
+                        payload: None,
+                        assumptions: Vec::new(),
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticMatchArm {
+                        variant: "Some".to_string(),
+                        discriminant: "1".to_string(),
+                        payload: Some(SemanticMatchPayload {
+                            binding: "v".to_string(),
+                            field_index: 0,
+                            ty: "i32".to_string(),
+                        }),
+                        assumptions: Vec::new(),
+                        return_expression: Some("v".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_option_match_from_local_alias() {
+        let mir = r#"
+fn alias_unwrap_or_zero(_1: Option<i32>) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let _2: Option<i32>;
+    let mut _3: isize;
+    let _4: i32;
+    scope 1 {
+        debug y => _2;
+        scope 2 {
+            debug v => _4;
+        }
+    }
+
+    bb0: {
+        _2 = copy _1;
+        _3 = discriminant(_2);
+        switchInt(move _3) -> [0: bb2, 1: bb3, otherwise: bb1];
+    }
+
+    bb1: {
+        unreachable;
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _4 = copy ((_2 as Some).0: i32);
+        _0 = copy _4;
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+"#;
+
+        let summary =
+            extract_mir_function_summary(mir, "alias_unwrap_or_zero").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_matches(&[]),
+            vec![SemanticMatch {
+                scrutinee: "y".to_string(),
                 scrutinee_type: "Option<i32>".to_string(),
                 arms: vec![
                     SemanticMatchArm {
