@@ -432,6 +432,8 @@ fn verification_error_item_name(err: &VerificationError) -> Option<&str> {
         | VerificationError::IntegerSubtractionOverflow { function, .. }
         | VerificationError::IntegerNegationOverflow { function, .. }
         | VerificationError::IntegerMultiplicationOverflow { function, .. }
+        | VerificationError::IntegerDivisionOverflow { function, .. }
+        | VerificationError::IntegerRemainderOverflow { function, .. }
         | VerificationError::IntegerDivisionByZero { function, .. }
         | VerificationError::IntegerRemainderByZero { function, .. }
         | VerificationError::SliceIndexOutOfBounds { function, .. }
@@ -465,6 +467,8 @@ fn verification_error_expression(err: &VerificationError) -> Option<&str> {
         | VerificationError::IntegerSubtractionOverflow { expression, .. }
         | VerificationError::IntegerNegationOverflow { expression, .. }
         | VerificationError::IntegerMultiplicationOverflow { expression, .. }
+        | VerificationError::IntegerDivisionOverflow { expression, .. }
+        | VerificationError::IntegerRemainderOverflow { expression, .. }
         | VerificationError::IntegerDivisionByZero { expression, .. }
         | VerificationError::IntegerRemainderByZero { expression, .. }
         | VerificationError::SliceIndexOutOfBounds { expression, .. }
@@ -524,7 +528,9 @@ fn diagnostic_help(err: &VerificationError) -> Option<&'static str> {
         VerificationError::IntegerAdditionOverflow { .. }
         | VerificationError::IntegerSubtractionOverflow { .. }
         | VerificationError::IntegerNegationOverflow { .. }
-        | VerificationError::IntegerMultiplicationOverflow { .. } => {
+        | VerificationError::IntegerMultiplicationOverflow { .. }
+        | VerificationError::IntegerDivisionOverflow { .. }
+        | VerificationError::IntegerRemainderOverflow { .. } => {
             Some("add executable preconditions that bound the arithmetic expression")
         }
         VerificationError::IntegerDivisionByZero { .. }

@@ -147,6 +147,14 @@ pub enum VerificationError {
         function: String,
         expression: String,
     },
+    IntegerDivisionOverflow {
+        function: String,
+        expression: String,
+    },
+    IntegerRemainderOverflow {
+        function: String,
+        expression: String,
+    },
     IntegerDivisionByZero {
         function: String,
         expression: String,
@@ -249,6 +257,20 @@ impl fmt::Display for VerificationError {
             } => write!(
                 f,
                 "could not prove integer multiplication cannot overflow in `{function}`: `{expression}`"
+            ),
+            VerificationError::IntegerDivisionOverflow {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer division cannot overflow in `{function}`: `{expression}`"
+            ),
+            VerificationError::IntegerRemainderOverflow {
+                function,
+                expression,
+            } => write!(
+                f,
+                "could not prove integer remainder cannot overflow in `{function}`: `{expression}`"
             ),
             VerificationError::IntegerDivisionByZero {
                 function,
@@ -542,6 +564,38 @@ fn verify_total_with_env(
         }
     }
 
+    for obligation in
+        verification_division_overflow_obligations(body, &value_params, semantics, options)
+    {
+        if !signed_division_overflow_obligation_proved(
+            &obligation,
+            &contracts,
+            &value_params,
+            options,
+        ) {
+            return Err(VerificationError::IntegerDivisionOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
+    for obligation in
+        verification_remainder_overflow_obligations(body, &value_params, semantics, options)
+    {
+        if !signed_division_overflow_obligation_proved(
+            &obligation,
+            &contracts,
+            &value_params,
+            options,
+        ) {
+            return Err(VerificationError::IntegerRemainderOverflow {
+                function: metadata.rust_function_path.clone(),
+                expression: obligation.expression,
+            });
+        }
+    }
+
     if let Some(expression) = unsupported_index_expression(body, &params, semantics) {
         return Err(VerificationError::UnsupportedIndex {
             function: metadata.rust_function_path.clone(),
@@ -648,6 +702,15 @@ struct MulObligation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DenominatorObligation {
     denominator: String,
+    expression: String,
+    assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DivOverflowObligation {
+    left: String,
+    right: String,
+    ty: String,
     expression: String,
     assumptions: Vec<String>,
 }
@@ -1642,6 +1705,89 @@ fn verification_remainder_obligations(
     )
 }
 
+fn verification_division_overflow_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
+) -> Vec<DivOverflowObligation> {
+    verification_signed_division_overflow_obligations(
+        body,
+        params,
+        semantics,
+        SemanticArithmeticKind::Div,
+        "/",
+        options.target_pointer_width,
+    )
+}
+
+fn verification_remainder_overflow_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+    options: VerificationOptions,
+) -> Vec<DivOverflowObligation> {
+    verification_signed_division_overflow_obligations(
+        body,
+        params,
+        semantics,
+        SemanticArithmeticKind::Rem,
+        "%",
+        options.target_pointer_width,
+    )
+}
+
+fn verification_signed_division_overflow_obligations(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+    kind: SemanticArithmeticKind,
+    op: &str,
+    target_pointer_width: Option<u32>,
+) -> Vec<DivOverflowObligation> {
+    let semantic_obligations = semantic_signed_division_overflow_obligations(
+        semantics,
+        params,
+        kind,
+        target_pointer_width,
+    );
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        signed_division_overflow_obligations(body, params, op, target_pointer_width),
+        |obligation| obligation.expression.as_str(),
+    );
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| existing.expression == fallback.expression,
+    )
+}
+
+fn semantic_signed_division_overflow_obligations(
+    semantics: Option<&TrustFunctionSemantics>,
+    params: &[Param],
+    kind: SemanticArithmeticKind,
+    target_pointer_width: Option<u32>,
+) -> Vec<DivOverflowObligation> {
+    semantic_arithmetic_operations(semantics, kind)
+        .filter_map(|operation| {
+            let right = operation.right.as_ref()?;
+            signed_division_overflow_obligation(
+                &operation.left,
+                right,
+                &operation.expression,
+                params,
+                operation.ty.as_deref(),
+                target_pointer_width,
+            )
+            .map(|mut obligation| {
+                obligation.assumptions = semantic_guard_assumptions(operation);
+                obligation
+            })
+        })
+        .collect()
+}
+
 fn semantic_arithmetic_operations(
     semantics: Option<&TrustFunctionSemantics>,
     kind: SemanticArithmeticKind,
@@ -1674,6 +1820,41 @@ fn semantic_denominator_obligations(
             })
         })
         .collect()
+}
+
+fn signed_division_overflow_obligation(
+    left: &str,
+    right: &str,
+    expression: &str,
+    params: &[Param],
+    operation_ty: Option<&str>,
+    target_pointer_width: Option<u32>,
+) -> Option<DivOverflowObligation> {
+    let operation_ty = supported_operation_type(operation_ty).filter(|ty| is_signed_integer(ty));
+    let ty = param_type(left, params)
+        .filter(|ty| is_signed_integer(ty))
+        .or_else(|| param_type(right, params).filter(|ty| is_signed_integer(ty)))
+        .or(operation_ty)?;
+    let min = min_value(ty)?;
+
+    if integer_constant_value(left, Some(ty), target_pointer_width)
+        .is_some_and(|value| value != min)
+    {
+        return None;
+    }
+    if integer_constant_value(right, Some(ty), target_pointer_width)
+        .is_some_and(|value| value != -1)
+    {
+        return None;
+    }
+
+    Some(DivOverflowObligation {
+        left: left.to_string(),
+        right: right.to_string(),
+        ty: ty.to_string(),
+        expression: expression.to_string(),
+        assumptions: Vec::new(),
+    })
 }
 
 fn semantic_addition_obligation(
@@ -1856,6 +2037,42 @@ fn division_obligations(body: &str, params: &[Param]) -> Vec<DenominatorObligati
 
 fn remainder_obligations(body: &str, params: &[Param]) -> Vec<DenominatorObligation> {
     denominator_obligations(body, params, "%")
+}
+
+fn signed_division_overflow_obligations(
+    body: &str,
+    params: &[Param],
+    op: &str,
+    target_pointer_width: Option<u32>,
+) -> Vec<DivOverflowObligation> {
+    let tokens = executable_tokens(body);
+    let mut obligations = Vec::new();
+
+    for op_idx in 1..tokens.len().saturating_sub(1) {
+        if tokens[op_idx] != op {
+            continue;
+        }
+        let Some((left, _left_start)) = simple_signed_value_operand_before(&tokens, op_idx) else {
+            continue;
+        };
+        let Some((right, _right_end)) = simple_signed_value_operand_after(&tokens, op_idx + 1)
+        else {
+            continue;
+        };
+        let expression = format!("{left} {op} {right}");
+        if let Some(obligation) = signed_division_overflow_obligation(
+            &left,
+            &right,
+            &expression,
+            params,
+            None,
+            target_pointer_width,
+        ) {
+            obligations.push(obligation);
+        }
+    }
+
+    obligations
 }
 
 fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<DenominatorObligation> {
@@ -2967,6 +3184,50 @@ fn multiplication_obligation_proved(
     (z3_upper_proved && z3_lower_proved) || (upper_proved && lower_proved)
 }
 
+fn signed_division_overflow_obligation_proved(
+    obligation: &DivOverflowObligation,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
+    let contracts = contracts_with_assumptions(contracts, &obligation.assumptions);
+    let contracts = contracts.as_slice();
+    let Some(min) = min_value(&obligation.ty) else {
+        return false;
+    };
+
+    if integer_constant_value(
+        &obligation.left,
+        Some(&obligation.ty),
+        options.target_pointer_width,
+    )
+    .is_some_and(|value| value != min)
+    {
+        return true;
+    }
+    if integer_constant_value(
+        &obligation.right,
+        Some(&obligation.ty),
+        options.target_pointer_width,
+    )
+    .is_some_and(|value| value != -1)
+    {
+        return true;
+    }
+
+    let left_ne_min = format!("{}!={}::MIN", obligation.left, obligation.ty);
+    let right_ne_neg_one = format!("{}!=-1", obligation.right);
+    if z3_proves_conclusion(&left_ne_min, contracts, params, options).is_some_and(|proved| proved)
+        || z3_proves_conclusion(&right_ne_neg_one, contracts, params, options)
+            .is_some_and(|proved| proved)
+    {
+        return true;
+    }
+
+    contracts_prove_not_min(&obligation.left, &obligation.ty, min, contracts)
+        || contracts_prove_not_negative_one(&obligation.right, contracts)
+}
+
 fn denominator_nonzero(
     denominator: &str,
     contracts: &[String],
@@ -3159,6 +3420,39 @@ fn is_value_operand(token: &str) -> bool {
     is_ident(token) || token.parse::<i128>().is_ok()
 }
 
+fn simple_signed_value_operand_before(tokens: &[String], op_idx: usize) -> Option<(String, usize)> {
+    let idx = op_idx.checked_sub(1)?;
+    let token = tokens.get(idx)?;
+    if token.parse::<i128>().is_ok()
+        && idx > 0
+        && tokens.get(idx - 1) == Some(&"-".to_string())
+        && looks_unary_minus(tokens, idx - 1)
+    {
+        return Some((format!("-{token}"), idx - 1));
+    }
+    if is_value_operand(token) {
+        return Some((token.clone(), idx));
+    }
+
+    None
+}
+
+fn simple_signed_value_operand_after(tokens: &[String], idx: usize) -> Option<(String, usize)> {
+    let token = tokens.get(idx)?;
+    if token == "-" {
+        let value = tokens.get(idx + 1)?;
+        if value.parse::<i128>().is_ok() && looks_unary_minus(tokens, idx) {
+            return Some((format!("-{value}"), idx + 2));
+        }
+        return None;
+    }
+    if is_value_operand(token) {
+        return Some((token.clone(), idx + 1));
+    }
+
+    None
+}
+
 fn field_expression_before(tokens: &[String], op_idx: usize) -> Option<String> {
     if op_idx < 3 || tokens.get(op_idx - 2) != Some(&".".to_string()) {
         return None;
@@ -3340,6 +3634,50 @@ fn min_bound_with_type(value: i128, ty: &str) -> String {
     }
 }
 
+fn contracts_prove_not_min(expr: &str, ty: &str, min: i128, contracts: &[String]) -> bool {
+    let min_plus_one = min + 1;
+    let min_plus_one_typed = min_bound_with_type(min_plus_one, ty);
+    let expected = [
+        format!("{expr}!={ty}::MIN"),
+        format!("{ty}::MIN!={expr}"),
+        format!("{expr}!={min}"),
+        format!("{min}!={expr}"),
+        format!("{expr}>{ty}::MIN"),
+        format!("{ty}::MIN<{expr}"),
+        format!("{expr}>{min}"),
+        format!("{min}<{expr}"),
+        format!("{expr}>={min_plus_one_typed}"),
+        format!("{min_plus_one_typed}<={expr}"),
+        format!("{expr}>={min_plus_one}"),
+        format!("{min_plus_one}<={expr}"),
+    ];
+
+    contracts
+        .iter()
+        .any(|contract| expected.iter().any(|expected| contract == expected))
+}
+
+fn contracts_prove_not_negative_one(expr: &str, contracts: &[String]) -> bool {
+    let expected = [
+        format!("{expr}!=-1"),
+        format!("-1!={expr}"),
+        format!("{expr}>-1"),
+        format!("-1<{expr}"),
+        format!("{expr}>0"),
+        format!("0<{expr}"),
+        format!("{expr}>=0"),
+        format!("0<={expr}"),
+        format!("{expr}<-1"),
+        format!("-1>{expr}"),
+        format!("{expr}<=-2"),
+        format!("-2>={expr}"),
+    ];
+
+    contracts
+        .iter()
+        .any(|contract| expected.iter().any(|expected| contract == expected))
+}
+
 fn looks_unary_minus(tokens: &[String], minus_idx: usize) -> bool {
     if minus_idx == 0 {
         return true;
@@ -3348,7 +3686,23 @@ fn looks_unary_minus(tokens: &[String], minus_idx: usize) -> bool {
     let previous = &tokens[minus_idx - 1];
     matches!(
         previous.as_str(),
-        "{" | "(" | "[" | "," | "return" | "=>" | "=" | "<" | ">" | "<=" | ">=" | "==" | "!="
+        "{" | "("
+            | "["
+            | ","
+            | "return"
+            | "=>"
+            | "="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "=="
+            | "!="
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
     )
 }
 
@@ -4066,7 +4420,7 @@ mod tests {
         let metadata = metadata_named(
             "div",
             "pub fn div(x: i32, y: i32) -> i32 { x / y }",
-            &["y != 0"],
+            &["y != 0", "x > i32::MIN"],
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
@@ -4142,6 +4496,97 @@ mod tests {
             Err(VerificationError::IntegerRemainderByZero {
                 function: "rem".to_string(),
                 expression: "x % y".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unproved_signed_division_overflow() {
+        let metadata = metadata_named(
+            "div_neg_one",
+            "pub fn div_neg_one(x: i32) -> i32 { x / -1 }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionOverflow {
+                function: "div_neg_one".to_string(),
+                expression: "x / -1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_signed_division_overflow_when_only_denominator_nonzero_is_proved() {
+        let metadata = metadata_named(
+            "div",
+            "pub fn div(x: i32, y: i32) -> i32 { x / y }",
+            &["y != 0"],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionOverflow {
+                function: "div".to_string(),
+                expression: "x / y".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn proves_signed_division_overflow_from_left_lower_bound() {
+        let metadata = metadata_named(
+            "div_neg_one",
+            "pub fn div_neg_one(x: i32) -> i32 { x / -1 }",
+            &["x > i32::MIN"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_signed_division_overflow_from_denominator_bound() {
+        let metadata = metadata_named(
+            "div",
+            "pub fn div(x: i32, y: i32) -> i32 { x / y }",
+            &["y > 0"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn z3_proves_signed_division_overflow_from_denominator_lower_bound() {
+        let metadata = metadata_named(
+            "div",
+            "pub fn div(x: i32, y: i32) -> i32 { x / y }",
+            &["y >= 1"],
+        );
+
+        assert!(matches!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionByZero { .. })
+        ));
+        assert_eq!(
+            verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_unproved_signed_remainder_overflow() {
+        let metadata = metadata_named(
+            "rem_neg_one",
+            "pub fn rem_neg_one(x: i32) -> i32 { x % -1 }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerRemainderOverflow {
+                function: "rem_neg_one".to_string(),
+                expression: "x % -1".to_string(),
             })
         );
     }
@@ -5640,7 +6085,7 @@ mod tests {
         let metadata = metadata_named(
             "divide",
             "pub fn divide(x: i32, y: i32) -> i32 { x / { y } }",
-            &["y != 0"],
+            &["y != 0", "y != -1"],
         );
         let semantics = TrustFunctionSemantics {
             rust_function_path: "divide".to_string(),
@@ -5663,6 +6108,80 @@ mod tests {
                 left: "x".to_string(),
                 right: Some("y".to_string()),
                 expression: "x / y".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_catches_signed_division_overflow() {
+        let metadata = metadata_named("divide", "pub fn divide(x: i32) -> i32 { x / { -1 } }", &[]);
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "divide".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x / -1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Div,
+                ty: Some("i32".to_string()),
+                left: "x".to_string(),
+                right: Some("-1".to_string()),
+                expression: "x / -1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerDivisionOverflow {
+                function: "divide".to_string(),
+                expression: "x / -1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_proves_signed_division_overflow_precondition() {
+        let metadata = metadata_named(
+            "divide",
+            "pub fn divide(x: i32) -> i32 { x / { -1 } }",
+            &["x > i32::MIN"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "divide".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x / -1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Div,
+                ty: Some("i32".to_string()),
+                left: "x".to_string(),
+                right: Some("-1".to_string()),
+                expression: "x / -1".to_string(),
                 guards: Vec::new(),
             }],
             slice_indexes: Vec::new(),

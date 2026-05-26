@@ -1659,7 +1659,7 @@ fn strip_mir_move_or_copy(expr: &str) -> &str {
 }
 
 fn mir_const_value(expr: &str) -> Option<String> {
-    let value = expr.strip_prefix("const ")?;
+    let value = expr.strip_prefix("const ")?.trim();
     if let Some(bound) = mir_integer_bound(value) {
         return Some(bound);
     }
@@ -1667,7 +1667,8 @@ fn mir_const_value(expr: &str) -> Option<String> {
         .split_once('_')
         .map(|(value, _ty)| value)
         .unwrap_or(value);
-    if value.chars().all(|ch| ch.is_ascii_digit()) {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) {
         Some(value.to_string())
     } else {
         None
@@ -3129,6 +3130,39 @@ fn ratio_and_mod(_1: i32, _2: i32) -> i32 {
                     guards: Vec::new(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn extracts_negative_mir_integer_constants() {
+        let mir = r#"
+fn div_neg_one(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = Div(copy _1, const -1_i32);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "div_neg_one").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x / -1".to_string())
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Div,
+                ty: Some("i32".to_string()),
+                left: "x".to_string(),
+                right: Some("-1".to_string()),
+                expression: "x / -1".to_string(),
+                guards: Vec::new(),
+            }]
         );
     }
 

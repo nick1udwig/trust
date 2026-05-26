@@ -782,6 +782,15 @@ fn pass_usize_double_precondition_proves_overflow_safety() {
 }
 
 #[test]
+fn pass_signed_div_neg_one_precondition_proves_overflow_safety() {
+    let output = run_fixture("pass_signed_div_neg_one_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_id_postcondition_proves_executable_postcondition() {
     let output = run_fixture("pass_id_postcondition", Expected::Pass);
 
@@ -1535,6 +1544,24 @@ fn fail_remainder_by_zero_is_rejected_by_wrapper_verifier() {
 
     output
         .assert_contains("error[trust]: could not prove integer remainder denominator is nonzero");
+}
+
+#[test]
+fn fail_signed_div_neg_one_unproved_is_rejected_by_mir_verifier() {
+    let output = run_fixture("fail_signed_div_neg_one_unproved", Expected::Fail);
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove integer division cannot overflow");
+    output.assert_contains("x / -1");
+}
+
+#[test]
+fn fail_signed_rem_neg_one_unproved_is_rejected_by_mir_verifier() {
+    let output = run_fixture("fail_signed_rem_neg_one_unproved", Expected::Fail);
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove integer remainder cannot overflow");
+    output.assert_contains("x % -1");
 }
 
 #[test]
