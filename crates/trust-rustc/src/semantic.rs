@@ -1297,18 +1297,18 @@ impl MirFunctionSummary {
             })
             .collect::<Vec<_>>();
         calls.extend(self.semantic_len_calls_with_models(model_fields));
-        calls.extend(self.semantic_unsupported_shift_calls_with_models(model_fields));
+        calls.extend(self.semantic_unsupported_operator_calls_with_models(model_fields));
         calls
     }
 
-    fn semantic_unsupported_shift_calls_with_models(
+    fn semantic_unsupported_operator_calls_with_models(
         &self,
         model_fields: &[ModelFieldMap],
     ) -> Vec<SemanticCall> {
         self.assignments
             .iter()
             .filter_map(|assignment| {
-                let (operator, args) = mir_unsupported_shift_operation(&assignment.expression)?;
+                let (operator, args) = mir_unsupported_binary_operation(&assignment.expression)?;
                 let [left, right] = args.as_slice() else {
                     return None;
                 };
@@ -1986,12 +1986,15 @@ fn mir_checked_arithmetic_operation(expr: &str) -> Option<(SemanticArithmeticKin
     Some((kind, parse_mir_call_args(args)))
 }
 
-fn mir_unsupported_shift_operation(expr: &str) -> Option<(&'static str, Vec<String>)> {
+fn mir_unsupported_binary_operation(expr: &str) -> Option<(&'static str, Vec<String>)> {
     let (op, args) = expr.split_once('(')?;
     let args = args.strip_suffix(')')?;
     let operator = match op.trim() {
         "Shl" => "<<",
         "Shr" => ">>",
+        "BitAnd" => "&",
+        "BitOr" => "|",
+        "BitXor" => "^",
         _ => return None,
     };
     Some((operator, parse_mir_call_args(args)))
@@ -3652,6 +3655,34 @@ fn shift_left(_1: u32, _2: u32) -> u32 {
             vec![SemanticCall {
                 callee: "x << n".to_string(),
                 args: vec!["x".to_string(), "n".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_unsupported_bitwise_operation_as_semantic_call() {
+        let mir = r#"
+fn bitwise_and(_1: u32, _2: u32) -> u32 {
+    debug x => _1;
+    debug mask => _2;
+    let mut _0: u32;
+
+    bb0: {
+        _0 = BitAnd(copy _1, copy _2);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "bitwise_and").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "x & mask".to_string(),
+                args: vec!["x".to_string(), "mask".to_string()],
                 guards: Vec::new(),
                 trust_callee: None,
             }]

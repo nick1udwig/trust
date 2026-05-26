@@ -971,6 +971,22 @@ fn fail_semantic_shift_operation_is_rejected_by_mir_verifier() {
 }
 
 #[test]
+fn fail_semantic_bitwise_operation_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_bitwise_operation",
+        Expected::Fail,
+        &format!("fail_semantic_bitwise_operation_{suffix}"),
+        &format!("fail_semantic_bitwise_operation_{suffix}"),
+        &[],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: unsupported function call");
+    output.assert_contains("x & bits");
+}
+
+#[test]
 fn fail_trait_dispatch_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_trait_dispatch", Expected::Fail);
 

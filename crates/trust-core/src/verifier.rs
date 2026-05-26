@@ -4474,7 +4474,7 @@ mod tests {
     fn rejects_complex_parenthesized_integer_division_denominator() {
         let metadata = metadata_named(
             "div",
-            "pub fn div(x: i32, y: i32) -> i32 { x / (y & 1) }",
+            "pub fn div(x: i32, y: i32) -> i32 { x / (y + 0) }",
             &[],
         );
 
@@ -4482,7 +4482,7 @@ mod tests {
             verify_total(&metadata),
             Err(VerificationError::IntegerDivisionByZero {
                 function: "div".to_string(),
-                expression: "x / (y&1)".to_string(),
+                expression: "x / (y+0)".to_string(),
             })
         );
     }

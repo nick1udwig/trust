@@ -1,8 +1,8 @@
 #[trust::module]
 mod verified {
     trust::total! {
-        pub fn div(x: i32, y: i32) -> i32 {
-            x / (y + 0)
+        pub fn mask(x: u32, bits: u32) -> u32 {
+            x & bits
         }
     }
 }
