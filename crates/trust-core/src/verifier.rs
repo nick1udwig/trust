@@ -195,6 +195,10 @@ pub enum VerificationError {
     LoopMissingDecreases {
         function: String,
     },
+    LoopInvariantNotEstablished {
+        function: String,
+        invariant: String,
+    },
     LoopInvariantNotPreserved {
         function: String,
         invariant: String,
@@ -330,6 +334,10 @@ impl fmt::Display for VerificationError {
             VerificationError::LoopMissingDecreases { function: _ } => {
                 write!(f, "loop in total function requires decreases measure")
             }
+            VerificationError::LoopInvariantNotEstablished {
+                function: _,
+                invariant: _,
+            } => write!(f, "loop invariant may not hold before loop entry"),
             VerificationError::LoopInvariantNotPreserved {
                 function: _,
                 invariant: _,
@@ -466,9 +474,17 @@ fn verify_total_with_env(
     let semantic_return_expression = semantics
         .and_then(|semantics| semantics.return_expression.as_deref())
         .map(normalize);
-    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path, semantics)?;
-    let loop_exit_facts = loop_exit_facts(&loop_facts);
-    let postcondition_assumptions = contracts_with_assumptions(&given_contracts, &loop_exit_facts);
+    let loop_facts = verify_loops(
+        raw_body,
+        &metadata.rust_function_path,
+        semantics,
+        &given_contracts,
+        &value_params,
+        options,
+    )?;
+    let loop_postcondition_facts = loop_postcondition_facts(&loop_facts);
+    let postcondition_assumptions =
+        contracts_with_assumptions(&given_contracts, &loop_postcondition_facts);
     let call_env = verification_call_env(env, semantics);
 
     if contains_unchecked_unwrap(raw_body) {
@@ -761,6 +777,7 @@ struct FieldAccessObligation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoopFact {
     condition: String,
+    invariants: Vec<String>,
     semantic_exit_facts: Vec<String>,
 }
 
@@ -1525,6 +1542,9 @@ fn expression_equals_expected_from_assumptions(
     contracts: &[String],
     params: &[Param],
 ) -> bool {
+    if contracts_prove_equality(expression, expected, contracts, params) {
+        return true;
+    }
     if expected != "0" {
         return false;
     }
@@ -1538,6 +1558,42 @@ fn expression_equals_expected_from_assumptions(
     contracts
         .iter()
         .any(|contract| contract_proves_unsigned_zero_upper_bound(expression, contract))
+}
+
+fn contracts_prove_equality(
+    expression: &str,
+    expected: &str,
+    contracts: &[String],
+    params: &[Param],
+) -> bool {
+    if expression == expected {
+        return true;
+    }
+    if !is_known_postcondition_term(expected, params) {
+        return false;
+    }
+
+    let eq = format!("{expression}=={expected}");
+    if contracts
+        .iter()
+        .any(|contract| conditions_equivalent(contract, &eq))
+    {
+        return true;
+    }
+
+    contracts_prove_order(expression, "<=", expected, contracts)
+        && contracts_prove_order(expression, ">=", expected, contracts)
+}
+
+fn is_known_postcondition_term(term: &str, params: &[Param]) -> bool {
+    integer_literal_value(term).is_some() || param_type(term, params).is_some()
+}
+
+fn contracts_prove_order(left: &str, op: &str, right: &str, contracts: &[String]) -> bool {
+    let condition = format!("{left}{op}{right}");
+    contracts
+        .iter()
+        .any(|contract| conditions_equivalent(contract, &condition))
 }
 
 fn contract_proves_unsigned_zero_upper_bound(expression: &str, contract: &str) -> bool {
@@ -2746,6 +2802,9 @@ fn verify_loops(
     body: &str,
     function: &str,
     semantics: Option<&TrustFunctionSemantics>,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
 ) -> Result<Vec<LoopFact>, VerificationError> {
     let tokens = tokens(body);
     let mut facts = Vec::new();
@@ -2793,8 +2852,12 @@ fn verify_loops(
 
         let condition = token_expression(&tokens[idx + 1..body_open_idx]);
         let loop_body = &tokens[body_open_idx + 1..body_close_idx];
-        verify_loop_spec(&spec, &condition, loop_body, function, semantics)?;
+        let prefix = &tokens[..idx];
+        let invariants = verify_loop_spec(
+            &spec, &condition, loop_body, prefix, function, semantics, contracts, params, options,
+        )?;
         facts.push(LoopFact {
+            invariants,
             semantic_exit_facts: semantic_loop_exit_facts(semantics, &condition),
             condition,
         });
@@ -2864,9 +2927,13 @@ fn verify_loop_spec(
     spec: &LoopSpec,
     condition: &str,
     loop_body: &[String],
+    prefix: &[String],
     function: &str,
     semantics: Option<&TrustFunctionSemantics>,
-) -> Result<(), VerificationError> {
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> Result<Vec<String>, VerificationError> {
     let Some(measure) = &spec.decreases else {
         return Err(VerificationError::LoopMissingDecreases {
             function: function.to_string(),
@@ -2882,13 +2949,22 @@ fn verify_loop_spec(
         }
     }
 
+    let mut invariants = Vec::new();
     if let Some(invariant) = &spec.invariant {
-        if loop_invariant_may_not_be_preserved(invariant, condition, loop_body, semantics) {
+        if !loop_invariant_preserved(invariant, condition, loop_body, semantics, params) {
             return Err(VerificationError::LoopInvariantNotPreserved {
                 function: function.to_string(),
                 invariant: invariant.clone(),
             });
         }
+        push_unique(&mut invariants, canonical_condition(invariant));
+    }
+
+    if !loop_measure_nonnegative(measure, spec.invariant.as_deref(), params) {
+        return Err(VerificationError::LoopDecreasesNotDecreasing {
+            function: function.to_string(),
+            measure: measure.clone(),
+        });
     }
 
     if !loop_measure_decreases(measure, condition, loop_body, semantics) {
@@ -2898,25 +2974,245 @@ fn verify_loop_spec(
         });
     }
 
-    Ok(())
+    if let Some(invariant) = &spec.invariant {
+        if !loop_invariant_established(invariant, prefix, contracts, params, options) {
+            return Err(VerificationError::LoopInvariantNotEstablished {
+                function: function.to_string(),
+                invariant: invariant.clone(),
+            });
+        }
+    }
+
+    Ok(invariants)
 }
 
-fn loop_invariant_may_not_be_preserved(
+fn loop_invariant_preserved(
     invariant: &str,
     condition: &str,
     loop_body: &[String],
     semantics: Option<&TrustFunctionSemantics>,
+    params: &[Param],
 ) -> bool {
-    let Some((left, right)) = invariant.split_once("<=") else {
+    let Some((left, op, right)) = comparison_parts(invariant) else {
         return false;
     };
-    if condition != format!("{left}<{right}") {
-        return false;
+
+    if invariant_is_unsigned_nonnegative(&left, &op, &right, params) {
+        return true;
     }
 
-    increment_amount(loop_body, left)
-        .or_else(|| semantic_increment_amount(semantics, condition, left))
-        .is_some_and(|amount| amount > 1)
+    if op == "<=" && conditions_equivalent(condition, &format!("{left}<{right}")) {
+        if let Some(amount) = increment_amount(loop_body, &left)
+            .or_else(|| semantic_increment_amount(semantics, condition, &left))
+        {
+            return amount <= 1;
+        }
+        return !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]);
+    }
+
+    if op == ">=" && conditions_equivalent(condition, &format!("{left}>{right}")) {
+        if let Some(amount) = decrement_amount(loop_body, &left)
+            .or_else(|| semantic_decrement_amount(semantics, condition, &left))
+        {
+            return amount <= 1;
+        }
+        return !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()]);
+    }
+
+    !tokens_assign_to_any(loop_body, &[left.as_str(), right.as_str()])
+}
+
+fn loop_invariant_established(
+    invariant: &str,
+    prefix: &[String],
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
+    let initialized = substitute_simple_initial_values(invariant, prefix, params);
+    condition_proved(&initialized, contracts, params, options)
+}
+
+fn loop_measure_nonnegative(measure: &str, invariant: Option<&str>, params: &[Param]) -> bool {
+    if integer_constant_value(measure, None, None).is_some_and(|value| value >= 0) {
+        return true;
+    }
+    if param_type(measure, params).is_some_and(is_unsigned_integer) {
+        return true;
+    }
+
+    let Some((left, right)) = measure.split_once('-') else {
+        return false;
+    };
+    let left = left.trim();
+    let right = right.trim();
+    let Some(invariant) = invariant else {
+        return false;
+    };
+
+    conditions_equivalent(invariant, &format!("{right}<={left}"))
+        || conditions_equivalent(invariant, &format!("{left}>={right}"))
+}
+
+fn condition_proved(
+    condition: &str,
+    contracts: &[String],
+    params: &[Param],
+    options: VerificationOptions,
+) -> bool {
+    let condition = canonical_condition(condition);
+    if contracts
+        .iter()
+        .any(|contract| conditions_equivalent(contract, &condition))
+    {
+        return true;
+    }
+    if condition_is_trivially_true(&condition, params) {
+        return true;
+    }
+
+    z3_proves_conclusion(&condition, contracts, params, options).is_some_and(|proved| proved)
+}
+
+fn condition_is_trivially_true(condition: &str, params: &[Param]) -> bool {
+    let Some((left, op, right)) = comparison_parts(condition) else {
+        return false;
+    };
+    if left == right && matches!(op.as_str(), "==" | "<=" | ">=") {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (integer_literal_value(&left), integer_literal_value(&right))
+    {
+        return compare_integer_values(left, &op, right);
+    }
+
+    invariant_is_unsigned_nonnegative(&left, &op, &right, params)
+}
+
+fn invariant_is_unsigned_nonnegative(left: &str, op: &str, right: &str, params: &[Param]) -> bool {
+    match op {
+        ">=" | ">" => {
+            param_type(left, params).is_some_and(is_unsigned_integer)
+                && integer_literal_value(right).is_some_and(|value| value <= 0)
+        }
+        "<=" | "<" => {
+            param_type(right, params).is_some_and(is_unsigned_integer)
+                && integer_literal_value(left).is_some_and(|value| value <= 0)
+        }
+        _ => false,
+    }
+}
+
+fn compare_integer_values(left: i128, op: &str, right: i128) -> bool {
+    match op {
+        "==" => left == right,
+        "!=" => left != right,
+        "<=" => left <= right,
+        ">=" => left >= right,
+        "<" => left < right,
+        ">" => left > right,
+        _ => false,
+    }
+}
+
+fn comparison_parts(condition: &str) -> Option<(String, String, String)> {
+    let condition = canonical_condition(condition);
+    for op in ["<=", ">=", "!=", "==", "<", ">"] {
+        let Some((left, right)) = condition.split_once(op) else {
+            continue;
+        };
+        return Some((
+            left.trim().to_string(),
+            op.to_string(),
+            right.trim().to_string(),
+        ));
+    }
+
+    None
+}
+
+fn substitute_simple_initial_values(
+    condition: &str,
+    prefix: &[String],
+    params: &[Param],
+) -> String {
+    token_expression(
+        &tokens(condition)
+            .into_iter()
+            .map(|token| {
+                if is_ident(&token) && param_type(&token, params).is_none() {
+                    simple_initial_value(prefix, &token).unwrap_or(token)
+                } else {
+                    token
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn simple_initial_value(tokens: &[String], variable: &str) -> Option<String> {
+    let mut value = None;
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if tokens[idx] == "let" {
+            let name_idx = if tokens.get(idx + 1).is_some_and(|token| token == "mut") {
+                idx + 2
+            } else {
+                idx + 1
+            };
+            if tokens.get(name_idx).is_some_and(|name| name == variable)
+                && tokens.get(name_idx + 1).is_some_and(|token| token == "=")
+            {
+                value = simple_assigned_expression(tokens, name_idx + 1);
+            }
+            idx += 1;
+            continue;
+        }
+
+        if tokens.get(idx).is_some_and(|token| token == variable) {
+            match tokens.get(idx + 1).map(String::as_str) {
+                Some("=") => value = simple_assigned_expression(tokens, idx + 1),
+                Some("+") | Some("-") if tokens.get(idx + 2).is_some_and(|token| token == "=") => {
+                    value = None;
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+
+    value
+}
+
+fn simple_assigned_expression(tokens: &[String], equals_idx: usize) -> Option<String> {
+    let start = equals_idx + 1;
+    let end = tokens[start..]
+        .iter()
+        .position(|token| token == ";")
+        .map(|offset| start + offset)
+        .unwrap_or(tokens.len());
+    let expression = compact_parenthesized_value_tokens(&tokens[start..end]);
+    if expression.len() == 1 && is_value_operand(&expression[0]) {
+        return Some(expression[0].clone());
+    }
+
+    None
+}
+
+fn tokens_assign_to_any(tokens: &[String], variables: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(idx, token)| {
+        variables.iter().any(|variable| token == variable)
+            && (tokens.get(idx + 1).is_some_and(|next| next == "=")
+                || (matches!(
+                    tokens.get(idx + 1).map(String::as_str),
+                    Some("+") | Some("-")
+                ) && tokens.get(idx + 2).is_some_and(|next| next == "=")))
+    })
+}
+
+fn integer_literal_value(value: &str) -> Option<i128> {
+    value.parse::<i128>().ok()
 }
 
 fn loop_measure_decreases(
@@ -2986,6 +3282,30 @@ fn semantic_increment_amount(
     })
 }
 
+fn semantic_decrement_amount(
+    semantics: Option<&TrustFunctionSemantics>,
+    condition: &str,
+    variable: &str,
+) -> Option<i128> {
+    semantics.into_iter().find_map(|semantics| {
+        semantics
+            .arithmetic_operations
+            .iter()
+            .filter(|operation| {
+                operation.kind == SemanticArithmeticKind::Sub
+                    && operation.target.as_deref() == Some(variable)
+                    && operation.left == variable
+                    && semantic_operation_guarded_by(operation, condition)
+            })
+            .find_map(|operation| {
+                operation
+                    .right
+                    .as_deref()
+                    .and_then(|right| right.parse::<i128>().ok())
+            })
+    })
+}
+
 fn semantic_operation_guarded_by(operation: &SemanticArithmeticOperation, condition: &str) -> bool {
     operation
         .guards
@@ -3012,19 +3332,22 @@ fn reversed_condition(condition: &str) -> Option<String> {
     None
 }
 
-fn loop_exit_facts(facts: &[LoopFact]) -> Vec<String> {
-    let mut exit_facts = Vec::new();
+fn loop_postcondition_facts(facts: &[LoopFact]) -> Vec<String> {
+    let mut postcondition_facts = Vec::new();
 
     for fact in facts {
+        for invariant in &fact.invariants {
+            push_unique(&mut postcondition_facts, canonical_condition(invariant));
+        }
         if let Some(exit_fact) = loop_exit_fact(&fact.condition) {
-            push_unique(&mut exit_facts, exit_fact);
+            push_unique(&mut postcondition_facts, exit_fact);
         }
         for exit_fact in &fact.semantic_exit_facts {
-            push_unique(&mut exit_facts, canonical_condition(exit_fact));
+            push_unique(&mut postcondition_facts, canonical_condition(exit_fact));
         }
     }
 
-    exit_facts
+    postcondition_facts
 }
 
 fn semantic_loop_exit_facts(
@@ -3625,10 +3948,34 @@ fn addition_obligation_proved(
     if constant == 1 && contracts.iter().any(|contract| contract == &lt_exact) {
         return true;
     }
+    if constant == 1
+        && is_unsigned_integer(ty)
+        && contracts.iter().any(|contract| {
+            contract_bounds_variable_below_unsigned(&obligation.variable, contract, params)
+        })
+    {
+        return true;
+    }
 
     contracts
         .iter()
         .any(|contract| contract == &le_required || contract == &le_unqualified)
+}
+
+fn contract_bounds_variable_below_unsigned(
+    variable: &str,
+    contract: &str,
+    params: &[Param],
+) -> bool {
+    let Some((left, op, right)) = comparison_parts(contract) else {
+        return false;
+    };
+
+    match op.as_str() {
+        "<" => left == variable && param_type(&right, params).is_some_and(is_unsigned_integer),
+        ">" => right == variable && param_type(&left, params).is_some_and(is_unsigned_integer),
+        _ => false,
+    }
 }
 
 fn subtraction_obligation_proved(
@@ -4283,6 +4630,32 @@ fn increment_amount(tokens: &[String], variable: &str) -> Option<i128> {
             continue;
         };
         if target == variable && plus == "+" && equals == "=" {
+            if let Ok(amount) = amount.parse::<i128>() {
+                return Some(amount);
+            }
+        }
+    }
+
+    None
+}
+
+fn decrement_amount(tokens: &[String], variable: &str) -> Option<i128> {
+    for window in tokens.windows(5) {
+        let [target, equals, source, op, amount] = window else {
+            continue;
+        };
+        if target == variable && equals == "=" && source == variable && op == "-" {
+            if let Ok(amount) = amount.parse::<i128>() {
+                return Some(amount);
+            }
+        }
+    }
+
+    for window in tokens.windows(4) {
+        let [target, minus, equals, amount] = window else {
+            continue;
+        };
+        if target == variable && minus == "-" && equals == "=" {
             if let Ok(amount) = amount.parse::<i128>() {
                 return Some(amount);
             }
@@ -5659,6 +6032,35 @@ mod tests {
     }
 
     #[test]
+    fn loop_invariant_and_exit_fact_prove_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "count_to",
+            "pub fn count_to(n: usize) -> usize { let mut i = 0; trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { i += 1; } i }",
+            &["out == n"],
+            &["gives executable"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_loop_invariant_not_established() {
+        let metadata = metadata_named(
+            "count_from",
+            "pub fn count_from(mut i: usize, n: usize) -> usize { trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { i += 1; } i }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::LoopInvariantNotEstablished {
+                function: "count_from".to_string(),
+                invariant: "i<=n".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_loop_missing_decreases() {
         let metadata = metadata_named(
             "count_up",
@@ -6697,7 +7099,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_branch_guard_assumption_can_prove_postcondition_with_z3() {
+    fn semantic_branch_guard_equality_assumption_can_prove_postcondition() {
         let metadata = metadata_named_with_classes(
             "zero_or_self",
             "pub fn zero_or_self(x: i32) -> i32 { if x == 0 { 0 } else { x } }",
@@ -6734,16 +7136,8 @@ mod tests {
             }],
         };
 
-        assert!(matches!(
-            verify_totals_with_semantics(
-                &[metadata.clone()],
-                &[semantics.clone()],
-                VerificationOptions::default()
-            ),
-            Err(VerificationError::PostconditionUnproved { .. })
-        ));
         assert_eq!(
-            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::z3(5000)),
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
         );
     }

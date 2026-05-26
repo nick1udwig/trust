@@ -359,6 +359,14 @@ fn pass_loop_parenthesized_condition_uses_semantic_guard() {
 }
 
 #[test]
+fn pass_loop_invariant_postcondition_uses_exit_fact() {
+    let output = run_fixture("pass_loop_invariant_postcondition", Expected::Pass);
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_loop_without_spec_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_without_spec", Expected::Fail);
 
@@ -1266,6 +1274,13 @@ fn fail_loop_invariant_not_preserved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_invariant_not_preserved", Expected::Fail);
 
     output.assert_contains("error[trust]: loop invariant may not be preserved");
+}
+
+#[test]
+fn fail_loop_invariant_not_established_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_invariant_not_established", Expected::Fail);
+
+    output.assert_contains("error[trust]: loop invariant may not hold before loop entry");
 }
 
 #[test]

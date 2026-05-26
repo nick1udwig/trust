@@ -444,6 +444,7 @@ fn verification_error_item_name(err: &VerificationError) -> Option<&str> {
         | VerificationError::LoopMissingSpec { function }
         | VerificationError::LoopAmbiguousSpec { function }
         | VerificationError::LoopMissingDecreases { function }
+        | VerificationError::LoopInvariantNotEstablished { function, .. }
         | VerificationError::LoopInvariantNotPreserved { function, .. }
         | VerificationError::LoopDecreasesNotDecreasing { function, .. }
         | VerificationError::UnsupportedLoopControl { function, .. }
@@ -475,6 +476,10 @@ fn verification_error_expression(err: &VerificationError) -> Option<&str> {
         | VerificationError::SliceIndexOutOfBounds { expression, .. }
         | VerificationError::UnsupportedIndex { expression, .. } => Some(expression),
         VerificationError::CalleePreconditionUnproved { condition, .. }
+        | VerificationError::LoopInvariantNotEstablished {
+            invariant: condition,
+            ..
+        }
         | VerificationError::LoopInvariantNotPreserved {
             invariant: condition,
             ..
