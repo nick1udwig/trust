@@ -351,6 +351,14 @@ fn pass_loop_reversed_condition_uses_semantic_guard_and_exit_assumption() {
 }
 
 #[test]
+fn pass_loop_parenthesized_condition_uses_semantic_guard() {
+    let output = run_fixture("pass_loop_parenthesized_condition", Expected::Pass);
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn fail_loop_without_spec_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_loop_without_spec", Expected::Fail);
 

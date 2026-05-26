@@ -467,10 +467,7 @@ fn verify_total_with_env(
         .and_then(|semantics| semantics.return_expression.as_deref())
         .map(normalize);
     let loop_facts = verify_loops(raw_body, &metadata.rust_function_path, semantics)?;
-    let loop_exit_facts = loop_facts
-        .iter()
-        .filter_map(|fact| loop_exit_fact(&fact.condition))
-        .collect::<Vec<_>>();
+    let loop_exit_facts = loop_exit_facts(&loop_facts);
     let postcondition_assumptions = contracts_with_assumptions(&given_contracts, &loop_exit_facts);
     let call_env = verification_call_env(env, semantics);
 
@@ -764,6 +761,7 @@ struct FieldAccessObligation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoopFact {
     condition: String,
+    semantic_exit_facts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1373,16 +1371,17 @@ fn semantic_branch_proves_postcondition(
 }
 
 fn semantic_branch_arm_reachable(arm: &SemanticBranchArm, contracts: &[String]) -> bool {
-    !contracts.iter().any(|contract| {
-        semantic_condition_excluded_by_contract(&normalize(&arm.guard), &normalize(contract))
-    })
+    !contracts
+        .iter()
+        .any(|contract| semantic_condition_excluded_by_contract(&arm.guard, contract))
 }
 
 fn semantic_condition_excluded_by_contract(condition: &str, contract: &str) -> bool {
-    negated_condition(condition).as_deref() == Some(contract)
+    condition_negates(condition, contract)
 }
 
 fn negated_condition(condition: &str) -> Option<String> {
+    let condition = canonical_condition(condition);
     for (op, negated) in [
         ("<=", ">"),
         (">=", "<"),
@@ -1398,6 +1397,60 @@ fn negated_condition(condition: &str) -> Option<String> {
     }
 
     None
+}
+
+fn conditions_equivalent(left: &str, right: &str) -> bool {
+    let left = canonical_condition(left);
+    let right = canonical_condition(right);
+
+    left == right
+        || reversed_condition(&left).as_deref() == Some(right.as_str())
+        || reversed_condition(&right).as_deref() == Some(left.as_str())
+}
+
+fn condition_negates(condition: &str, other: &str) -> bool {
+    condition_variants(condition).iter().any(|variant| {
+        negated_condition(variant)
+            .as_deref()
+            .is_some_and(|negated| conditions_equivalent(negated, other))
+    })
+}
+
+fn condition_variants(condition: &str) -> Vec<String> {
+    let mut variants = vec![canonical_condition(condition)];
+    if let Some(reversed) = reversed_condition(condition) {
+        push_unique(&mut variants, reversed);
+    }
+    variants
+}
+
+fn canonical_condition(condition: &str) -> String {
+    let mut condition = normalize(condition);
+    while let Some(inner) = strip_balanced_outer_parentheses(&condition) {
+        condition = inner.to_string();
+    }
+    condition
+}
+
+fn strip_balanced_outer_parentheses(condition: &str) -> Option<&str> {
+    if !condition.starts_with('(') || !condition.ends_with(')') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (idx, ch) in condition.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+
+        if depth == 0 && idx + ch.len_utf8() < condition.len() {
+            return None;
+        }
+    }
+
+    Some(&condition[1..condition.len() - 1])
 }
 
 fn postcondition_proved_by_return_expression(
@@ -2741,7 +2794,10 @@ fn verify_loops(
         let condition = token_expression(&tokens[idx + 1..body_open_idx]);
         let loop_body = &tokens[body_open_idx + 1..body_close_idx];
         verify_loop_spec(&spec, &condition, loop_body, function, semantics)?;
-        facts.push(LoopFact { condition });
+        facts.push(LoopFact {
+            semantic_exit_facts: semantic_loop_exit_facts(semantics, &condition),
+            condition,
+        });
         idx = body_close_idx + 1;
     }
 
@@ -2931,16 +2987,14 @@ fn semantic_increment_amount(
 }
 
 fn semantic_operation_guarded_by(operation: &SemanticArithmeticOperation, condition: &str) -> bool {
-    let condition = normalize(condition);
-    operation.guards.iter().any(|guard| {
-        let guard = normalize(guard);
-        guard == condition
-            || reversed_condition(&guard).as_deref() == Some(condition.as_str())
-            || reversed_condition(&condition).as_deref() == Some(guard.as_str())
-    })
+    operation
+        .guards
+        .iter()
+        .any(|guard| conditions_equivalent(guard, condition))
 }
 
 fn reversed_condition(condition: &str) -> Option<String> {
+    let condition = canonical_condition(condition);
     for (op, reversed) in [
         ("<=", ">="),
         (">=", "<="),
@@ -2958,13 +3012,47 @@ fn reversed_condition(condition: &str) -> Option<String> {
     None
 }
 
-fn loop_exit_fact(condition: &str) -> Option<String> {
-    for (op, exit_op) in [(">=", "<"), ("<=", ">"), (">", "<="), ("<", ">=")] {
-        if let Some((left, right)) = condition.split_once(op) {
-            return Some(format!("{left}{exit_op}{right}"));
+fn loop_exit_facts(facts: &[LoopFact]) -> Vec<String> {
+    let mut exit_facts = Vec::new();
+
+    for fact in facts {
+        if let Some(exit_fact) = loop_exit_fact(&fact.condition) {
+            push_unique(&mut exit_facts, exit_fact);
+        }
+        for exit_fact in &fact.semantic_exit_facts {
+            push_unique(&mut exit_facts, canonical_condition(exit_fact));
         }
     }
-    None
+
+    exit_facts
+}
+
+fn semantic_loop_exit_facts(
+    semantics: Option<&TrustFunctionSemantics>,
+    condition: &str,
+) -> Vec<String> {
+    let mut facts = Vec::new();
+    let Some(semantics) = semantics else {
+        return facts;
+    };
+
+    for branch in &semantics.branches {
+        if !conditions_equivalent(&branch.condition, condition) {
+            continue;
+        }
+
+        for arm in &branch.arms {
+            if condition_negates(condition, &arm.guard) {
+                push_unique(&mut facts, canonical_condition(&arm.guard));
+            }
+        }
+    }
+
+    facts
+}
+
+fn loop_exit_fact(condition: &str) -> Option<String> {
+    negated_condition(condition)
 }
 
 fn loop_exit_proves_value(body: &str, return_expression: &str, expected: &str) -> bool {
@@ -5508,6 +5596,62 @@ mod tests {
             branches: Vec::new(),
         };
 
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_loop_exit_facts_use_mir_branch_guard() {
+        let metadata = metadata_named_with_classes(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while (n > 0) { n -= 1; } n }",
+            &["out == 0"],
+            &["gives executable"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("n".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                ty: Some("usize".to_string()),
+                target: Some("n".to_string()),
+                left: "n".to_string(),
+                right: Some("1".to_string()),
+                expression: "n - 1".to_string(),
+                guards: vec!["n > 0".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "n > 0".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "n > 0".to_string(),
+                        return_expression: None,
+                    },
+                    SemanticBranchArm {
+                        guard: "n <= 0".to_string(),
+                        return_expression: None,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            semantic_loop_exit_facts(Some(&semantics), "(n > 0)"),
+            vec!["n<=0".to_string()]
+        );
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
