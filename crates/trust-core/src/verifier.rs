@@ -472,8 +472,9 @@ fn verify_total_with_env(
         });
     }
     let value_params = verification_value_params(&params, semantics);
-    let raw_body = body(&metadata.function_source);
-    let body = body(&source);
+    let raw_body = cfg_selected_body(body(&metadata.function_source), options);
+    let body = normalize(&raw_body);
+    let raw_body = raw_body.as_str();
     let semantic_return_expression = semantics
         .and_then(|semantics| semantics.return_expression.as_deref())
         .map(normalize);
@@ -668,7 +669,7 @@ fn verify_total_with_env(
     for postcondition in postconditions(metadata) {
         if !postcondition_proved(
             &postcondition,
-            body,
+            &body,
             raw_body,
             semantic_return_expression.as_deref(),
             semantics,
@@ -4355,6 +4356,99 @@ fn executable_tokens(body: &str) -> Vec<String> {
     compact_parenthesized_value_tokens(&executable_tokens_without_loop_specs(body))
 }
 
+fn cfg_selected_body(body: &str, options: VerificationOptions) -> String {
+    let tokens = tokens(body);
+    cfg_selected_tokens(&tokens, options).join(" ")
+}
+
+fn cfg_selected_tokens(tokens: &[String], options: VerificationOptions) -> Vec<String> {
+    let mut selected = Vec::new();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if let Some((enabled, attr_end)) = cfg_attr(tokens, idx, options) {
+            idx = attr_end;
+            if enabled {
+                continue;
+            }
+            idx = cfg_attributed_end(tokens, idx);
+            continue;
+        }
+
+        selected.push(tokens[idx].clone());
+        idx += 1;
+    }
+
+    selected
+}
+
+fn cfg_attr(tokens: &[String], idx: usize, options: VerificationOptions) -> Option<(bool, usize)> {
+    if tokens.get(idx)? != "#" || tokens.get(idx + 1)? != "[" || tokens.get(idx + 2)? != "cfg" {
+        return None;
+    }
+    let open_idx = idx + 3;
+    if tokens.get(open_idx)? != "(" {
+        return None;
+    }
+    let close_idx = matching_token_group(tokens, open_idx, "(", ")")?;
+    if tokens.get(close_idx + 1)? != "]" {
+        return None;
+    }
+    let enabled = cfg_predicate_enabled(&tokens[open_idx + 1..close_idx], options).unwrap_or(true);
+    Some((enabled, close_idx + 2))
+}
+
+fn cfg_attributed_end(tokens: &[String], idx: usize) -> usize {
+    let Some(token) = tokens.get(idx) else {
+        return idx;
+    };
+    if matches!(token.as_str(), "{" | "(" | "[") {
+        let close = match token.as_str() {
+            "{" => "}",
+            "(" => ")",
+            "[" => "]",
+            _ => unreachable!(),
+        };
+        return matching_token_group(tokens, idx, token, close)
+            .map(|idx| idx + 1)
+            .unwrap_or(idx + 1);
+    }
+
+    tokens[idx..]
+        .iter()
+        .position(|token| token == ";")
+        .map(|offset| idx + offset + 1)
+        .unwrap_or(tokens.len())
+}
+
+fn cfg_predicate_enabled(tokens: &[String], options: VerificationOptions) -> Option<bool> {
+    match tokens {
+        [name, open, close] if name == "any" && open == "(" && close == ")" => Some(false),
+        [name, open, close] if name == "all" && open == "(" && close == ")" => Some(true),
+        [name, open, inner @ .., close] if name == "not" && open == "(" && close == ")" => {
+            cfg_predicate_enabled(inner, options).map(|enabled| !enabled)
+        }
+        [name, equals, value] if name == "target_pointer_width" && equals == "=" => {
+            cfg_target_pointer_width_matches(value, options)
+        }
+        [name, equals, quote_open, value, quote_close]
+            if name == "target_pointer_width"
+                && equals == "="
+                && quote_open == "\""
+                && quote_close == "\"" =>
+        {
+            cfg_target_pointer_width_matches(value, options)
+        }
+        _ => None,
+    }
+}
+
+fn cfg_target_pointer_width_matches(value: &str, options: VerificationOptions) -> Option<bool> {
+    options
+        .target_pointer_width
+        .map(|width| value == width.to_string())
+}
+
 fn executable_tokens_without_loop_specs(body: &str) -> Vec<String> {
     let tokens = tokens(body);
     let mut executable = Vec::new();
@@ -5215,6 +5309,42 @@ mod tests {
                 function: "inc".to_string(),
                 expression: "n + 1".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn target_cfg_disabled_code_is_not_verified_from_tokens() {
+        let metadata = metadata_named_with_classes(
+            "cfg_zero",
+            "pub fn cfg_zero(x: i32) -> i32 { #[cfg(target_pointer_width = \"16\")] { x + 1 } #[cfg(not(target_pointer_width = \"16\"))] { 0 } }",
+            &["out == 0"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "cfg_zero".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("0".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[metadata],
+                &[semantics],
+                VerificationOptions::default().with_target_pointer_width(64),
+            ),
+            Ok(())
         );
     }
 

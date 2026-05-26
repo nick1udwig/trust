@@ -24,6 +24,8 @@ Implemented:
 - target-aware `usize` proof bounds using the rustc target pointer width
 - optional SMT-LIB query dumps with `TRUST_SMT_DUMP_DIR`
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
+- cfg-aware source-token fallback for supported `#[cfg]` predicates, aligned with
+  the rustc-selected body used by HIR/MIR extraction
 - runtime public precondition assertions
 - MVP checks for `i32`, `i64`, `u32`, `u64`, and `usize` integer overflow,
   signed division/remainder overflow, division and remainder by zero, slice bounds,
@@ -57,8 +59,9 @@ Still intentionally limited:
   including through unambiguous local aliases, field types, missing-TrustModel
   field checks, unsupported shift/bitwise/cast-operation and
   signature/source-local type checks, opaque contract-reasoning checks, path
-  guards, and struct returns into verification, but it is not the primary VC
-  generator yet
+  guards, and struct returns into verification; cfg-disabled source is pruned
+  from token fallback for supported predicates, but HIR/MIR is not the primary
+  VC generator yet
 
 ## Toolchain
 
@@ -160,7 +163,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   unambiguous local aliases, and path guards plus field types for arithmetic
   obligations, missing-TrustModel checks, and unsupported
   shift/bitwise/cast-operation, signature/source-local type checks, and opaque
-  contract-reasoning checks, into verification.
+  contract-reasoning checks, into verification. Source-token fallback prunes
+  cfg-disabled body fragments for supported `#[cfg]` predicates.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 
