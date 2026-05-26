@@ -2325,6 +2325,18 @@ fn proof_body_asserts(body: &str, obligation: &str) -> bool {
 }
 
 fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
+    call_obligations_with_ambiguity(body, env, true)
+}
+
+fn unambiguous_call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligation> {
+    call_obligations_with_ambiguity(body, env, false)
+}
+
+fn call_obligations_with_ambiguity(
+    body: &str,
+    env: &[TrustFunctionSummary],
+    allow_ambiguous_leaf_matches: bool,
+) -> Vec<CallObligation> {
     let tokens = tokens(body);
     let mut obligations = Vec::new();
     let mut idx = 0;
@@ -2336,13 +2348,17 @@ fn call_obligations(body: &str, env: &[TrustFunctionSummary]) -> Vec<CallObligat
             continue;
         }
 
-        let Some(callee) = env
+        let mut matching_callees = env
             .iter()
-            .find(|function| function_name_matches_call(&function.name, callee_name))
-        else {
+            .filter(|function| function_name_matches_call(&function.name, callee_name));
+        let Some(callee) = matching_callees.next() else {
             idx += 1;
             continue;
         };
+        if !allow_ambiguous_leaf_matches && matching_callees.next().is_some() {
+            idx += 1;
+            continue;
+        }
         let Some(end) = matching_token_group(&tokens, idx + 1, "(", ")") else {
             idx += 1;
             continue;
@@ -2385,11 +2401,24 @@ fn verification_call_obligations(
     semantics: Option<&TrustFunctionSemantics>,
 ) -> Vec<CallObligation> {
     let semantic_obligations = semantic_call_obligations(semantics, env);
-    if semantic_obligations.is_empty() {
+    let token_obligations = if semantic_obligations.is_empty() {
         call_obligations(body, env)
     } else {
-        semantic_obligations
-    }
+        unambiguous_call_obligations(body, env)
+    };
+    let fallback_obligations = mergeable_token_fallback_obligations(
+        &semantic_obligations,
+        token_obligations,
+        |obligation| &obligation.condition,
+    );
+
+    extend_unique_by(
+        semantic_obligations,
+        fallback_obligations,
+        |existing, fallback| {
+            existing.callee == fallback.callee && existing.condition == fallback.condition
+        },
+    )
 }
 
 fn semantic_call_obligations(
@@ -5347,6 +5376,117 @@ mod tests {
         assert_eq!(
             verify_totals_with_semantics(
                 &[inc, caller],
+                &[semantics],
+                VerificationOptions::default()
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn partial_semantic_calls_do_not_suppress_simple_token_obligations() {
+        let inc = metadata_named(
+            "inc",
+            "pub fn inc(x: i32) -> i32 { x + 1 }",
+            &["x < i32::MAX"],
+        );
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(x: i32, y: i32) -> i32 { let _ = inc(x); inc(y) }",
+            &["x < i32::MAX"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "caller".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "y".to_string(),
+                    ty: "i32".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[inc, caller],
+                &[semantics],
+                VerificationOptions::default()
+            ),
+            Err(VerificationError::CalleePreconditionUnproved {
+                function: "caller".to_string(),
+                callee: "inc".to_string(),
+                condition: "y<i32::MAX".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_call_merge_does_not_reintroduce_ambiguous_leaf_callee() {
+        let left_inc = metadata_named(
+            "outer::left::inc",
+            "pub fn inc(x: i32) -> i32 { x }",
+            &["x > 0"],
+        );
+        let right_inc = metadata_named(
+            "outer::right::inc",
+            "pub fn inc(x: i32) -> i32 { x }",
+            &["x < 0"],
+        );
+        let caller = metadata_named(
+            "outer::right::caller",
+            "pub fn caller(x: i32) -> i32 { inc(x) }",
+            &["x < 0"],
+        );
+        let right_callee = SemanticTrustCallee {
+            rust_function_path: "outer::right::inc".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            preconditions: vec!["x < 0".to_string()],
+        };
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "outer::right::caller".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "right::inc".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: Some(right_callee),
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(
+                &[left_inc, right_inc, caller],
                 &[semantics],
                 VerificationOptions::default()
             ),
