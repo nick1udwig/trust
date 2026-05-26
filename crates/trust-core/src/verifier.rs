@@ -40,6 +40,7 @@ pub enum SemanticContractBindingKind {
     Result,
     Field,
     Local,
+    LocalInitializer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1287,7 +1288,9 @@ fn verification_value_params(
     for binding in &semantics.contract_bindings {
         if !matches!(
             binding.kind,
-            SemanticContractBindingKind::Field | SemanticContractBindingKind::Local
+            SemanticContractBindingKind::Field
+                | SemanticContractBindingKind::Local
+                | SemanticContractBindingKind::LocalInitializer
         ) || value_params.iter().any(|param| param.name == binding.name)
         {
             continue;
@@ -3391,11 +3394,21 @@ fn verify_loop_spec(
     }
 
     if let Some(invariant) = &spec.invariant {
-        if !loop_invariant_established(invariant, prefix, contracts, params, options) {
-            return Err(VerificationError::LoopInvariantNotEstablished {
-                function: function.to_string(),
-                invariant: invariant.clone(),
-            });
+        match loop_invariant_established(invariant, prefix, semantics, contracts, params, options) {
+            LoopInvariantProof::Proved => {}
+            LoopInvariantProof::Unproved => {
+                return Err(VerificationError::LoopInvariantNotEstablished {
+                    function: function.to_string(),
+                    invariant: invariant.clone(),
+                });
+            }
+            LoopInvariantProof::SemanticExtractionIncomplete => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: function.to_string(),
+                    category: "loop invariant".to_string(),
+                    expression: invariant.clone(),
+                });
+            }
         }
     }
 
@@ -3474,12 +3487,33 @@ fn token_loop_invariant_proof(
 fn loop_invariant_established(
     invariant: &str,
     prefix: &[String],
+    semantics: Option<&TrustFunctionSemantics>,
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
-) -> bool {
-    let initialized = substitute_simple_initial_values(invariant, prefix, params);
-    condition_proved(&initialized, contracts, params, options)
+) -> LoopInvariantProof {
+    if condition_proved(invariant, contracts, params, options) {
+        return LoopInvariantProof::Proved;
+    }
+
+    if let Some(initialized) = semantic_substitute_initial_values(invariant, semantics) {
+        if condition_proved(&initialized, contracts, params, options) {
+            return LoopInvariantProof::Proved;
+        }
+    }
+
+    let initialized = substitute_simple_initial_values(invariant, prefix, params, semantics);
+    if initialized != normalize(invariant)
+        && condition_proved(&initialized, contracts, params, options)
+    {
+        if semantics.is_some() {
+            LoopInvariantProof::SemanticExtractionIncomplete
+        } else {
+            LoopInvariantProof::Proved
+        }
+    } else {
+        LoopInvariantProof::Unproved
+    }
 }
 
 fn loop_measure_nonnegative(measure: &str, invariant: Option<&str>, params: &[Param]) -> bool {
@@ -3584,12 +3618,16 @@ fn substitute_simple_initial_values(
     condition: &str,
     prefix: &[String],
     params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
 ) -> String {
     token_expression(
         &tokens(condition)
             .into_iter()
             .map(|token| {
-                if is_ident(&token) && param_type(&token, params).is_none() {
+                let is_function_param = semantics
+                    .map(|semantics| semantic_function_param(semantics, &token))
+                    .unwrap_or_else(|| param_type(&token, params).is_some());
+                if is_ident(&token) && !is_function_param {
                     simple_initial_value(prefix, &token).unwrap_or(token)
                 } else {
                     token
@@ -3597,6 +3635,48 @@ fn substitute_simple_initial_values(
             })
             .collect::<Vec<_>>(),
     )
+}
+
+fn semantic_substitute_initial_values(
+    condition: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
+    let semantics = semantics?;
+    let mut changed = false;
+    let substituted = token_expression(
+        &tokens(condition)
+            .into_iter()
+            .map(|token| {
+                if is_ident(&token) && !semantic_function_param(semantics, &token) {
+                    if let Some(value) = semantic_local_initial_value(semantics, &token) {
+                        changed = true;
+                        return value;
+                    }
+                }
+                token
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    changed.then_some(substituted)
+}
+
+fn semantic_function_param(semantics: &TrustFunctionSemantics, name: &str) -> bool {
+    semantics.params.iter().any(|param| param.name == name)
+}
+
+fn semantic_local_initial_value(
+    semantics: &TrustFunctionSemantics,
+    variable: &str,
+) -> Option<String> {
+    semantics
+        .contract_bindings
+        .iter()
+        .find(|binding| {
+            binding.kind == SemanticContractBindingKind::LocalInitializer
+                && binding.name == variable
+        })
+        .map(|binding| normalize(&binding.expression))
 }
 
 fn simple_initial_value(tokens: &[String], variable: &str) -> Option<String> {
@@ -6970,6 +7050,137 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn semantic_loop_invariant_establishment_uses_mir_local_initializer() {
+        let metadata = metadata_named_with_classes(
+            "count_to",
+            "pub fn count_to(n: usize) -> usize { let mut i = 0; trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { i += 1; } i }",
+            &[],
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "count_to".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: vec!["usize".to_string()],
+            contract_bindings: vec![
+                SemanticContractBinding {
+                    expression: "i".to_string(),
+                    name: "i".to_string(),
+                    kind: SemanticContractBindingKind::Local,
+                    ty: "usize".to_string(),
+                },
+                SemanticContractBinding {
+                    expression: "0".to_string(),
+                    name: "i".to_string(),
+                    kind: SemanticContractBindingKind::LocalInitializer,
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_expression: Some("i".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("usize".to_string()),
+                target: Some("i".to_string()),
+                left: "i".to_string(),
+                right: Some("1".to_string()),
+                expression: "i + 1".to_string(),
+                guards: vec!["i < n".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "i < n".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "i < n".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                    SemanticBranchArm {
+                        guard: "i >= n".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn partial_semantic_loop_invariant_establishment_fails_closed() {
+        let metadata = metadata_named_with_classes(
+            "count_to",
+            "pub fn count_to(n: usize) -> usize { let mut i = 0; trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { i += 1; } i }",
+            &[],
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "count_to".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: vec!["usize".to_string()],
+            contract_bindings: vec![SemanticContractBinding {
+                expression: "i".to_string(),
+                name: "i".to_string(),
+                kind: SemanticContractBindingKind::Local,
+                ty: "usize".to_string(),
+            }],
+            return_expression: Some("i".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("usize".to_string()),
+                target: Some("i".to_string()),
+                left: "i".to_string(),
+                right: Some("1".to_string()),
+                expression: "i + 1".to_string(),
+                guards: vec!["i < n".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: vec![SemanticBranch {
+                condition: "i < n".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "i < n".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                    SemanticBranchArm {
+                        guard: "i >= n".to_string(),
+                        assumptions: Vec::new(),
+                        return_expression: None,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "count_to".to_string(),
+                category: "loop invariant".to_string(),
+                expression: "i<=n".to_string(),
+            })
+        );
     }
 
     #[test]

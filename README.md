@@ -29,6 +29,8 @@ Implemented:
 - MIR-backed arithmetic, slice-index, Trust-call, field-access, loop-invariant,
   loop-decreases, loop-exit, and return postcondition VCs when semantic
   extraction is available, with fail-closed diagnostics for token-only gaps
+- MIR-backed source-local initializer facts for loop invariant establishment,
+  with fail-closed diagnostics when only source-token initialization proves it
 - MIR-backed unsupported-call rejection when semantic extraction is available,
   with fail-closed diagnostics for token-only gaps
 - HIR/MIR-backed parameter and return-type mapping when semantic extraction is
@@ -61,8 +63,9 @@ Still intentionally limited:
   assumptions, branch-assignment and carried-local return facts at simple MIR
   joins including same-block copy chains,
   Option/Result match arms including simple local aliases, loop decreases
-  targets and loop exit facts from compiler branch guards, source-local type
-  bindings for local loop measures, and TrustModel field projections,
+  targets and loop exit facts from compiler branch guards, source-local type and
+  initializer bindings for local loop measures and invariant establishment, and
+  TrustModel field projections,
   including through unambiguous local aliases, field types, missing-TrustModel
   field checks, unsupported shift/bitwise/cast-operation and
   signature/source-local type checks, opaque contract-reasoning checks, path
@@ -168,8 +171,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   branch-assignment and carried-local return facts at simple MIR joins including
   same-block copy chains, Option/Result
   match arms including simple local aliases, loop decreases targets,
-  loop exit facts, and source-local type bindings for local loop measures, and
-  TrustModel field projections in returns,
+  loop exit facts, and source-local type and initializer bindings for local loop
+  measures and invariant establishment, and TrustModel field projections in returns,
   unambiguous local aliases, and path guards plus field types for arithmetic
   obligations, missing-TrustModel checks, and unsupported
   shift/bitwise/cast-operation, signature/source-local type checks, and opaque

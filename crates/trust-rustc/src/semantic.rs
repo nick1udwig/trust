@@ -252,7 +252,7 @@ fn verifier_semantics(
             })?;
             let mut contract_bindings =
                 semantic_contract_bindings(metadata_item, mir_function, &model_fields);
-            contract_bindings.extend(semantic_local_bindings(mir_function));
+            contract_bindings.extend(semantic_local_bindings(mir_function, &model_fields));
             let contract_bindings = dedup_contract_bindings(contract_bindings);
 
             Some(TrustFunctionSemantics {
@@ -386,21 +386,34 @@ fn semantic_contract_bindings(
     dedup_contract_bindings(bindings)
 }
 
-fn semantic_local_bindings(mir_function: &MirFunctionSummary) -> Vec<SemanticContractBinding> {
-    let bindings = mir_function
+fn semantic_local_bindings(
+    mir_function: &MirFunctionSummary,
+    model_fields: &[ModelFieldMap],
+) -> Vec<SemanticContractBinding> {
+    let mut bindings = Vec::new();
+    for local in mir_function
         .debug_locals
         .iter()
         .filter(|local| !mir_function.is_arg_place(&local.place) && is_ident_token(&local.name))
-        .filter_map(|local| {
-            let ty = mir_function.mir_expression_type(&local.place, &[])?;
-            Some(SemanticContractBinding {
-                expression: local.name.clone(),
+    {
+        let Some(ty) = mir_function.mir_expression_type(&local.place, model_fields) else {
+            continue;
+        };
+        bindings.push(SemanticContractBinding {
+            expression: local.name.clone(),
+            name: local.name.clone(),
+            kind: SemanticContractBindingKind::Local,
+            ty: ty.clone(),
+        });
+        if let Some(initializer) = mir_function.semantic_local_initializer(local, model_fields) {
+            bindings.push(SemanticContractBinding {
+                expression: initializer,
                 name: local.name.clone(),
-                kind: SemanticContractBindingKind::Local,
+                kind: SemanticContractBindingKind::LocalInitializer,
                 ty,
-            })
-        })
-        .collect();
+            });
+        }
+    }
 
     dedup_contract_bindings(bindings)
 }
@@ -522,6 +535,7 @@ fn contract_binding_kind_name(kind: SemanticContractBindingKind) -> &'static str
         SemanticContractBindingKind::Result => "result",
         SemanticContractBindingKind::Field => "field",
         SemanticContractBindingKind::Local => "local",
+        SemanticContractBindingKind::LocalInitializer => "local_initializer",
     }
 }
 
@@ -829,6 +843,52 @@ impl MirFunctionSummary {
             }
         }
         types
+    }
+
+    fn semantic_local_initializer(
+        &self,
+        local: &MirDebugLocal,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<String> {
+        let assignments = self
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.place == local.place)
+            .collect::<Vec<_>>();
+        let first = assignments.first()?;
+        if !self.guards_for_assignment(first, model_fields).is_empty() {
+            return None;
+        }
+        if assignments
+            .iter()
+            .skip(1)
+            .any(|assignment| !self.guarded_self_update(local, assignment, model_fields))
+        {
+            return None;
+        }
+
+        self.normalized_mir_expression_with_models(&first.expression, model_fields)
+    }
+
+    fn guarded_self_update(
+        &self,
+        local: &MirDebugLocal,
+        assignment: &MirAssignment,
+        model_fields: &[ModelFieldMap],
+    ) -> bool {
+        let guards = self.guards_for_assignment(assignment, model_fields);
+        let Some(expression) =
+            self.normalized_mir_expression_with_models(&assignment.expression, model_fields)
+        else {
+            return false;
+        };
+        !guards.is_empty()
+            && guards.iter().any(|guard| {
+                guard_variables(guard)
+                    .iter()
+                    .any(|variable| variable == &local.name)
+            })
+            && semantic_self_update_expression(&expression, &local.name)
     }
 
     fn local_aliases_for_place_with_models(
@@ -2818,6 +2878,16 @@ fn semantic_binary_expression(left: &str, operator: &str, right: &str) -> String
     )
 }
 
+fn semantic_self_update_expression(expression: &str, variable: &str) -> bool {
+    let expression = expression
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    expression.starts_with(&format!("{variable}+"))
+        || expression.starts_with(&format!("{variable}-"))
+        || expression.ends_with(&format!("+{variable}"))
+}
+
 fn semantic_binary_operand(expr: &str, operator: &str, is_right: bool) -> String {
     if semantic_binary_operand_needs_parentheses(expr, operator, is_right) {
         format!("({expr})")
@@ -2971,7 +3041,7 @@ fn semantic_summary(
                     semantic_contract_bindings(metadata_item, mir_function, &model_fields)
                 })
                 .unwrap_or_default();
-            contract_bindings.extend(semantic_local_bindings(mir_function));
+            contract_bindings.extend(semantic_local_bindings(mir_function, &model_fields));
             let contract_bindings = dedup_contract_bindings(contract_bindings);
             let return_expr = mir_function
                 .normalized_return_expression_with_models(&model_fields)
@@ -4757,13 +4827,123 @@ fn keep(_1: i32) -> i32 {
         let summary = extract_mir_function_summary(mir, "keep").expect("MIR summary");
 
         assert_eq!(
-            semantic_local_bindings(&summary),
-            vec![SemanticContractBinding {
-                expression: "count".to_string(),
-                name: "count".to_string(),
-                kind: SemanticContractBindingKind::Local,
-                ty: "u32".to_string(),
-            }]
+            semantic_local_bindings(&summary, &[]),
+            vec![
+                SemanticContractBinding {
+                    expression: "count".to_string(),
+                    name: "count".to_string(),
+                    kind: SemanticContractBindingKind::Local,
+                    ty: "u32".to_string(),
+                },
+                SemanticContractBinding {
+                    expression: "1".to_string(),
+                    name: "count".to_string(),
+                    kind: SemanticContractBindingKind::LocalInitializer,
+                    ty: "u32".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_loop_local_initializer_from_mir() {
+        let mir = r#"
+fn count_to(_1: usize) -> usize {
+    debug n => _1;
+    debug i => _2;
+    let mut _0: usize;
+    let mut _2: usize;
+    let mut _3: bool;
+    let mut _4: (usize, bool);
+
+    bb0: {
+        _2 = const 0_usize;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _3 = Lt(copy _2, copy _1);
+        switchInt(move _3) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _4 = AddWithOverflow(copy _2, const 1_usize);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _2, const 1_usize) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _2 = move (_4.0: usize);
+        goto -> bb1;
+    }
+
+    bb3: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "count_to").expect("MIR summary");
+
+        assert!(
+            semantic_local_bindings(&summary, &[]).contains(&SemanticContractBinding {
+                expression: "0".to_string(),
+                name: "i".to_string(),
+                kind: SemanticContractBindingKind::LocalInitializer,
+                ty: "usize".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn skips_local_initializer_when_later_guarded_assignment_is_not_self_update() {
+        let mir = r#"
+fn adjust_before_loop(_1: usize) -> usize {
+    debug n => _1;
+    debug i => _2;
+    let mut _0: usize;
+    let mut _2: usize;
+    let mut _3: bool;
+    let mut _4: (usize, bool);
+    let mut _5: bool;
+
+    bb0: {
+        _2 = const 0_usize;
+        _3 = Lt(copy _2, copy _1);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = AddWithOverflow(copy _1, const 1_usize);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _1, const 1_usize) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _2 = move (_4.0: usize);
+        goto -> bb2;
+    }
+
+    bb2: {
+        _5 = Lt(copy _2, copy _1);
+        switchInt(move _5) -> [0: bb3, otherwise: bb3];
+    }
+
+    bb3: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "adjust_before_loop").expect("MIR summary");
+
+        assert!(
+            !semantic_local_bindings(&summary, &[]).contains(&SemanticContractBinding {
+                expression: "0".to_string(),
+                name: "i".to_string(),
+                kind: SemanticContractBindingKind::LocalInitializer,
+                ty: "usize".to_string(),
+            })
         );
     }
 
