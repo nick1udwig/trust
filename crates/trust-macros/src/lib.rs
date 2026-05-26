@@ -622,43 +622,183 @@ fn take_leading_attribute(input: &str) -> Option<(&str, &str)> {
 
 fn inject_module_path_markers(source: &str, module_path: &str) -> String {
     let mut output = String::new();
-    let mut remaining = source;
+    let mut cursor = 0usize;
 
-    while let Some((prefix_len, open_brace_end)) = find_next_trust_macro_open(remaining) {
-        output.push_str(&remaining[..open_brace_end]);
-        output.push_str(" __trust_module_path ");
-        output.push_str(module_path);
-        output.push_str("; ");
-        remaining = &remaining[open_brace_end..];
-        if prefix_len == 0 && open_brace_end == 0 {
-            break;
+    loop {
+        let remaining = &source[cursor..];
+        let next_macro = find_next_trust_macro_open(remaining)
+            .map(|(prefix_len, open_brace_end)| (cursor + prefix_len, cursor + open_brace_end));
+        let next_module = find_next_module_body(remaining).map(|module| NestedModuleBody {
+            module_name: module.module_name,
+            mod_idx: cursor + module.mod_idx,
+            open_brace_end: cursor + module.open_brace_end,
+            close_brace_idx: cursor + module.close_brace_idx,
+        });
+
+        match (next_macro, next_module) {
+            (Some((macro_idx, open_brace_end)), Some(module)) if macro_idx < module.mod_idx => {
+                output.push_str(&source[cursor..open_brace_end]);
+                output.push_str(" __trust_module_path ");
+                output.push_str(module_path);
+                output.push_str("; ");
+                cursor = open_brace_end;
+            }
+            (Some((_macro_idx, open_brace_end)), None) => {
+                output.push_str(&source[cursor..open_brace_end]);
+                output.push_str(" __trust_module_path ");
+                output.push_str(module_path);
+                output.push_str("; ");
+                cursor = open_brace_end;
+            }
+            (_, Some(module)) => {
+                output.push_str(&source[cursor..module.open_brace_end]);
+                let nested_module_path = child_module_path(source, module_path, &module);
+                output.push_str(&inject_module_path_markers(
+                    &source[module.open_brace_end..module.close_brace_idx],
+                    &nested_module_path,
+                ));
+                cursor = module.close_brace_idx;
+            }
+            (None, None) => break,
         }
     }
 
-    output.push_str(remaining);
+    output.push_str(&source[cursor..]);
     output
 }
 
 fn inject_trust_model_module_path_attrs(source: &str, module_path: &str) -> String {
     let mut output = String::new();
     let mut cursor = 0usize;
-    let mut search_start = 0usize;
 
-    while let Some((insertion_idx, struct_end)) =
-        find_next_trust_model_derive_struct(&source[search_start..])
-    {
-        let insertion_idx = search_start + insertion_idx;
-        let struct_end = search_start + struct_end;
-        output.push_str(&source[cursor..insertion_idx]);
-        output.push_str("#[trust_module_path = \"");
-        output.push_str(module_path);
-        output.push_str("\"] ");
-        cursor = insertion_idx;
-        search_start = struct_end;
+    loop {
+        let remaining = &source[cursor..];
+        let next_derive = find_next_trust_model_derive_struct(remaining)
+            .map(|(insertion_idx, struct_end)| (cursor + insertion_idx, cursor + struct_end));
+        let next_module = find_next_module_body(remaining).map(|module| NestedModuleBody {
+            module_name: module.module_name,
+            mod_idx: cursor + module.mod_idx,
+            open_brace_end: cursor + module.open_brace_end,
+            close_brace_idx: cursor + module.close_brace_idx,
+        });
+
+        match (next_derive, next_module) {
+            (Some((insertion_idx, struct_end)), Some(module)) if insertion_idx < module.mod_idx => {
+                output.push_str(&source[cursor..insertion_idx]);
+                output.push_str("#[trust_module_path = \"");
+                output.push_str(module_path);
+                output.push_str("\"] ");
+                output.push_str(&source[insertion_idx..struct_end]);
+                cursor = struct_end;
+            }
+            (Some((insertion_idx, struct_end)), None) => {
+                output.push_str(&source[cursor..insertion_idx]);
+                output.push_str("#[trust_module_path = \"");
+                output.push_str(module_path);
+                output.push_str("\"] ");
+                output.push_str(&source[insertion_idx..struct_end]);
+                cursor = struct_end;
+            }
+            (_, Some(module)) => {
+                output.push_str(&source[cursor..module.open_brace_end]);
+                let nested_module_path = child_module_path(source, module_path, &module);
+                output.push_str(&inject_trust_model_module_path_attrs(
+                    &source[module.open_brace_end..module.close_brace_idx],
+                    &nested_module_path,
+                ));
+                cursor = module.close_brace_idx;
+            }
+            (None, None) => break,
+        }
     }
 
     output.push_str(&source[cursor..]);
     output
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NestedModuleBody {
+    module_name: String,
+    mod_idx: usize,
+    open_brace_end: usize,
+    close_brace_idx: usize,
+}
+
+fn child_module_path(source: &str, module_path: &str, module: &NestedModuleBody) -> String {
+    if source[..module.mod_idx].trim().is_empty()
+        && module_path
+            .rsplit("::")
+            .next()
+            .is_some_and(|leaf| leaf == module.module_name)
+    {
+        module_path.to_string()
+    } else {
+        format!("{module_path}::{}", module.module_name)
+    }
+}
+
+fn find_next_module_body(input: &str) -> Option<NestedModuleBody> {
+    for (idx, _) in input.char_indices() {
+        let Some(after_mod) = consume_ident_at(input, idx, "mod") else {
+            continue;
+        };
+        let name_start = skip_ws(input, after_mod);
+        let rest = input.get(name_start..)?;
+        let Some((module_name, after_name)) = take_ident(rest) else {
+            continue;
+        };
+        let after_name_idx = name_start + rest.len() - after_name.len();
+        let open_brace_idx = skip_ws(input, after_name_idx);
+        if input
+            .get(open_brace_idx..)
+            .is_some_and(|rest| rest.starts_with(';'))
+        {
+            continue;
+        }
+        if input
+            .get(open_brace_idx..)
+            .and_then(|rest| rest.chars().next())
+            != Some('{')
+        {
+            continue;
+        }
+        let close_brace_idx = matching_brace_idx(input, open_brace_idx)?;
+
+        return Some(NestedModuleBody {
+            module_name: module_name.to_string(),
+            mod_idx: idx,
+            open_brace_end: open_brace_idx + 1,
+            close_brace_idx,
+        });
+    }
+
+    None
+}
+
+fn matching_brace_idx(input: &str, open_brace_idx: usize) -> Option<usize> {
+    if input
+        .get(open_brace_idx..)
+        .and_then(|rest| rest.chars().next())
+        != Some('{')
+    {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (relative_idx, ch) in input[open_brace_idx..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open_brace_idx + relative_idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn find_next_trust_model_derive_struct(input: &str) -> Option<(usize, usize)> {
@@ -1104,17 +1244,17 @@ fn inspect_module(input: &str) -> Result<(), &'static str> {
     while idx < tokens.len() && depth > 0 {
         match &tokens[idx] {
             LexToken::Ident(ident)
-                if depth == 1
+                if depth >= 1
                     && matches!(ident.as_str(), "total" | "spec" | "proof" | "trusted_model") =>
             {
                 idx = skip_macro_invocation_group(&tokens, idx);
             }
-            LexToken::Ident(ident) if depth == 1 && ident == "unsafe" => {
+            LexToken::Ident(ident) if depth >= 1 && ident == "unsafe" => {
                 return Err(
                     "error[trust]: unsafe items are not allowed inside #[trust::module] in the MVP",
                 );
             }
-            LexToken::Ident(ident) if depth == 1 && ident == "fn" => {
+            LexToken::Ident(ident) if depth >= 1 && ident == "fn" => {
                 return Err("error[trust]: unverified Rust functions are not allowed inside #[trust::module] in the MVP");
             }
             LexToken::Punct('{') => {
@@ -1675,12 +1815,33 @@ mod tests {
     }
 
     #[test]
+    fn module_injects_nested_path_marker_into_nested_total_macros() {
+        let source =
+            "mod outer { mod inner { trust::total! { pub fn same(x : i32) -> i32 { x } } } }";
+
+        assert_eq!(
+            inject_module_path_markers(source, "outer"),
+            "mod outer { mod inner { trust::total! { __trust_module_path outer::inner;  pub fn same(x : i32) -> i32 { x } } } }"
+        );
+    }
+
+    #[test]
     fn module_injects_path_attr_into_trust_model_derive() {
         let source = "mod left { # [derive(TrustModel)] pub struct Account { pub balance : i64 } }";
 
         assert_eq!(
             inject_trust_model_module_path_attrs(source, "left"),
             "mod left { #[trust_module_path = \"left\"] # [derive(TrustModel)] pub struct Account { pub balance : i64 } }"
+        );
+    }
+
+    #[test]
+    fn module_injects_nested_path_attr_into_nested_trust_model_derive() {
+        let source = "mod outer { mod inner { # [derive(TrustModel)] pub struct Account { pub balance : i64 } } }";
+
+        assert_eq!(
+            inject_trust_model_module_path_attrs(source, "outer"),
+            "mod outer { mod inner { #[trust_module_path = \"outer::inner\"] # [derive(TrustModel)] pub struct Account { pub balance : i64 } } }"
         );
     }
 

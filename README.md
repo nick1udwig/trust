@@ -34,9 +34,10 @@ Still intentionally limited:
   arbitrary Rust calls, arbitrary method calls, iterators, mutation-heavy collection models,
   or user-declared trusted axioms
 - diagnostics are deterministic and tested, but source-span quality is still MVP-level
-- Trust macros and `#[derive(TrustModel)]` inside distinct verified modules record
-  module-qualified metadata paths, but Trust metadata emitted from ordinary
-  unannotated Rust modules still does not receive full Rust module paths
+- Trust macros and `#[derive(TrustModel)]` inside verified modules, including
+  nested modules, record module-qualified metadata paths, but Trust metadata
+  emitted from ordinary unannotated Rust modules still does not receive full
+  Rust module paths
 - verification still mostly uses the metadata/token verifier plus default
   HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic
   operations with concrete Rust integer types, slice index facts with element and

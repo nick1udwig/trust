@@ -137,6 +137,40 @@ fn pass_semantic_duplicate_leaf_names_use_module_qualified_mir_paths() {
 }
 
 #[test]
+fn pass_semantic_nested_module_paths_use_full_mir_paths() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_nested_module_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_nested_module_paths",
+        Expected::Pass,
+        &format!("pass_semantic_nested_module_paths_{suffix}"),
+        &format!("pass_semantic_nested_module_paths_{suffix}"),
+        &[("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str)],
+    );
+
+    output.assert_contains("trust: discovered 2 total functions");
+    output.assert_contains("trust: extracted HIR/MIR for 2 total functions");
+    output.assert_contains("trust: proved 2 total functions");
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("path=outer::left::same resolved_path=left::same"));
+    assert!(summary.contains("path=outer::right::same resolved_path=right::same"));
+    assert!(summary.contains("mir_function path=left::same"));
+    assert!(summary.contains("mir_function path=right::same"));
+}
+
+#[test]
 fn pass_semantic_let_return_postcondition_uses_mir_return_expression() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(

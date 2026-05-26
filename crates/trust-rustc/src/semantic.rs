@@ -625,11 +625,16 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
 
 fn mir_function_signature_idx(lines: &[&str], expected_path: &str) -> Option<usize> {
     if expected_path.contains("::") {
-        if let Some(idx) = lines
+        let mut qualified_matches = lines
             .iter()
-            .position(|line| mir_signature_matches_qualified_path(line.trim(), expected_path))
-        {
-            return Some(idx);
+            .enumerate()
+            .filter(|(_, line)| mir_signature_matches_qualified_path(line.trim(), expected_path))
+            .map(|(idx, _)| idx);
+        if let Some(first) = qualified_matches.next() {
+            if qualified_matches.next().is_none() {
+                return Some(first);
+            }
+            return None;
         }
     }
 
@@ -1282,7 +1287,9 @@ fn mir_signature_matches_qualified_path(line: &str, expected_path: &str) -> bool
     let Some(path) = mir_signature_name(line) else {
         return false;
     };
-    path == expected_path || path.ends_with(&format!("::{expected_path}"))
+    path == expected_path
+        || path.ends_with(&format!("::{expected_path}"))
+        || expected_path.ends_with(&format!("::{path}"))
 }
 
 fn mir_signature_matches_leaf(line: &str, name: &str) -> bool {
@@ -2109,6 +2116,44 @@ fn id_i32(_1: i32) -> i32 {
                 .expect("verified::id_i32 summary")
                 .path,
             "id_i32"
+        );
+    }
+
+    #[test]
+    fn extracts_mir_function_summary_when_rustc_omits_outer_module() {
+        let mir = r#"
+fn left::same(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+
+fn right::same(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+
+    bb0: {
+        _0 = Add(copy _1, const 1_i32);
+        return;
+    }
+}
+"#;
+
+        assert_eq!(
+            extract_mir_function_summary(mir, "outer::left::same")
+                .expect("outer::left::same summary")
+                .path,
+            "left::same"
+        );
+        assert_eq!(
+            extract_mir_function_summary(mir, "outer::right::same")
+                .expect("outer::right::same summary")
+                .path,
+            "right::same"
         );
     }
 
