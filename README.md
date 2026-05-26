@@ -50,8 +50,9 @@ Still intentionally limited:
   return facts, Option/Result match arms, and TrustModel field projections,
   including through unambiguous local aliases, field types, missing-TrustModel
   field checks, unsupported shift/bitwise/cast-operation and
-  signature/source-local type checks, path guards, and struct returns into
-  verification, but it is not the primary VC generator yet
+  signature/source-local type checks, opaque contract-reasoning checks, path
+  guards, and struct returns into verification, but it is not the primary VC
+  generator yet
 
 ## Toolchain
 
@@ -146,8 +147,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   facts, Option/Result match arms, and TrustModel field projections in
   returns, unambiguous local aliases, and path guards plus field types for
   arithmetic obligations, missing-TrustModel checks, and unsupported
-  shift/bitwise/cast-operation and signature/source-local type checks, into
-  verification.
+  shift/bitwise/cast-operation, signature/source-local type checks, and opaque
+  contract-reasoning checks, into verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 

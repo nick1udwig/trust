@@ -3266,7 +3266,10 @@ fn choose(_1: i32) -> i32 {
 
         let summary = extract_mir_function_summary(mir, "choose").expect("MIR summary");
 
-        assert_eq!(summary.normalized_return_expression(), Some("y".to_string()));
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("y".to_string())
+        );
     }
 
     #[test]

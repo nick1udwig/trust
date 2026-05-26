@@ -453,6 +453,12 @@ fn verify_total_with_env(
             ty,
         });
     }
+    if let Some(ty) = opaque_contract_type(&params, &return_type, metadata, model_types) {
+        return Err(VerificationError::UnsupportedType {
+            function: metadata.rust_function_path.clone(),
+            ty,
+        });
+    }
     let value_params = verification_value_params(&params, semantics);
     let raw_body = body(&metadata.function_source);
     let body = body(&source);
@@ -940,6 +946,52 @@ fn unsupported_function_type(
 }
 
 fn unsupported_mvp_type(ty: &str, model_types: &[String]) -> Option<String> {
+    match mvp_type_support(ty, model_types) {
+        MvpTypeSupport::Unsupported(ty) => Some(ty),
+        MvpTypeSupport::Supported | MvpTypeSupport::Opaque => None,
+    }
+}
+
+fn opaque_contract_type(
+    params: &[Param],
+    return_type: &str,
+    metadata: &TrustMetadata,
+    model_types: &[String],
+) -> Option<String> {
+    let contract_tokens = metadata
+        .contracts_normalized
+        .iter()
+        .flat_map(|contract| tokens(contract))
+        .collect::<Vec<_>>();
+    if contract_tokens.is_empty() {
+        return None;
+    }
+
+    if contract_tokens.iter().any(|token| token == "out")
+        && mvp_type_support(return_type, model_types) == MvpTypeSupport::Opaque
+    {
+        return Some(return_type.trim().to_string());
+    }
+
+    params.iter().find_map(|param| {
+        if contract_tokens.iter().any(|token| token == &param.name)
+            && mvp_type_support(&param.ty, model_types) == MvpTypeSupport::Opaque
+        {
+            Some(param.ty.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MvpTypeSupport {
+    Supported,
+    Opaque,
+    Unsupported(String),
+}
+
+fn mvp_type_support(ty: &str, model_types: &[String]) -> MvpTypeSupport {
     let ty = ty.trim();
     if ty.is_empty()
         || ty == "()"
@@ -949,7 +1001,7 @@ fn unsupported_mvp_type(ty: &str, model_types: &[String]) -> Option<String> {
             .iter()
             .any(|model_type| model_type == &type_name_tail(ty))
     {
-        return None;
+        return MvpTypeSupport::Supported;
     }
     if matches!(ty, "f32" | "f64")
         || ty.starts_with("*const ")
@@ -958,21 +1010,39 @@ fn unsupported_mvp_type(ty: &str, model_types: &[String]) -> Option<String> {
         || ty.starts_with("dyn ")
         || ty.contains(" dyn ")
     {
-        return Some(ty.to_string());
+        return MvpTypeSupport::Unsupported(ty.to_string());
     }
     if let Some(element) = slice_element_type(ty) {
-        return unsupported_mvp_type(element, model_types);
+        return mvp_type_support(element, model_types);
     }
     if let Some(inner) = single_type_arg(ty, "Option").or_else(|| single_type_arg(ty, "Some")) {
-        return unsupported_mvp_type(inner, model_types);
+        return mvp_type_support(inner, model_types);
     }
     if let Some(args) = type_args(ty, "Result") {
-        return split_type_args(args)
-            .into_iter()
-            .find_map(|arg| unsupported_mvp_type(arg, model_types));
+        return combine_type_support(
+            split_type_args(args)
+                .into_iter()
+                .map(|arg| mvp_type_support(arg, model_types)),
+        );
     }
 
-    None
+    MvpTypeSupport::Opaque
+}
+
+fn combine_type_support(supports: impl IntoIterator<Item = MvpTypeSupport>) -> MvpTypeSupport {
+    let mut saw_opaque = false;
+    for support in supports {
+        match support {
+            MvpTypeSupport::Unsupported(ty) => return MvpTypeSupport::Unsupported(ty),
+            MvpTypeSupport::Opaque => saw_opaque = true,
+            MvpTypeSupport::Supported => {}
+        }
+    }
+    if saw_opaque {
+        MvpTypeSupport::Opaque
+    } else {
+        MvpTypeSupport::Supported
+    }
 }
 
 fn single_type_arg<'a>(ty: &'a str, name: &str) -> Option<&'a str> {
@@ -4920,6 +4990,35 @@ mod tests {
             Err(VerificationError::UnsupportedType {
                 function: "keep".to_string(),
                 ty: "f32".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn allows_opaque_type_pass_through_without_contract_reasoning() {
+        let metadata = metadata_named(
+            "id_string",
+            "pub fn id_string(x: String) -> String { x }",
+            &[],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_opaque_type_contract_reasoning() {
+        let metadata = metadata_named_with_classes(
+            "id_string",
+            "pub fn id_string(x: String) -> String { x }",
+            &["out == x"],
+            &["gives ghost"],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedType {
+                function: "id_string".to_string(),
+                ty: "String".to_string(),
             })
         );
     }
