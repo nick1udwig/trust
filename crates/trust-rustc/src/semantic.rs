@@ -1109,10 +1109,12 @@ impl MirFunctionSummary {
     }
 
     fn assignment_for_place(&self, place: &str) -> Option<&MirAssignment> {
-        self.assignments
+        let mut matches = self
+            .assignments
             .iter()
-            .rev()
-            .find(|assignment| assignment.place == place)
+            .filter(|assignment| assignment.place == place);
+        let assignment = matches.next()?;
+        matches.next().is_none().then_some(assignment)
     }
 
     #[cfg(test)]
@@ -3227,6 +3229,44 @@ fn add_one(_1: i32) -> i32 {
                 guards: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn does_not_inline_reassigned_local_return_value() {
+        let mir = r#"
+fn choose(_1: i32) -> i32 {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: i32;
+    let mut _2: i32;
+    let mut _3: bool;
+
+    bb0: {
+        _2 = const 0_i32;
+        _3 = Gt(copy _1, const 0_i32);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _2 = const 1_i32;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _2 = const 2_i32;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "choose").expect("MIR summary");
+
+        assert_eq!(summary.normalized_return_expression(), Some("y".to_string()));
     }
 
     #[test]

@@ -48,10 +48,10 @@ Still intentionally limited:
   resolution, resolved primitive integer `checked_add` calls, call arguments with
   simple branch guards and attached Trust callee preconditions, `if` branch
   return facts, Option/Result match arms, and TrustModel field projections,
-  including through simple local aliases, field types, missing-TrustModel field
-  checks, unsupported shift/bitwise/cast-operation and signature/source-local
-  type checks, path guards, and struct returns into verification, but it is not
-  the primary VC generator yet
+  including through unambiguous local aliases, field types, missing-TrustModel
+  field checks, unsupported shift/bitwise/cast-operation and
+  signature/source-local type checks, path guards, and struct returns into
+  verification, but it is not the primary VC generator yet
 
 ## Toolchain
 
@@ -144,8 +144,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   base alias resolution, resolved primitive integer `checked_add` calls, guarded
   call arguments with attached Trust callee preconditions, `if` branch return
   facts, Option/Result match arms, and TrustModel field projections in
-  returns, local aliases, and path guards plus field types for arithmetic
-  obligations, missing-TrustModel checks, and unsupported
+  returns, unambiguous local aliases, and path guards plus field types for
+  arithmetic obligations, missing-TrustModel checks, and unsupported
   shift/bitwise/cast-operation and signature/source-local type checks, into
   verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
