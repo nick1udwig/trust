@@ -31,8 +31,8 @@ Implemented:
   extraction is available, with fail-closed diagnostics for token-only gaps
 - MIR-backed unsupported-call rejection when semantic extraction is available,
   with fail-closed diagnostics for token-only gaps
-- HIR/MIR-backed parameter mapping when semantic extraction is available, with
-  fail-closed diagnostics for token-only gaps
+- HIR/MIR-backed parameter and return-type mapping when semantic extraction is
+  available, with fail-closed diagnostics for token-only gaps
 - runtime public precondition assertions
 - MVP checks for `i32`, `i64`, `u32`, `u64`, and `usize` integer overflow,
   signed division/remainder overflow, division and remainder by zero, slice bounds,
@@ -67,7 +67,7 @@ Still intentionally limited:
   field checks, unsupported shift/bitwise/cast-operation and
   signature/source-local type checks, opaque contract-reasoning checks, path
   guards, and struct returns into verification; cfg-disabled source is pruned
-  from token fallback for supported predicates, and parameter mapping,
+  from token fallback for supported predicates, and parameter/return-type mapping,
   arithmetic, slice-index, Trust-call, field-access, loop-invariant,
   loop-decreases, loop-exit, and return-postcondition VCs and unsupported-call
   rejection are generated from MIR facts when available, but HIR/MIR is not the
@@ -175,11 +175,11 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   shift/bitwise/cast-operation, signature/source-local type checks, and opaque
   contract-reasoning checks, into verification. Source-token fallback prunes
   cfg-disabled body fragments for supported `#[cfg]` predicates. Arithmetic,
-  parameter mapping, slice-index, Trust-call, field-access, loop-invariant,
-  loop-decreases, loop-exit, return-postcondition, and unsupported-call checks
-  come from MIR facts when semantic extraction is available; token-only
-  obligations, proofs, or checks in those categories fail closed as incomplete
-  semantic extraction.
+  parameter/return-type mapping, slice-index, Trust-call, field-access,
+  loop-invariant, loop-decreases, loop-exit, return-postcondition, and
+  unsupported-call checks come from MIR facts when semantic extraction is
+  available; token-only obligations, proofs, or checks in those categories fail
+  closed as incomplete semantic extraction.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 
