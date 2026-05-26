@@ -46,9 +46,10 @@ Still intentionally limited:
   operations with concrete Rust integer types, slice index facts with element and
   index types, supported slice `len` receiver and slice-index base alias
   resolution, resolved primitive integer `checked_add` calls, call arguments with
-  simple branch guards and attached Trust callee preconditions, `if` branch
-  return facts, nested path assumptions, branch-assignment and carried-local
-  return facts at simple MIR joins including same-block copy chains,
+  simple branch guards and attached Trust callee preconditions, resolved
+  unsupported calls including trait-dispatch and closure calls for rejection,
+  `if` branch return facts, nested path assumptions, branch-assignment and
+  carried-local return facts at simple MIR joins including same-block copy chains,
   Option/Result match arms including simple local aliases, loop decreases
   targets and loop exit facts from compiler branch guards, source-local type
   bindings for local loop measures, and TrustModel field projections,
@@ -147,8 +148,9 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   concrete Rust integer types for arithmetic obligations, guarded slice indexes
   with element and index types, supported slice `len` receiver and slice-index
   base alias resolution, resolved primitive integer `checked_add` calls, guarded
-  call arguments with attached Trust callee preconditions, `if` branch return
-  facts, nested path assumptions, branch-assignment and carried-local return
+  call arguments with attached Trust callee preconditions, resolved unsupported
+  calls including trait-dispatch and closure calls for rejection, `if` branch
+  return facts, nested path assumptions, branch-assignment and carried-local return
   facts at simple MIR joins including same-block copy chains, Option/Result
   match arms including simple local aliases, loop decreases targets,
   loop exit facts, and source-local type bindings for local loop measures, and

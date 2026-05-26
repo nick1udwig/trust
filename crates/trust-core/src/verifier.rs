@@ -500,7 +500,7 @@ fn verify_total_with_env(
             function: metadata.rust_function_path.clone(),
         });
     }
-    if contains_closure(raw_body) {
+    if contains_closure(raw_body) || contains_semantic_closure(semantics) {
         return Err(VerificationError::UnsupportedClosure {
             function: metadata.rust_function_path.clone(),
         });
@@ -3461,6 +3461,22 @@ fn contains_closure(body: &str) -> bool {
     })
 }
 
+fn contains_semantic_closure(semantics: Option<&TrustFunctionSemantics>) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics
+            .calls
+            .iter()
+            .any(|call| semantic_call_is_closure(&call.callee))
+    })
+}
+
+fn semantic_call_is_closure(callee: &str) -> bool {
+    callee.contains("{closure@")
+        || callee.contains(" as Fn")
+        || callee.contains(" as FnMut")
+        || callee.contains(" as FnOnce")
+}
+
 fn unsupported_call(
     body: &str,
     params: &[Param],
@@ -3555,6 +3571,9 @@ fn unsupported_semantic_call(
             if semantic_checked_add_call_supported(call) {
                 return None;
             }
+            if semantic_index_call(&call.callee) {
+                return None;
+            }
             if unique_semantic_function_for_call(env, &call.callee).is_some() {
                 return None;
             }
@@ -3565,6 +3584,10 @@ fn unsupported_semantic_call(
             Some(call.callee.clone())
         })
     })
+}
+
+fn semantic_index_call(callee: &str) -> bool {
+    callee.contains(" as Index<") && callee.ends_with(">::index")
 }
 
 fn supported_checked_add_method(
@@ -6576,6 +6599,40 @@ mod tests {
     }
 
     #[test]
+    fn semantic_call_rejects_closure_body() {
+        let metadata = metadata_named("apply", "pub fn apply(x: i32) -> i32 { x }", &[]);
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "apply".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "<{closure@src/lib.rs:1:1: 1:17} as Fn<(i32,)>>::call".to_string(),
+                args: vec!["_2".to_string(), "(x,)".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::UnsupportedClosure {
+                function: "apply".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_recursive_total_call() {
         let recurse = metadata_named(
             "recurse",
@@ -8380,6 +8437,51 @@ mod tests {
             Err(VerificationError::UnsupportedCall {
                 function: "abs_value".to_string(),
                 callee: "core::num::<impl i32>::abs".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_index_diagnostic_precedes_semantic_index_call() {
+        let metadata = metadata_named(
+            "get_vec",
+            "pub fn get_vec(xs: Vec<i32>, i: usize) -> i32 { xs[i] }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get_vec".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "Vec<i32>".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "<Vec<i32> as Index<usize>>::index".to_string(),
+                args: vec!["xs".to_string(), "i".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::UnsupportedIndex {
+                function: "get_vec".to_string(),
+                expression: "xs[i]".to_string(),
             })
         );
     }

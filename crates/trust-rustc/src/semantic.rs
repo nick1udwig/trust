@@ -894,6 +894,9 @@ impl MirFunctionSummary {
             return None;
         }
         let expr = strip_mir_move_or_copy(expr.trim());
+        if let Some(referent) = mir_borrow(expr) {
+            return self.normalized_mir_expression_with_depth(referent, depth + 1, model_fields);
+        }
         if self.is_arg_place(expr) {
             if let Some(source_name) = self.local_name_for_place(expr) {
                 return Some(source_name.to_string());
@@ -926,6 +929,18 @@ impl MirFunctionSummary {
                 })
                 .collect::<Option<Vec<_>>>()?;
             return Some(format!("{ty} {{ {} }}", fields.join(", ")));
+        }
+        if let Some(elements) = mir_tuple_elements(expr) {
+            let elements = elements
+                .iter()
+                .map(|element| {
+                    self.normalized_mir_expression_with_depth(element, depth + 1, model_fields)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if elements.len() == 1 {
+                return Some(format!("({},)", elements[0]));
+            }
+            return Some(format!("({})", elements.join(", ")));
         }
         if let Some(operation) = self.normalized_mir_operation(expr, depth + 1, model_fields) {
             return Some(operation);
@@ -1494,18 +1509,36 @@ impl MirFunctionSummary {
         model_fields: &[ModelFieldMap],
         trust_callees: &[SemanticTrustCallee],
     ) -> Vec<SemanticCall> {
+        let runtime_assertion_input_places = self.runtime_assertion_input_places();
         let mut calls = self
             .assignments
             .iter()
             .filter_map(|assignment| {
                 let (callee, args) = mir_call(&assignment.expression)?;
+                if mir_runtime_assertion_callee(callee)
+                    || runtime_assertion_input_places.contains(&assignment.place)
+                {
+                    return None;
+                }
+                let trust_callee = trust_callee_for_call(callee, trust_callees);
+                let normalized_args = args
+                    .iter()
+                    .map(|arg| self.normalized_mir_expression_with_models(arg, model_fields))
+                    .collect::<Option<Vec<_>>>();
+                let args = match normalized_args {
+                    Some(args) => args,
+                    None if trust_callee.is_none() && mir_checked_add_type(callee).is_none() => {
+                        args.iter()
+                            .map(|arg| self.lossy_mir_call_arg(arg, model_fields))
+                            .collect()
+                    }
+                    None => return None,
+                };
+
                 Some(SemanticCall {
                     callee: callee.to_string(),
-                    trust_callee: trust_callee_for_call(callee, trust_callees),
-                    args: args
-                        .iter()
-                        .map(|arg| self.normalized_mir_expression_with_models(arg, model_fields))
-                        .collect::<Option<Vec<_>>>()?,
+                    trust_callee,
+                    args,
                     guards: self.guards_for_assignment(assignment, model_fields),
                 })
             })
@@ -1513,6 +1546,68 @@ impl MirFunctionSummary {
         calls.extend(self.semantic_len_calls_with_models(model_fields));
         calls.extend(self.semantic_unsupported_operator_calls_with_models(model_fields));
         calls
+    }
+
+    fn runtime_assertion_input_places(&self) -> BTreeSet<String> {
+        let mut places = BTreeSet::new();
+        let mut stack = self
+            .assignments
+            .iter()
+            .filter_map(|assignment| {
+                let (callee, args) = mir_call(&assignment.expression)?;
+                mir_runtime_assertion_callee(callee).then_some(args)
+            })
+            .flatten()
+            .map(|arg| strip_mir_move_or_copy(arg.trim()).to_string())
+            .collect::<Vec<_>>();
+
+        while let Some(place) = stack.pop() {
+            if !places.insert(place.clone()) {
+                continue;
+            }
+            let Some(assignment) = self.assignment_for_place(&place) else {
+                continue;
+            };
+            stack.extend(mir_local_places(&assignment.expression));
+        }
+
+        places
+    }
+
+    fn lossy_mir_call_arg(&self, arg: &str, model_fields: &[ModelFieldMap]) -> String {
+        self.lossy_mir_expression(arg, model_fields, 0)
+    }
+
+    fn lossy_mir_expression(
+        &self,
+        expr: &str,
+        model_fields: &[ModelFieldMap],
+        depth: usize,
+    ) -> String {
+        let expr = strip_mir_move_or_copy(expr.trim());
+        if depth > 8 {
+            return expr.to_string();
+        }
+        if let Some(normalized) = self.normalized_mir_expression_with_models(expr, model_fields) {
+            return normalized;
+        }
+        if let Some(referent) = mir_borrow(expr) {
+            return self.lossy_mir_expression(referent, model_fields, depth + 1);
+        }
+        if let Some(assignment) = self.assignment_for_place(expr) {
+            return self.lossy_mir_expression(&assignment.expression, model_fields, depth + 1);
+        }
+        if let Some(elements) = mir_tuple_elements(expr) {
+            let elements = elements
+                .iter()
+                .map(|element| self.lossy_mir_expression(element, model_fields, depth + 1))
+                .collect::<Vec<_>>();
+            if elements.len() == 1 {
+                return format!("({},)", elements[0]);
+            }
+            return format!("({})", elements.join(", "));
+        }
+        self.local_name_for_place(expr).unwrap_or(expr).to_string()
     }
 
     fn semantic_unsupported_operator_calls_with_models(
@@ -2248,6 +2343,17 @@ fn strip_mir_move_or_copy(expr: &str) -> &str {
         .trim()
 }
 
+fn mir_borrow(expr: &str) -> Option<&str> {
+    let referent = expr.trim().strip_prefix('&')?.trim();
+    let referent = referent
+        .strip_prefix("mut ")
+        .or_else(|| referent.strip_prefix("raw const "))
+        .or_else(|| referent.strip_prefix("raw mut "))
+        .unwrap_or(referent)
+        .trim();
+    Some(strip_mir_move_or_copy(referent))
+}
+
 fn mir_const_value(expr: &str) -> Option<String> {
     let value = expr.strip_prefix("const ")?.trim();
     if let Some(bound) = mir_integer_bound(value) {
@@ -2344,6 +2450,14 @@ fn mir_aggregate_fields(expr: &str) -> Option<(&str, Vec<(String, String)>)> {
     Some((ty, fields))
 }
 
+fn mir_tuple_elements(expr: &str) -> Option<Vec<String>> {
+    let inner = expr.trim().strip_prefix('(')?.strip_suffix(')')?;
+    if !inner.trim_end().ends_with(',') {
+        return None;
+    }
+    Some(parse_comma_separated(inner))
+}
+
 fn mir_variant_projection(expr: &str) -> Option<MirVariantProjection> {
     let expr = expr.strip_prefix('(')?.strip_suffix(')')?;
     let (projection, ty) = expr.split_once(':')?;
@@ -2386,9 +2500,71 @@ fn slice_element_type(ty: &str) -> Option<&str> {
 
 fn mir_call(expr: &str) -> Option<(&str, Vec<String>)> {
     let (call, _target) = expr.split_once(" -> ")?;
-    let (callee, args) = call.split_once('(')?;
-    let args = args.strip_suffix(')')?;
+    let (callee, args) = split_mir_call_head(call.trim())?;
     Some((callee.trim(), parse_mir_call_args(args)))
+}
+
+fn mir_runtime_assertion_callee(callee: &str) -> bool {
+    matches!(
+        function_leaf_name(callee),
+        "assert_precondition" | "assert_postcondition"
+    )
+}
+
+fn mir_local_places(expr: &str) -> Vec<String> {
+    let mut places = Vec::new();
+    let chars = expr.char_indices().collect::<Vec<_>>();
+    let mut idx = 0usize;
+
+    while let Some((byte_idx, ch)) = chars.get(idx).copied() {
+        if ch != '_' {
+            idx += 1;
+            continue;
+        }
+
+        let mut end_idx = idx + 1;
+        while let Some((_byte_idx, ch)) = chars.get(end_idx).copied() {
+            if !ch.is_ascii_digit() {
+                break;
+            }
+            end_idx += 1;
+        }
+        if end_idx > idx + 1 {
+            let end_byte = chars
+                .get(end_idx)
+                .map(|(next_byte_idx, _)| *next_byte_idx)
+                .unwrap_or(expr.len());
+            let place = expr[byte_idx..end_byte].to_string();
+            if !places.contains(&place) {
+                places.push(place);
+            }
+        }
+        idx = end_idx;
+    }
+
+    places
+}
+
+fn split_mir_call_head(call: &str) -> Option<(&str, &str)> {
+    let call = call.trim();
+    if !call.ends_with(')') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (idx, ch) in call.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((call[..idx].trim(), call[idx + 1..call.len() - 1].trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn mir_checked_add_type(callee: &str) -> Option<&str> {
@@ -4372,6 +4548,80 @@ fn checked_sum(_1: i32, _2: i32) -> Option<i32> {
     }
 
     #[test]
+    fn extracts_resolved_trait_method_call_through_borrowed_receiver() {
+        let mir = r#"
+fn display(_1: i32) -> String {
+    debug x => _1;
+    let mut _0: std::string::String;
+    let mut _2: &i32;
+
+    bb0: {
+        _2 = &_1;
+        _0 = <i32 as ToString>::to_string(move _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "display").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("<i32 as ToString>::to_string(x)".to_string())
+        );
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "<i32 as ToString>::to_string".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_resolved_closure_call_as_unsupported_call() {
+        let mir = r#"
+fn apply(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let _2: {closure@src/lib.rs:1:1: 1:17};
+    let mut _3: &{closure@src/lib.rs:1:1: 1:17};
+    let mut _4: (i32,);
+    scope 1 {
+        debug inc => const ZeroSized: {closure@src/lib.rs:1:1: 1:17};
+    }
+
+    bb0: {
+        _3 = &_2;
+        _4 = (copy _1,);
+        _0 = <{closure@src/lib.rs:1:1: 1:17} as Fn<(i32,)>>::call(move _3, move _4) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "apply").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "<{closure@src/lib.rs:1:1: 1:17} as Fn<(i32,)>>::call".to_string(),
+                args: vec!["_2".to_string(), "(x,)".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
     fn extracts_arithmetic_type_from_mir_local_constant() {
         let mir = r#"
 fn overflow() -> i32 {
@@ -5333,6 +5583,47 @@ fn add_one(_1: i32) -> i32 {
             summary.normalized_return_expression(),
             Some("x + 1".to_string())
         );
+        assert_eq!(summary.semantic_calls(), Vec::new());
+    }
+
+    #[test]
+    fn ignores_runtime_precondition_condition_calls() {
+        let mir = r#"
+fn zero_for_alias_option(_1: Option<i32>) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let _2: ();
+    let mut _3: bool;
+    let mut _4: &std::option::Option<i32>;
+    let mut _5: &std::option::Option<i32>;
+    let mut _6: std::option::Option<i32>;
+    let mut _7: &str;
+    let mut _8: &str;
+
+    bb0: {
+        _4 = &_1;
+        _6 = Option::<i32>::None;
+        _5 = &_6;
+        _3 = <Option<i32> as PartialEq>::eq(move _4, move _5) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _7 = const "zero_for_alias_option";
+        _8 = const "x == None";
+        _2 = assert_precondition(move _3, move _7, move _8) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _0 = const 0_i32;
+        return;
+    }
+}
+"#;
+
+        let summary =
+            extract_mir_function_summary(mir, "zero_for_alias_option").expect("MIR summary");
+
+        assert_eq!(summary.semantic_calls(), Vec::new());
     }
 
     #[test]

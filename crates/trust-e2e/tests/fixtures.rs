@@ -1133,6 +1133,41 @@ fn fail_trait_dispatch_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_semantic_trait_dispatch_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_trait_dispatch_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "fail_trait_dispatch",
+        Expected::Fail,
+        &format!("fail_semantic_trait_dispatch_{suffix}"),
+        &format!("fail_semantic_trait_dispatch_{suffix}"),
+        &[
+            ("TRUST_SEMANTIC_VERIFY", "1"),
+            ("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str),
+        ],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains(
+        "error[trust]: unsupported function call in `verified::display`: `x.to_string`",
+    );
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("calls=<i32 as ToString>::to_string(x)"));
+}
+
+#[test]
 fn fail_ordinary_call_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_ordinary_call", Expected::Fail);
 
@@ -1146,6 +1181,41 @@ fn fail_closure_body_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_closure_body", Expected::Fail);
 
     output.assert_contains("error[trust]: closures are not supported in `verified::apply`");
+}
+
+#[test]
+fn fail_semantic_closure_body_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_closure_body_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "fail_closure_body",
+        Expected::Fail,
+        &format!("fail_semantic_closure_body_{suffix}"),
+        &format!("fail_semantic_closure_body_{suffix}"),
+        &[
+            ("TRUST_SEMANTIC_VERIFY", "1"),
+            ("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str),
+        ],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: closures are not supported in `verified::apply`");
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("calls=<{closure@"));
+    assert!(summary.contains(" as Fn"));
+    assert!(summary.contains(">>::call"));
 }
 
 #[test]
