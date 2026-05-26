@@ -528,20 +528,65 @@ fn verify_total_with_env(
         contracts_with_assumptions(&given_contracts, &loop_postcondition_facts);
     let call_env = verification_call_env(env, semantics);
 
-    if contains_unchecked_unwrap(raw_body) || contains_semantic_unchecked_unwrap(semantics) {
-        return Err(VerificationError::UncheckedUnwrap {
-            function: metadata.rust_function_path.clone(),
-        });
+    if let Some(proof) = semantic_rejection_proof(
+        contains_unchecked_unwrap(raw_body),
+        contains_semantic_unchecked_unwrap(semantics),
+        semantics,
+    ) {
+        match proof {
+            SemanticRejectionProof::Rejected => {
+                return Err(VerificationError::UncheckedUnwrap {
+                    function: metadata.rust_function_path.clone(),
+                });
+            }
+            SemanticRejectionProof::SemanticExtractionIncomplete => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: metadata.rust_function_path.clone(),
+                    category: "unchecked unwrap".to_string(),
+                    expression: "unwrap/expect".to_string(),
+                });
+            }
+        }
     }
-    if contains_explicit_panic(raw_body) || contains_semantic_explicit_panic(semantics) {
-        return Err(VerificationError::ExplicitPanic {
-            function: metadata.rust_function_path.clone(),
-        });
+    if let Some(proof) = semantic_rejection_proof(
+        contains_explicit_panic(raw_body),
+        contains_semantic_explicit_panic(semantics),
+        semantics,
+    ) {
+        match proof {
+            SemanticRejectionProof::Rejected => {
+                return Err(VerificationError::ExplicitPanic {
+                    function: metadata.rust_function_path.clone(),
+                });
+            }
+            SemanticRejectionProof::SemanticExtractionIncomplete => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: metadata.rust_function_path.clone(),
+                    category: "explicit panic".to_string(),
+                    expression: "panic/todo/unimplemented".to_string(),
+                });
+            }
+        }
     }
-    if contains_closure(raw_body) || contains_semantic_closure(semantics) {
-        return Err(VerificationError::UnsupportedClosure {
-            function: metadata.rust_function_path.clone(),
-        });
+    if let Some(proof) = semantic_rejection_proof(
+        contains_closure(raw_body),
+        contains_semantic_closure(semantics),
+        semantics,
+    ) {
+        match proof {
+            SemanticRejectionProof::Rejected => {
+                return Err(VerificationError::UnsupportedClosure {
+                    function: metadata.rust_function_path.clone(),
+                });
+            }
+            SemanticRejectionProof::SemanticExtractionIncomplete => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: metadata.rust_function_path.clone(),
+                    category: "closure".to_string(),
+                    expression: "closure".to_string(),
+                });
+            }
+        }
     }
     let token_unsupported_call = unsupported_call(
         raw_body,
@@ -925,6 +970,12 @@ enum LoopInvariantProof {
 enum UnsupportedIndexProof {
     Unsupported(String),
     SemanticExtractionIncomplete(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticRejectionProof {
+    Rejected,
+    SemanticExtractionIncomplete,
 }
 
 fn semantic_for<'a>(
@@ -4013,6 +4064,25 @@ fn loop_exit_proves_value(body: &str, return_expression: &str, expected: &str) -
             };
             keyword == "while" && variable == return_expression && op == ">" && value == "0"
         })
+}
+
+fn semantic_rejection_proof(
+    token_rejected: bool,
+    semantic_rejected: bool,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<SemanticRejectionProof> {
+    if semantic_rejected {
+        return Some(SemanticRejectionProof::Rejected);
+    }
+    if token_rejected {
+        return Some(if semantics.is_some() {
+            SemanticRejectionProof::SemanticExtractionIncomplete
+        } else {
+            SemanticRejectionProof::Rejected
+        });
+    }
+
+    None
 }
 
 fn contains_unchecked_unwrap(body: &str) -> bool {
@@ -7601,6 +7671,47 @@ mod tests {
     }
 
     #[test]
+    fn partial_semantic_unchecked_unwrap_fails_closed() {
+        let metadata = metadata_named(
+            "bad_unwrap",
+            "pub fn bad_unwrap(x: Option<i32>) -> i32 { x.unwrap() }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "bad_unwrap".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Option<i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UncheckedUnwrap {
+                function: "bad_unwrap".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "bad_unwrap".to_string(),
+                category: "unchecked unwrap".to_string(),
+                expression: "unwrap/expect".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_unchecked_result_expect() {
         let metadata = metadata_named(
             "bad_expect",
@@ -7849,6 +7960,47 @@ mod tests {
     }
 
     #[test]
+    fn partial_semantic_closure_fails_closed() {
+        let metadata = metadata_named(
+            "apply",
+            "pub fn apply(x: i32) -> i32 { let inc = |n: i32| n + 1; inc(x) }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "apply".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "i32".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedClosure {
+                function: "apply".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "apply".to_string(),
+                category: "closure".to_string(),
+                expression: "closure".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_recursive_total_call() {
         let recurse = metadata_named(
             "recurse",
@@ -7904,6 +8056,40 @@ mod tests {
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Err(VerificationError::ExplicitPanic {
                 function: "fail".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_semantic_explicit_panic_fails_closed() {
+        let metadata = metadata_named("fail", "pub fn fail() -> i32 { panic!(\"boom\") }", &[]);
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "fail".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::ExplicitPanic {
+                function: "fail".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "fail".to_string(),
+                category: "explicit panic".to_string(),
+                expression: "panic/todo/unimplemented".to_string(),
             })
         );
     }
