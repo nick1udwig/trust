@@ -2262,6 +2262,9 @@ fn unsupported_call(
         if method == "len" && supported_len_method(base, params, semantics) {
             continue;
         }
+        if method == "checked_add" && supported_checked_add_method(base, semantics) {
+            continue;
+        }
 
         return Some(format!("{base}.{method}"));
     }
@@ -2331,6 +2334,9 @@ fn unsupported_semantic_call(
             if call.callee == "<slice>.len" {
                 return None;
             }
+            if semantic_checked_add_call_supported(call) {
+                return None;
+            }
             if unique_semantic_function_for_call(env, &call.callee).is_some() {
                 return None;
             }
@@ -2341,6 +2347,29 @@ fn unsupported_semantic_call(
             Some(call.callee.clone())
         })
     })
+}
+
+fn supported_checked_add_method(
+    receiver: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics.calls.iter().any(|call| {
+            semantic_checked_add_call_supported(call)
+                && call.args.first().is_some_and(|arg| arg == receiver)
+        })
+    })
+}
+
+fn semantic_checked_add_call_supported(call: &SemanticCall) -> bool {
+    call.args.len() == 2 && semantic_checked_add_integer_type(&call.callee).is_some()
+}
+
+fn semantic_checked_add_integer_type(callee: &str) -> Option<&str> {
+    let ty = callee
+        .strip_prefix("core::num::<impl ")?
+        .strip_suffix(">::checked_add")?;
+    is_supported_integer(ty).then_some(ty)
 }
 
 fn allowed_builtin_call(name: &str) -> bool {
@@ -4422,6 +4451,55 @@ mod tests {
             Err(VerificationError::UnsupportedCall {
                 function: "get_or_zero".to_string(),
                 callee: "ys.len".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn semantic_checked_add_call_allows_supported_integer_method() {
+        let metadata = metadata_named_with_classes(
+            "checked_sum",
+            "pub fn checked_sum(x: i32, y: i32) -> Option<i32> { x.checked_add(y) }",
+            &["out == x.checked_add(y)"],
+            &["gives ghost"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "checked_sum".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                },
+                SemanticParam {
+                    name: "y".to_string(),
+                    ty: "i32".to_string(),
+                },
+            ],
+            return_type: "Option<i32>".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("x.checked_add(y)".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "core::num::<impl i32>::checked_add".to_string(),
+                args: vec!["x".to_string(), "y".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedCall {
+                function: "checked_sum".to_string(),
+                callee: "x.checked_add".to_string(),
             })
         );
         assert_eq!(

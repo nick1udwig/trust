@@ -833,6 +833,13 @@ impl MirFunctionSummary {
             return Some(operation);
         }
         if let Some((callee, args)) = mir_call(expr) {
+            if mir_checked_add_type(callee).is_some() && args.len() == 2 {
+                let receiver =
+                    self.normalized_mir_expression_with_depth(&args[0], depth + 1, model_fields)?;
+                let rhs =
+                    self.normalized_mir_expression_with_depth(&args[1], depth + 1, model_fields)?;
+                return Some(format!("{receiver}.checked_add({rhs})"));
+            }
             let args = args
                 .iter()
                 .map(|arg| self.normalized_mir_expression_with_depth(arg, depth + 1, model_fields))
@@ -1781,6 +1788,13 @@ fn mir_call(expr: &str) -> Option<(&str, Vec<String>)> {
     let (callee, args) = call.split_once('(')?;
     let args = args.strip_suffix(')')?;
     Some((callee.trim(), parse_mir_call_args(args)))
+}
+
+fn mir_checked_add_type(callee: &str) -> Option<&str> {
+    let ty = callee
+        .strip_prefix("core::num::<impl ")?
+        .strip_suffix(">::checked_add")?;
+    supported_mir_integer_type(ty).then_some(ty)
 }
 
 fn mir_ptr_metadata(expr: &str) -> Option<&str> {
@@ -2821,6 +2835,41 @@ fn has_items(_1: &[i32]) -> bool {
         assert_eq!(
             summary.normalized_return_expression(),
             Some("verified::nonempty(xs)".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_resolved_checked_add_call() {
+        let mir = r#"
+fn checked_sum(_1: i32, _2: i32) -> Option<i32> {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: std::option::Option<i32>;
+
+    bb0: {
+        _0 = core::num::<impl i32>::checked_add(copy _1, copy _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "checked_sum").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x.checked_add(y)".to_string())
+        );
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "core::num::<impl i32>::checked_add".to_string(),
+                args: vec!["x".to_string(), "y".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
         );
     }
 

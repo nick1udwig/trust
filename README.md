@@ -43,9 +43,9 @@ Still intentionally limited:
   HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic
   operations with concrete Rust integer types, slice index facts with element and
   index types, supported slice `len` receiver and slice-index base alias
-  resolution, call arguments with simple branch guards and attached Trust callee
-  preconditions, `if` branch return facts, Option/Result match arms, and
-  TrustModel field projections,
+  resolution, resolved primitive integer `checked_add` calls, call arguments with
+  simple branch guards and attached Trust callee preconditions, `if` branch
+  return facts, Option/Result match arms, and TrustModel field projections,
   field types, path guards, and struct returns into verification, but it is not
   the primary VC generator yet
 
@@ -137,9 +137,9 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   supported facts, including return expressions, guarded arithmetic operations,
   concrete Rust integer types for arithmetic obligations, guarded slice indexes
   with element and index types, supported slice `len` receiver and slice-index
-  base alias resolution, guarded call arguments with attached Trust callee
-  preconditions, `if` branch return facts, Option/Result match arms, and
-  TrustModel field projections in
+  base alias resolution, resolved primitive integer `checked_add` calls, guarded
+  call arguments with attached Trust callee preconditions, `if` branch return
+  facts, Option/Result match arms, and TrustModel field projections in
   returns and path guards plus field types for arithmetic obligations, into
   verification.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
