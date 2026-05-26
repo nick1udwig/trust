@@ -33,6 +33,8 @@ Implemented:
   with fail-closed diagnostics when only source-token initialization proves it
 - MIR-backed unsupported-call rejection when semantic extraction is available,
   with fail-closed diagnostics for token-only gaps
+- MIR-backed unsupported-index rejection when semantic extraction is available,
+  with fail-closed diagnostics for token-only gaps
 - HIR/MIR-backed parameter and return-type mapping when semantic extraction is
   available, with fail-closed diagnostics for token-only gaps
 - runtime public precondition assertions
@@ -73,8 +75,8 @@ Still intentionally limited:
   from token fallback for supported predicates, and parameter/return-type mapping,
   arithmetic, slice-index, Trust-call, field-access, loop-invariant,
   loop-decreases, loop-exit, and return-postcondition VCs and unsupported-call
-  rejection are generated from MIR facts when available, but HIR/MIR is not the
-  primary VC generator yet
+  and unsupported-index rejection are generated from MIR facts when available,
+  but HIR/MIR is not the primary VC generator yet
 
 ## Toolchain
 
@@ -179,10 +181,10 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   contract-reasoning checks, into verification. Source-token fallback prunes
   cfg-disabled body fragments for supported `#[cfg]` predicates. Arithmetic,
   parameter/return-type mapping, slice-index, Trust-call, field-access,
-  loop-invariant, loop-decreases, loop-exit, return-postcondition, and
-  unsupported-call checks come from MIR facts when semantic extraction is
-  available; token-only obligations, proofs, or checks in those categories fail
-  closed as incomplete semantic extraction.
+  loop-invariant, loop-decreases, loop-exit, return-postcondition,
+  unsupported-call, and unsupported-index checks come from MIR facts when
+  semantic extraction is available; token-only obligations, proofs, or checks in
+  those categories fail closed as incomplete semantic extraction.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 

@@ -707,11 +707,22 @@ fn verify_total_with_env(
         }
     }
 
-    if let Some(expression) = unsupported_index_expression(raw_body, &params, semantics) {
-        return Err(VerificationError::UnsupportedIndex {
-            function: metadata.rust_function_path.clone(),
-            expression,
-        });
+    if let Some(proof) = unsupported_index_expression(raw_body, &params, semantics) {
+        match proof {
+            UnsupportedIndexProof::Unsupported(expression) => {
+                return Err(VerificationError::UnsupportedIndex {
+                    function: metadata.rust_function_path.clone(),
+                    expression,
+                });
+            }
+            UnsupportedIndexProof::SemanticExtractionIncomplete(expression) => {
+                return Err(VerificationError::SemanticExtractionIncomplete {
+                    function: metadata.rust_function_path.clone(),
+                    category: "unsupported index".to_string(),
+                    expression,
+                });
+            }
+        }
     }
 
     for obligation in verification_slice_index_obligations(raw_body, &params, semantics) {
@@ -908,6 +919,12 @@ enum LoopInvariantProof {
     Proved,
     Unproved,
     SemanticExtractionIncomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnsupportedIndexProof {
+    Unsupported(String),
+    SemanticExtractionIncomplete(String),
 }
 
 fn semantic_for<'a>(
@@ -3065,7 +3082,26 @@ fn unsupported_index_expression(
     body: &str,
     params: &[Param],
     semantics: Option<&TrustFunctionSemantics>,
-) -> Option<String> {
+) -> Option<UnsupportedIndexProof> {
+    if let Some(semantics) = semantics {
+        if let Some(expression) = semantic_unsupported_index_expression(semantics) {
+            return Some(UnsupportedIndexProof::Unsupported(expression));
+        }
+        if let Some(expression) = token_unsupported_index_expression(body, params) {
+            if supported_semantic_index_expression(&expression, semantics) {
+                return None;
+            }
+            return Some(UnsupportedIndexProof::SemanticExtractionIncomplete(
+                expression,
+            ));
+        }
+        return None;
+    }
+
+    token_unsupported_index_expression(body, params).map(UnsupportedIndexProof::Unsupported)
+}
+
+fn token_unsupported_index_expression(body: &str, params: &[Param]) -> Option<String> {
     let tokens = executable_tokens(body);
     let mut idx = 0;
 
@@ -3081,9 +3117,7 @@ fn unsupported_index_expression(
         };
         let index = simple_grouped_value_expression(&tokens[idx + 2..end]);
         let expression = format!("{base}[{index}]");
-        if !is_read_only_slice_param(base, params)
-            && !supported_semantic_index_expression(&expression, semantics)
-        {
+        if !is_read_only_slice_param(base, params) {
             return Some(expression);
         }
         idx = end + 1;
@@ -3092,16 +3126,35 @@ fn unsupported_index_expression(
     None
 }
 
-fn supported_semantic_index_expression(
-    expression: &str,
-    semantics: Option<&TrustFunctionSemantics>,
-) -> bool {
-    semantics.into_iter().any(|semantics| {
-        semantics
+fn semantic_unsupported_index_expression(semantics: &TrustFunctionSemantics) -> Option<String> {
+    semantics.calls.iter().find_map(|call| {
+        if !semantic_call_is_index(&call.callee) || call.args.len() < 2 {
+            return None;
+        }
+        let expression = format!("{}[{}]", call.args[0], call.args[1]);
+        if semantics
             .slice_indexes
             .iter()
             .any(|index| semantic_slice_index_supported(index) && index.expression == expression)
+        {
+            return None;
+        }
+        Some(expression)
     })
+}
+
+fn supported_semantic_index_expression(
+    expression: &str,
+    semantics: &TrustFunctionSemantics,
+) -> bool {
+    semantics
+        .slice_indexes
+        .iter()
+        .any(|index| semantic_slice_index_supported(index) && index.expression == expression)
+}
+
+fn semantic_call_is_index(callee: &str) -> bool {
+    callee.contains(" as Index<") || callee.contains("::ops::index::Index")
 }
 
 fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObligation> {
@@ -9757,6 +9810,54 @@ mod tests {
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Err(VerificationError::UnsupportedIndex {
                 function: "get_vec".to_string(),
+                expression: "xs[i]".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_semantic_unsupported_index_fails_closed() {
+        let metadata = metadata_named(
+            "get_vec",
+            "pub fn get_vec(xs: Vec<i32>, i: usize) -> i32 { xs[i] }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "get_vec".to_string(),
+            params: vec![
+                SemanticParam {
+                    name: "xs".to_string(),
+                    ty: "Vec<i32>".to_string(),
+                },
+                SemanticParam {
+                    name: "i".to_string(),
+                    ty: "usize".to_string(),
+                },
+            ],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::UnsupportedIndex {
+                function: "get_vec".to_string(),
+                expression: "xs[i]".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "get_vec".to_string(),
+                category: "unsupported index".to_string(),
                 expression: "xs[i]".to_string(),
             })
         );
