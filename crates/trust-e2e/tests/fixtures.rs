@@ -1139,6 +1139,22 @@ fn fail_semantic_local_const_add_unproved_uses_mir_integer_type() {
 }
 
 #[test]
+fn fail_semantic_unbound_contract_identifier_is_rejected_by_z3_verifier() {
+    let suffix = std::process::id();
+    let output = run_fixture_with_cache_and_env(
+        "fail_semantic_unbound_contract_identifier",
+        Expected::Fail,
+        &format!("fail_semantic_unbound_contract_identifier_{suffix}"),
+        &format!("fail_semantic_unbound_contract_identifier_{suffix}"),
+        &[],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: could not prove postcondition");
+    output.assert_contains("out == y");
+}
+
+#[test]
 fn fail_semantic_block_div_unproved_is_rejected_by_mir_verifier() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(

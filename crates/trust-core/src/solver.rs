@@ -95,6 +95,18 @@ fn prove_integer_implication(
     params: &[(String, String)],
     timeout_ms: u64,
 ) -> ProofResult {
+    let parsed_assumptions = assumptions
+        .iter()
+        .filter_map(|assumption| parse_predicate(assumption))
+        .collect::<Vec<_>>();
+    if predicate_uses_unknown_variable(conclusion, params)
+        || parsed_assumptions
+            .iter()
+            .any(|assumption| predicate_uses_unknown_variable(assumption, params))
+    {
+        return ProofResult::Unsupported;
+    }
+
     let mut cfg = Config::new();
     cfg.set_bool_param_value("trace", false);
     cfg.set_timeout_msec(timeout_ms);
@@ -105,9 +117,8 @@ fn prove_integer_implication(
         for assertion in env.domain_assertions() {
             solver.assert(&assertion);
         }
-        for assumption in assumptions
+        for assumption in parsed_assumptions
             .iter()
-            .filter_map(|assumption| parse_predicate(assumption))
             .filter_map(|predicate| predicate.to_z3(&mut env))
         {
             solver.assert(&assumption);
@@ -123,6 +134,12 @@ fn prove_integer_implication(
             SatResult::Sat | SatResult::Unknown => ProofResult::Unproved,
         }
     })
+}
+
+fn predicate_uses_unknown_variable(predicate: &Predicate, params: &[(String, String)]) -> bool {
+    referenced_variables(predicate)
+        .into_iter()
+        .any(|variable| !params.iter().any(|(name, _ty)| name == &variable))
 }
 
 fn dump_smt_if_requested(
@@ -369,7 +386,6 @@ fn rust_integer_bound(input: &str) -> Option<i128> {
     }
 }
 
-#[cfg(test)]
 fn referenced_variables(predicate: &Predicate) -> std::collections::BTreeSet<String> {
     let mut variables = std::collections::BTreeSet::new();
     for expression in [&predicate.left, &predicate.right] {
@@ -420,6 +436,24 @@ mod tests {
         assert_eq!(
             prove_addition_overflow_safety("x", "i32", 1, &[], &i32_param("x"), 5000),
             ProofResult::Unproved
+        );
+    }
+
+    #[test]
+    fn z3_rejects_unknown_variables_in_conclusion() {
+        assert_eq!(
+            prove_integer_predicate(&[], "y>0", &i32_param("x"), 5000),
+            ProofResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn z3_rejects_unknown_variables_in_assumptions() {
+        let contracts = vec!["y==x".to_string()];
+
+        assert_eq!(
+            prove_integer_predicate(&contracts, "x==x", &i32_param("x"), 5000),
+            ProofResult::Unsupported
         );
     }
 

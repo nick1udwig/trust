@@ -3376,6 +3376,25 @@ mod tests {
     }
 
     #[test]
+    fn z3_does_not_prove_postcondition_from_unbound_contract_identifier() {
+        let mut metadata = metadata_named_with_classes(
+            "id",
+            "fn id(x: i32) -> i32 { x }",
+            &["y == x", "out == y"],
+            &["given ghost", "gives ghost"],
+        );
+        metadata.visibility = "private".to_string();
+
+        assert_eq!(
+            verify_totals_with_options(&[metadata], VerificationOptions::z3(5000)),
+            Err(VerificationError::PostconditionUnproved {
+                function: "id".to_string(),
+                condition: "out == y".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn proves_proof_obligation_from_assert_step() {
         let proof = proof_metadata(
             "le_refl",
