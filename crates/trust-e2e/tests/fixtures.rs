@@ -367,6 +367,15 @@ fn fail_loop_break_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_loop_exit_division_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_loop_exit_division", Expected::Fail);
+
+    output.assert_contains(
+        "error[trust]: could not prove integer division denominator is nonzero in `verified::divide_after_countdown`: `1 / n`",
+    );
+}
+
+#[test]
 fn pass_executable_spec_builds_as_runtime_rust() {
     run_fixture("pass_spec_executable", Expected::Pass);
 }

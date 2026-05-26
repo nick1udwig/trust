@@ -442,7 +442,7 @@ fn verify_total_with_env(
     }
 
     let source = normalize(&metadata.function_source);
-    let mut contracts = executable_preconditions(metadata);
+    let contracts = executable_preconditions(metadata);
     let given_contracts = given_preconditions(metadata);
     let params = verification_params(&source, semantics);
     let return_type = verification_return_type(&source, semantics);
@@ -465,32 +465,32 @@ fn verify_total_with_env(
     let semantic_return_expression = semantics
         .and_then(|semantics| semantics.return_expression.as_deref())
         .map(normalize);
-    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?
-        .into_iter()
-        .map(|fact| fact.condition)
+    let loop_facts = verify_loops(raw_body, &metadata.rust_function_path)?;
+    let loop_exit_facts = loop_facts
+        .iter()
+        .filter_map(|fact| loop_exit_fact(&fact.condition))
         .collect::<Vec<_>>();
-    contracts.extend(loop_facts.iter().cloned());
-    let postcondition_assumptions = contracts_with_assumptions(&given_contracts, &loop_facts);
+    let postcondition_assumptions = contracts_with_assumptions(&given_contracts, &loop_exit_facts);
     let call_env = verification_call_env(env, semantics);
 
-    if contains_unchecked_unwrap(body) {
+    if contains_unchecked_unwrap(raw_body) {
         return Err(VerificationError::UncheckedUnwrap {
             function: metadata.rust_function_path.clone(),
         });
     }
-    if contains_explicit_panic(body) {
+    if contains_explicit_panic(raw_body) {
         return Err(VerificationError::ExplicitPanic {
             function: metadata.rust_function_path.clone(),
         });
     }
-    if contains_closure(body) {
+    if contains_closure(raw_body) {
         return Err(VerificationError::UnsupportedClosure {
             function: metadata.rust_function_path.clone(),
         });
     }
     if let Some(callee) = unsupported_semantic_call(semantics, env, &metadata.rust_function_path) {
         let callee = unsupported_call(
-            body,
+            raw_body,
             &params,
             &call_env,
             &metadata.rust_function_path,
@@ -503,7 +503,7 @@ fn verify_total_with_env(
         });
     }
     if let Some(callee) = unsupported_call(
-        body,
+        raw_body,
         &params,
         &call_env,
         &metadata.rust_function_path,
@@ -515,7 +515,7 @@ fn verify_total_with_env(
         });
     }
 
-    for obligation in verification_field_access_obligations(body, &params, semantics) {
+    for obligation in verification_field_access_obligations(raw_body, &params, semantics) {
         if !model_types
             .iter()
             .any(|model_type| model_type == &type_name_tail(&obligation.ty))
@@ -527,7 +527,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_addition_obligations(body, &value_params, semantics, options) {
+    for obligation in verification_addition_obligations(raw_body, &value_params, semantics, options)
+    {
         if !addition_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerAdditionOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -536,7 +537,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_subtraction_obligations(body, &value_params, semantics, options)
+    for obligation in
+        verification_subtraction_obligations(raw_body, &value_params, semantics, options)
     {
         if !subtraction_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerSubtractionOverflow {
@@ -546,7 +548,8 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_negation_obligations(body, &value_params, semantics, options) {
+    for obligation in verification_negation_obligations(raw_body, &value_params, semantics, options)
+    {
         if !negation_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerNegationOverflow {
                 function: metadata.rust_function_path.clone(),
@@ -556,7 +559,7 @@ fn verify_total_with_env(
     }
 
     for obligation in
-        verification_multiplication_obligations(body, &value_params, semantics, options)
+        verification_multiplication_obligations(raw_body, &value_params, semantics, options)
     {
         if !multiplication_obligation_proved(&obligation, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerMultiplicationOverflow {
@@ -566,7 +569,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_division_obligations(body, &params, semantics) {
+    for obligation in verification_division_obligations(raw_body, &params, semantics) {
         let contracts = contracts_with_assumptions(&contracts, &obligation.assumptions);
         if !denominator_nonzero(&obligation.denominator, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerDivisionByZero {
@@ -576,7 +579,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_remainder_obligations(body, &params, semantics) {
+    for obligation in verification_remainder_obligations(raw_body, &params, semantics) {
         let contracts = contracts_with_assumptions(&contracts, &obligation.assumptions);
         if !denominator_nonzero(&obligation.denominator, &contracts, &value_params, options) {
             return Err(VerificationError::IntegerRemainderByZero {
@@ -587,7 +590,7 @@ fn verify_total_with_env(
     }
 
     for obligation in
-        verification_division_overflow_obligations(body, &value_params, semantics, options)
+        verification_division_overflow_obligations(raw_body, &value_params, semantics, options)
     {
         if !signed_division_overflow_obligation_proved(
             &obligation,
@@ -603,7 +606,7 @@ fn verify_total_with_env(
     }
 
     for obligation in
-        verification_remainder_overflow_obligations(body, &value_params, semantics, options)
+        verification_remainder_overflow_obligations(raw_body, &value_params, semantics, options)
     {
         if !signed_division_overflow_obligation_proved(
             &obligation,
@@ -618,14 +621,14 @@ fn verify_total_with_env(
         }
     }
 
-    if let Some(expression) = unsupported_index_expression(body, &params, semantics) {
+    if let Some(expression) = unsupported_index_expression(raw_body, &params, semantics) {
         return Err(VerificationError::UnsupportedIndex {
             function: metadata.rust_function_path.clone(),
             expression,
         });
     }
 
-    for obligation in verification_slice_index_obligations(body, &params, semantics) {
+    for obligation in verification_slice_index_obligations(raw_body, &params, semantics) {
         if !slice_index_obligation_proved(&obligation, &contracts) {
             return Err(VerificationError::SliceIndexOutOfBounds {
                 function: metadata.rust_function_path.clone(),
@@ -634,7 +637,7 @@ fn verify_total_with_env(
         }
     }
 
-    for obligation in verification_call_obligations(body, &call_env, semantics) {
+    for obligation in verification_call_obligations(raw_body, &call_env, semantics) {
         let contracts = contracts_with_assumptions(&given_contracts, &obligation.assumptions);
         if !callee_precondition_proved(&obligation.condition, &contracts, &value_params, options) {
             return Err(VerificationError::CalleePreconditionUnproved {
@@ -760,6 +763,12 @@ struct FieldAccessObligation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoopFact {
     condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenSegment {
+    tokens: Vec<String>,
+    assumptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1484,7 +1493,19 @@ fn return_field_expression(return_expression: &str, field: &str) -> Option<Strin
 }
 
 fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            addition_obligations_from_tokens(&segment.tokens, params, &segment.assumptions)
+        })
+        .collect()
+}
+
+fn addition_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    assumptions: &[String],
+) -> Vec<AddObligation> {
     let mut obligations = Vec::new();
 
     for idx in 0..tokens.len().saturating_sub(2) {
@@ -1502,7 +1523,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
             continue;
         }
@@ -1517,7 +1538,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                 ty: Some(ty.to_string()),
                 constant: Some(constant),
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
         } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
             obligations.push(AddObligation {
@@ -1525,7 +1546,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                 ty: Some(ty.to_string()),
                 constant: Some(constant),
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
         } else if expression_needs_integer_proof(left, right, params) {
             obligations.push(AddObligation {
@@ -1535,7 +1556,7 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
         }
     }
@@ -1544,7 +1565,19 @@ fn addition_obligations(body: &str, params: &[Param]) -> Vec<AddObligation> {
 }
 
 fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            subtraction_obligations_from_tokens(&segment.tokens, params, &segment.assumptions)
+        })
+        .collect()
+}
+
+fn subtraction_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    assumptions: &[String],
+) -> Vec<SubObligation> {
     let mut obligations = Vec::new();
 
     for idx in 0..tokens.len().saturating_sub(2) {
@@ -1561,7 +1594,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
                 constant: None,
                 rhs: Some(right.clone()),
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
             continue;
         }
@@ -1579,7 +1612,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
                     constant: Some(constant),
                     rhs: None,
                     expression,
-                    assumptions: Vec::new(),
+                    assumptions: assumptions.to_vec(),
                 });
             }
         } else if expression_needs_integer_proof(left, right, params)
@@ -1591,7 +1624,7 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
                 constant: None,
                 rhs: Some(right.clone()),
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
         }
     }
@@ -1600,7 +1633,19 @@ fn subtraction_obligations(body: &str, params: &[Param]) -> Vec<SubObligation> {
 }
 
 fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            negation_obligations_from_tokens(&segment.tokens, params, &segment.assumptions)
+        })
+        .collect()
+}
+
+fn negation_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    assumptions: &[String],
+) -> Vec<NegObligation> {
     let mut obligations = Vec::new();
 
     for (idx, token) in tokens.iter().enumerate() {
@@ -1620,7 +1665,7 @@ fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
             variable: variable.clone(),
             ty: param.ty.clone(),
             expression: format!("-{variable}"),
-            assumptions: Vec::new(),
+            assumptions: assumptions.to_vec(),
         });
     }
 
@@ -1628,7 +1673,19 @@ fn negation_obligations(body: &str, params: &[Param]) -> Vec<NegObligation> {
 }
 
 fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            multiplication_obligations_from_tokens(&segment.tokens, params, &segment.assumptions)
+        })
+        .collect()
+}
+
+fn multiplication_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    assumptions: &[String],
+) -> Vec<MulObligation> {
     let mut obligations = Vec::new();
 
     for idx in 0..tokens.len().saturating_sub(2) {
@@ -1646,7 +1703,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
             continue;
         }
@@ -1662,7 +1719,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     ty: Some(ty.to_string()),
                     constant: Some(constant),
                     expression,
-                    assumptions: Vec::new(),
+                    assumptions: assumptions.to_vec(),
                 });
             }
         } else if let (Ok(constant), Some(ty)) = (left.parse::<i128>(), param_type(right, params)) {
@@ -1672,7 +1729,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     ty: Some(ty.to_string()),
                     constant: Some(constant),
                     expression,
-                    assumptions: Vec::new(),
+                    assumptions: assumptions.to_vec(),
                 });
             }
         } else if expression_needs_integer_proof(left, right, params) {
@@ -1683,7 +1740,7 @@ fn multiplication_obligations(body: &str, params: &[Param]) -> Vec<MulObligation
                     .map(|ty| ty.to_string()),
                 constant: None,
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
         }
     }
@@ -2258,7 +2315,27 @@ fn signed_division_overflow_obligations(
     op: &str,
     target_pointer_width: Option<u32>,
 ) -> Vec<DivOverflowObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            signed_division_overflow_obligations_from_tokens(
+                &segment.tokens,
+                params,
+                op,
+                target_pointer_width,
+                &segment.assumptions,
+            )
+        })
+        .collect()
+}
+
+fn signed_division_overflow_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    op: &str,
+    target_pointer_width: Option<u32>,
+    assumptions: &[String],
+) -> Vec<DivOverflowObligation> {
     let mut obligations = Vec::new();
 
     for op_idx in 1..tokens.len().saturating_sub(1) {
@@ -2273,7 +2350,7 @@ fn signed_division_overflow_obligations(
             continue;
         };
         let expression = format!("{left} {op} {right}");
-        if let Some(obligation) = signed_division_overflow_obligation(
+        if let Some(mut obligation) = signed_division_overflow_obligation(
             &left,
             &right,
             &expression,
@@ -2281,6 +2358,7 @@ fn signed_division_overflow_obligations(
             None,
             target_pointer_width,
         ) {
+            obligation.assumptions = assumptions.to_vec();
             obligations.push(obligation);
         }
     }
@@ -2289,7 +2367,20 @@ fn signed_division_overflow_obligations(
 }
 
 fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<DenominatorObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            denominator_obligations_from_tokens(&segment.tokens, params, op, &segment.assumptions)
+        })
+        .collect()
+}
+
+fn denominator_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    op: &str,
+    assumptions: &[String],
+) -> Vec<DenominatorObligation> {
     let mut obligations = Vec::new();
 
     for idx in 0..tokens.len().saturating_sub(2) {
@@ -2305,7 +2396,7 @@ fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<Denomi
             obligations.push(DenominatorObligation {
                 denominator,
                 expression,
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
             continue;
         }
@@ -2322,7 +2413,7 @@ fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<Denomi
             obligations.push(DenominatorObligation {
                 denominator: right.clone(),
                 expression: format!("{left} {op} {right}"),
-                assumptions: Vec::new(),
+                assumptions: assumptions.to_vec(),
             });
         }
     }
@@ -2331,7 +2422,19 @@ fn denominator_obligations(body: &str, params: &[Param], op: &str) -> Vec<Denomi
 }
 
 fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObligation> {
-    let tokens = executable_tokens(body);
+    executable_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            slice_index_obligations_from_tokens(&segment.tokens, params, &segment.assumptions)
+        })
+        .collect()
+}
+
+fn slice_index_obligations_from_tokens(
+    tokens: &[String],
+    params: &[Param],
+    assumptions: &[String],
+) -> Vec<SliceIndexObligation> {
     let mut obligations = Vec::new();
     let mut idx = 0;
 
@@ -2368,7 +2471,7 @@ fn slice_index_obligations(body: &str, params: &[Param]) -> Vec<SliceIndexObliga
             base: base.clone(),
             index: index.clone(),
             expression: format!("{base}[{index}]"),
-            assumptions: Vec::new(),
+            assumptions: assumptions.to_vec(),
         });
         idx += 1;
     }
@@ -2686,6 +2789,15 @@ fn loop_measure_decreases(measure: &str, loop_body: &[String]) -> bool {
     decrements_variable(loop_body, left) || increment_amount(loop_body, right).is_some()
 }
 
+fn loop_exit_fact(condition: &str) -> Option<String> {
+    for (op, exit_op) in [(">=", "<"), ("<=", ">"), (">", "<="), ("<", ">=")] {
+        if let Some((left, right)) = condition.split_once(op) {
+            return Some(format!("{left}{exit_op}{right}"));
+        }
+    }
+    None
+}
+
 fn loop_exit_proves_value(body: &str, return_expression: &str, expected: &str) -> bool {
     expected == "0"
         && tokens(body).windows(4).any(|window| {
@@ -2944,7 +3056,25 @@ fn call_obligations_with_ambiguity(
     env: &[TrustFunctionSummary],
     allow_ambiguous_leaf_matches: bool,
 ) -> Vec<CallObligation> {
-    let tokens = tokens(body);
+    executable_call_token_segments(body)
+        .into_iter()
+        .flat_map(|segment| {
+            call_obligations_from_tokens(
+                &segment.tokens,
+                env,
+                allow_ambiguous_leaf_matches,
+                &segment.assumptions,
+            )
+        })
+        .collect()
+}
+
+fn call_obligations_from_tokens(
+    tokens: &[String],
+    env: &[TrustFunctionSummary],
+    allow_ambiguous_leaf_matches: bool,
+    assumptions: &[String],
+) -> Vec<CallObligation> {
     let mut obligations = Vec::new();
     let mut idx = 0;
 
@@ -2980,7 +3110,7 @@ fn call_obligations_with_ambiguity(
                 obligations.push(CallObligation {
                     callee: callee.name.clone(),
                     condition: substitute_params(precondition, &callee.params, &args),
-                    assumptions: Vec::new(),
+                    assumptions: assumptions.to_vec(),
                 });
             }
         }
@@ -3522,6 +3652,10 @@ fn callee_precondition_proved(
 }
 
 fn executable_tokens(body: &str) -> Vec<String> {
+    compact_parenthesized_value_tokens(&executable_tokens_without_loop_specs(body))
+}
+
+fn executable_tokens_without_loop_specs(body: &str) -> Vec<String> {
     let tokens = tokens(body);
     let mut executable = Vec::new();
     let mut idx = 0;
@@ -3538,7 +3672,79 @@ fn executable_tokens(body: &str) -> Vec<String> {
         idx += 1;
     }
 
-    compact_parenthesized_value_tokens(&executable)
+    executable
+}
+
+fn executable_token_segments(body: &str) -> Vec<TokenSegment> {
+    scoped_token_segments(&executable_tokens(body), &[])
+}
+
+fn executable_call_token_segments(body: &str) -> Vec<TokenSegment> {
+    scoped_token_segments(&executable_tokens_without_loop_specs(body), &[])
+}
+
+fn scoped_token_segments(tokens: &[String], assumptions: &[String]) -> Vec<TokenSegment> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if tokens[idx] != "while" {
+            current.push(tokens[idx].clone());
+            idx += 1;
+            continue;
+        }
+
+        let Some(body_open_idx) = tokens[idx + 1..]
+            .iter()
+            .position(|token| token == "{")
+            .map(|offset| idx + 1 + offset)
+        else {
+            current.push(tokens[idx].clone());
+            idx += 1;
+            continue;
+        };
+        let Some(body_close_idx) = matching_token_group(tokens, body_open_idx, "{", "}") else {
+            current.push(tokens[idx].clone());
+            idx += 1;
+            continue;
+        };
+
+        if !current.is_empty() {
+            segments.push(TokenSegment {
+                tokens: std::mem::take(&mut current),
+                assumptions: assumptions.to_vec(),
+            });
+        }
+
+        let condition_tokens = tokens[idx + 1..body_open_idx].to_vec();
+        if !condition_tokens.is_empty() {
+            segments.push(TokenSegment {
+                tokens: condition_tokens,
+                assumptions: assumptions.to_vec(),
+            });
+        }
+
+        let mut loop_assumptions = assumptions.to_vec();
+        let condition = token_expression(&tokens[idx + 1..body_open_idx]);
+        if !condition.is_empty() {
+            loop_assumptions.push(condition);
+        }
+        segments.extend(scoped_token_segments(
+            &tokens[body_open_idx + 1..body_close_idx],
+            &loop_assumptions,
+        ));
+        idx = body_close_idx + 1;
+    }
+
+    if !current.is_empty() {
+        segments.push(TokenSegment {
+            tokens: current,
+            assumptions: assumptions.to_vec(),
+        });
+    }
+
+    segments
 }
 
 fn compact_parenthesized_value_tokens(tokens: &[String]) -> Vec<String> {
@@ -5164,6 +5370,68 @@ mod tests {
                 function: "count_up".to_string(),
                 measure: "n-i".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn rejects_division_using_loop_exit_value() {
+        let metadata = metadata_named(
+            "divide_after_countdown",
+            "pub fn divide_after_countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { n = n - 1; } 1 / n }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerDivisionByZero {
+                function: "divide_after_countdown".to_string(),
+                expression: "1 / n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn loop_body_arithmetic_uses_loop_condition_assumption() {
+        let source =
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { n = n - 1; } n }";
+        let params = parse_params(&normalize(source));
+        let body = body(source);
+
+        assert_eq!(
+            executable_token_segments(body),
+            vec![
+                TokenSegment {
+                    tokens: vec!["n".to_string(), ">".to_string(), "0".to_string()],
+                    assumptions: Vec::new(),
+                },
+                TokenSegment {
+                    tokens: vec![
+                        "n".to_string(),
+                        "=".to_string(),
+                        "n".to_string(),
+                        "-".to_string(),
+                        "1".to_string(),
+                        ";".to_string(),
+                    ],
+                    assumptions: vec!["n>0".to_string()],
+                },
+                TokenSegment {
+                    tokens: vec!["n".to_string()],
+                    assumptions: Vec::new(),
+                },
+            ]
+        );
+
+        assert_eq!(
+            subtraction_obligations(body, &params),
+            vec![SubObligation {
+                variable: "n".to_string(),
+                ty: Some("usize".to_string()),
+                constant: Some(1),
+                rhs: None,
+                expression: "n - 1".to_string(),
+                assumptions: vec!["n>0".to_string()],
+            }]
         );
     }
 

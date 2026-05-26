@@ -858,6 +858,11 @@ impl MirFunctionSummary {
             return None;
         }
         let expr = strip_mir_move_or_copy(expr.trim());
+        if self.is_arg_place(expr) {
+            if let Some(source_name) = self.local_name_for_place(expr) {
+                return Some(source_name.to_string());
+            }
+        }
         if let Some(assignment) = self.assignment_for_place(expr) {
             if let Some(normalized) = self.normalized_mir_expression_with_depth(
                 &assignment.expression,
@@ -1026,6 +1031,9 @@ impl MirFunctionSummary {
             return None;
         }
         let expr = strip_mir_move_or_copy(expr.trim());
+        if self.is_arg_place(expr) {
+            return None;
+        }
         if let Some(assignment) = self.assignment_for_place(expr) {
             return self.normalized_mir_predicate_with_depth(
                 &assignment.expression,
@@ -1068,44 +1076,57 @@ impl MirFunctionSummary {
         }
         seen.push(block.to_string());
 
-        let mut guards = self
+        let predecessor_paths = self
             .terminators
             .iter()
             .filter_map(|terminator| {
-                let (condition, targets) = mir_switch(&terminator.expression)?;
-                let explicit_values = explicit_mir_switch_values(&targets);
-                Some(
-                    targets
-                        .iter()
-                        .filter_map(|target| {
-                            if target.block != block {
-                                return None;
-                            }
-                            self.guard_for_switch_target(
-                                condition,
-                                &target.value,
-                                &explicit_values,
-                                model_fields,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                let predecessor = terminator.block.as_deref()?;
+                if is_mir_backedge(predecessor, block) {
+                    return None;
+                }
+                if !mir_successor_targets(&terminator.expression)
+                    .iter()
+                    .any(|target| target == block)
+                {
+                    return None;
+                }
+
+                let mut path_seen = seen.clone();
+                let mut path =
+                    self.guards_for_block_with_seen(predecessor, &mut path_seen, model_fields);
+                path.extend(self.edge_guards_for_successor(terminator, block, model_fields));
+                Some(dedup_strings(path))
             })
-            .flatten()
             .collect::<Vec<_>>();
 
-        for terminator in &self.terminators {
-            if mir_successor_targets(&terminator.expression)
-                .iter()
-                .any(|target| target == block)
-            {
-                if let Some(predecessor) = terminator.block.as_deref() {
-                    guards.extend(self.guards_for_block_with_seen(predecessor, seen, model_fields));
-                }
-            }
-        }
+        common_guards(predecessor_paths)
+    }
 
-        dedup_strings(guards)
+    fn edge_guards_for_successor(
+        &self,
+        terminator: &MirTerminator,
+        successor: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<String> {
+        let Some((condition, targets)) = mir_switch(&terminator.expression) else {
+            return Vec::new();
+        };
+        let explicit_values = explicit_mir_switch_values(&targets);
+
+        targets
+            .iter()
+            .filter_map(|target| {
+                if target.block != successor {
+                    return None;
+                }
+                self.guard_for_switch_target(
+                    condition,
+                    &target.value,
+                    &explicit_values,
+                    model_fields,
+                )
+            })
+            .collect()
     }
 
     fn assignment_for_place(&self, place: &str) -> Option<&MirAssignment> {
@@ -1115,6 +1136,10 @@ impl MirFunctionSummary {
             .filter(|assignment| assignment.place == place);
         let assignment = matches.next()?;
         matches.next().is_none().then_some(assignment)
+    }
+
+    fn is_arg_place(&self, place: &str) -> bool {
+        self.args.iter().any(|arg| arg.place == place)
     }
 
     #[cfg(test)]
@@ -2182,6 +2207,16 @@ fn mir_successor_targets(expr: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_mir_backedge(predecessor: &str, successor: &str) -> bool {
+    mir_block_index(predecessor)
+        .zip(mir_block_index(successor))
+        .is_some_and(|(predecessor, successor)| predecessor >= successor)
+}
+
+fn mir_block_index(block: &str) -> Option<u32> {
+    block.strip_prefix("bb")?.parse().ok()
+}
+
 fn negate_predicate(predicate: &str) -> Option<String> {
     for (op, negated) in [
         ("<=", ">"),
@@ -2208,6 +2243,21 @@ fn dedup_strings(values: Vec<String>) -> Vec<String> {
         }
     }
     deduped
+}
+
+fn common_guards(paths: Vec<Vec<String>>) -> Vec<String> {
+    let Some((first, rest)) = paths.split_first() else {
+        return Vec::new();
+    };
+
+    first
+        .iter()
+        .filter(|guard| {
+            rest.iter()
+                .all(|path| path.iter().any(|other| other == *guard))
+        })
+        .cloned()
+        .collect()
 }
 
 fn semantic_arithmetic_operator(kind: SemanticArithmeticKind) -> &'static str {
@@ -3269,6 +3319,61 @@ fn choose(_1: i32) -> i32 {
         assert_eq!(
             summary.normalized_return_expression(),
             Some("y".to_string())
+        );
+    }
+
+    #[test]
+    fn does_not_inline_mutated_argument_in_later_operations() {
+        let mir = r#"
+fn divide_after_countdown(_1: usize) -> usize {
+    debug n => _1;
+    let mut _0: usize;
+    let mut _2: bool;
+
+    bb0: {
+        _2 = Gt(copy _1, const 0_usize);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _1 = Sub(copy _1, const 1_usize);
+        goto -> bb0;
+    }
+
+    bb2: {
+        _0 = Div(const 1_usize, copy _1);
+        return;
+    }
+}
+"#;
+
+        let summary =
+            extract_mir_function_summary(mir, "divide_after_countdown").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("1 / n".to_string())
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Sub,
+                    ty: Some("usize".to_string()),
+                    left: "n".to_string(),
+                    right: Some("1".to_string()),
+                    expression: "n - 1".to_string(),
+                    guards: vec!["n > 0".to_string()],
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Div,
+                    ty: Some("usize".to_string()),
+                    left: "1".to_string(),
+                    right: Some("n".to_string()),
+                    expression: "1 / n".to_string(),
+                    guards: vec!["n <= 0".to_string()],
+                },
+            ]
         );
     }
 
