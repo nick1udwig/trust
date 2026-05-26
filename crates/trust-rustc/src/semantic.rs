@@ -308,6 +308,26 @@ fn trust_preconditions(item: &TrustMetadata) -> Vec<String> {
         .collect()
 }
 
+fn semantic_guards_for_base_alias(
+    guards: &[String],
+    canonical_base: &str,
+    alias: &str,
+) -> Vec<String> {
+    if canonical_base == alias {
+        return guards.to_vec();
+    }
+
+    guards
+        .iter()
+        .map(|guard| {
+            guard.replace(
+                &format!("{canonical_base}.len()"),
+                &format!("{alias}.len()"),
+            )
+        })
+        .collect()
+}
+
 fn semantic_contract_bindings(
     item: &TrustMetadata,
     mir_function: &MirFunctionSummary,
@@ -718,6 +738,24 @@ impl MirFunctionSummary {
         names
     }
 
+    fn local_aliases_for_place_with_models(
+        &self,
+        place: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<String> {
+        let mut aliases = self
+            .local_names_for_place(place)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if let Some(normalized) = self.normalized_mir_expression_with_models(place, model_fields) {
+            if !aliases.contains(&normalized) {
+                aliases.push(normalized);
+            }
+        }
+        aliases
+    }
+
     fn type_for_place(&self, place: &str) -> Option<&str> {
         self.args
             .iter()
@@ -1088,29 +1126,94 @@ impl MirFunctionSummary {
     ) -> Vec<SemanticSliceIndex> {
         self.assignments
             .iter()
-            .filter_map(|assignment| {
+            .flat_map(|assignment| {
                 let expr = strip_mir_move_or_copy(&assignment.expression);
-                let (base_place, index_expr) = mir_slice_index(expr)?;
-                let base_type = self.type_for_place(base_place)?.to_string();
-                let element_type = slice_element_type(&base_type)?.to_string();
-                let index_type = self.mir_expression_type(index_expr, model_fields)?;
-                let base = self.normalized_mir_expression_with_models(base_place, model_fields)?;
-                let index = self.normalized_mir_expression_with_models(index_expr, model_fields)?;
-                Some(SemanticSliceIndex {
-                    expression: format!("{base}[{index}]"),
-                    base,
-                    base_type,
-                    index,
-                    index_type,
-                    element_type,
-                    guards: assignment
-                        .block
-                        .as_deref()
-                        .map(|block| self.guards_for_block_with_models(block, model_fields))
-                        .unwrap_or_default(),
-                })
+                let Some((base_place, index_expr)) = mir_slice_index(expr) else {
+                    return Vec::new();
+                };
+                let Some(base_type) = self.type_for_place(base_place).map(ToString::to_string)
+                else {
+                    return Vec::new();
+                };
+                let Some(element_type) = slice_element_type(&base_type).map(ToString::to_string)
+                else {
+                    return Vec::new();
+                };
+                let Some(index_type) = self.mir_expression_type(index_expr, model_fields) else {
+                    return Vec::new();
+                };
+                let Some(canonical_base) =
+                    self.normalized_mir_expression_with_models(base_place, model_fields)
+                else {
+                    return Vec::new();
+                };
+                let Some(index) =
+                    self.normalized_mir_expression_with_models(index_expr, model_fields)
+                else {
+                    return Vec::new();
+                };
+                let guards = assignment
+                    .block
+                    .as_deref()
+                    .map(|block| self.guards_for_block_with_models(block, model_fields))
+                    .unwrap_or_default();
+                self.local_aliases_for_place_with_models(base_place, model_fields)
+                    .into_iter()
+                    .map(|base| SemanticSliceIndex {
+                        expression: format!("{base}[{index}]"),
+                        guards: semantic_guards_for_base_alias(&guards, &canonical_base, &base),
+                        base,
+                        base_type: base_type.clone(),
+                        index: index.clone(),
+                        index_type: index_type.clone(),
+                        element_type: element_type.clone(),
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect()
+            .fold(Vec::new(), |mut indexes, index| {
+                if !indexes
+                    .iter()
+                    .any(|existing: &SemanticSliceIndex| existing.expression == index.expression)
+                {
+                    indexes.push(index);
+                }
+                indexes
+            })
+    }
+
+    fn semantic_len_calls_with_models(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticCall> {
+        let mut calls = Vec::new();
+
+        for assignment in &self.assignments {
+            let Some(base) = mir_ptr_metadata(&assignment.expression) else {
+                continue;
+            };
+            let base_place = strip_mir_move_or_copy(base);
+            let Some(base_type) = self.type_for_place(base_place) else {
+                continue;
+            };
+            if slice_element_type(base_type).is_none() {
+                continue;
+            }
+
+            for receiver in self.local_aliases_for_place_with_models(base_place, model_fields) {
+                if calls.iter().any(|call: &SemanticCall| {
+                    call.callee == "<slice>.len"
+                        && call.args.len() == 1
+                        && call.args.first() == Some(&receiver)
+                }) {
+                    continue;
+                }
+                calls.push(SemanticCall {
+                    callee: "<slice>.len".to_string(),
+                    trust_callee: None,
+                    args: vec![receiver],
+                    guards: Vec::new(),
+                })
+            }
+        }
+
+        calls
     }
 
     #[cfg(test)]
@@ -1144,53 +1247,6 @@ impl MirFunctionSummary {
             })
             .collect::<Vec<_>>();
         calls.extend(self.semantic_len_calls_with_models(model_fields));
-        calls
-    }
-
-    fn semantic_len_calls_with_models(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticCall> {
-        let mut calls = Vec::new();
-
-        for assignment in &self.assignments {
-            let Some(base) = mir_ptr_metadata(&assignment.expression) else {
-                continue;
-            };
-            let base_place = strip_mir_move_or_copy(base);
-            let Some(base_type) = self.type_for_place(base_place) else {
-                continue;
-            };
-            if slice_element_type(base_type).is_none() {
-                continue;
-            }
-
-            let mut receivers = self
-                .local_names_for_place(base_place)
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            if let Some(normalized) = self.normalized_mir_expression_with_models(base, model_fields)
-            {
-                if !receivers.contains(&normalized) {
-                    receivers.push(normalized);
-                }
-            }
-
-            for receiver in receivers {
-                if calls.iter().any(|call: &SemanticCall| {
-                    call.callee == "<slice>.len"
-                        && call.args.len() == 1
-                        && call.args.first() == Some(&receiver)
-                }) {
-                    continue;
-                }
-                calls.push(SemanticCall {
-                    callee: "<slice>.len".to_string(),
-                    trust_callee: None,
-                    args: vec![receiver],
-                    guards: Vec::new(),
-                });
-            }
-        }
-
         calls
     }
 
@@ -3108,6 +3164,29 @@ fn get_or_zero(_1: &[i32], _2: usize) -> i32 {
                     args: vec!["ys".to_string()],
                     guards: Vec::new(),
                     trust_callee: None,
+                },
+            ]
+        );
+        assert_eq!(
+            summary.semantic_slice_indexes(),
+            vec![
+                SemanticSliceIndex {
+                    base: "xs".to_string(),
+                    base_type: "&[i32]".to_string(),
+                    index: "i".to_string(),
+                    index_type: "usize".to_string(),
+                    element_type: "i32".to_string(),
+                    expression: "xs[i]".to_string(),
+                    guards: vec!["i < xs.len()".to_string()],
+                },
+                SemanticSliceIndex {
+                    base: "ys".to_string(),
+                    base_type: "&[i32]".to_string(),
+                    index: "i".to_string(),
+                    index_type: "usize".to_string(),
+                    element_type: "i32".to_string(),
+                    expression: "ys[i]".to_string(),
+                    guards: vec!["i < ys.len()".to_string()],
                 },
             ]
         );

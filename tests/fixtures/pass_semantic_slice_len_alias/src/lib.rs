@@ -4,7 +4,7 @@ mod verified {
         pub fn get_or_zero(xs: &[i32], i: usize) -> i32 {
             let ys = xs;
             if i < ys.len() {
-                xs[i]
+                ys[i]
             } else {
                 0
             }

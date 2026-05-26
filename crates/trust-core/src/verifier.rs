@@ -539,7 +539,7 @@ fn verify_total_with_env(
         }
     }
 
-    if let Some(expression) = unsupported_index_expression(body, &params) {
+    if let Some(expression) = unsupported_index_expression(body, &params, semantics) {
         return Err(VerificationError::UnsupportedIndex {
             function: metadata.rust_function_path.clone(),
             expression,
@@ -1932,7 +1932,11 @@ fn semantic_slice_index_supported(index: &SemanticSliceIndex) -> bool {
             .is_some_and(|element_type| element_type == index.element_type)
 }
 
-fn unsupported_index_expression(body: &str, params: &[Param]) -> Option<String> {
+fn unsupported_index_expression(
+    body: &str,
+    params: &[Param],
+    semantics: Option<&TrustFunctionSemantics>,
+) -> Option<String> {
     let tokens = executable_tokens(body);
     let mut idx = 0;
 
@@ -1946,14 +1950,29 @@ fn unsupported_index_expression(body: &str, params: &[Param]) -> Option<String> 
             idx += 1;
             continue;
         };
-        if !is_read_only_slice_param(base, params) {
-            let index = token_expression(&tokens[idx + 2..end]);
-            return Some(format!("{base}[{index}]"));
+        let index = simple_grouped_value_expression(&tokens[idx + 2..end]);
+        let expression = format!("{base}[{index}]");
+        if !is_read_only_slice_param(base, params)
+            && !supported_semantic_index_expression(&expression, semantics)
+        {
+            return Some(expression);
         }
         idx = end + 1;
     }
 
     None
+}
+
+fn supported_semantic_index_expression(
+    expression: &str,
+    semantics: Option<&TrustFunctionSemantics>,
+) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics
+            .slice_indexes
+            .iter()
+            .any(|index| semantic_slice_index_supported(index) && index.expression == expression)
+    })
 }
 
 fn field_access_obligations(body: &str, params: &[Param]) -> Vec<FieldAccessObligation> {
@@ -4359,7 +4378,7 @@ mod tests {
     fn semantic_len_call_allows_slice_alias_method() {
         let metadata = metadata_named(
             "get_or_zero",
-            "pub fn get_or_zero(xs: &[i32], i: usize) -> i32 { let ys = xs; if i < ys.len() { xs[i] } else { 0 } }",
+            "pub fn get_or_zero(xs: &[i32], i: usize) -> i32 { let ys = xs; if i < ys.len() { ys[i] } else { 0 } }",
             &[],
         );
         let semantics = TrustFunctionSemantics {
@@ -4379,13 +4398,13 @@ mod tests {
             return_expression: None,
             arithmetic_operations: Vec::new(),
             slice_indexes: vec![SemanticSliceIndex {
-                base: "xs".to_string(),
+                base: "ys".to_string(),
                 base_type: "&[i32]".to_string(),
                 index: "i".to_string(),
                 index_type: "usize".to_string(),
                 element_type: "i32".to_string(),
-                expression: "xs[i]".to_string(),
-                guards: vec!["i < xs.len()".to_string()],
+                expression: "ys[i]".to_string(),
+                guards: vec!["i < ys.len()".to_string()],
             }],
             calls: vec![SemanticCall {
                 callee: "<slice>.len".to_string(),

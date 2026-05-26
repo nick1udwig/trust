@@ -1384,6 +1384,7 @@ fn pass_semantic_slice_len_alias_uses_mir_method_resolution() {
     let summary = fs::read_to_string(summary_path).expect("read semantic summary");
     assert!(summary
         .contains("slice_indexes=xs[i] element_type=i32 index_type=usize guarded_by i < xs.len()"));
+    assert!(summary.contains("ys[i] element_type=i32 index_type=usize guarded_by i < ys.len()"));
     assert!(summary.contains("<slice>.len(ys)"));
 }
 
