@@ -1910,9 +1910,10 @@ impl MirFunctionSummary {
         model_fields: &[ModelFieldMap],
     ) -> Option<MirSemanticReturnFact> {
         let join_block = self.goto_target_for_block(block)?;
-        let return_place = self.return_source_place_for_block(join_block)?;
+        let return_places = self.return_source_places_for_block(join_block);
         let assignment = self.assignments.iter().rev().find(|assignment| {
-            assignment.block.as_deref() == Some(block) && assignment.place == return_place
+            assignment.block.as_deref() == Some(block)
+                && return_places.iter().any(|place| place == &assignment.place)
         })?;
 
         Some(MirSemanticReturnFact {
@@ -1932,11 +1933,11 @@ impl MirFunctionSummary {
         predecessor_block: &str,
         model_fields: &[ModelFieldMap],
     ) -> Option<MirSemanticReturnFact> {
-        let return_place = self.join_return_source_place_for_block(block)?;
+        let return_places = self.join_return_source_places_for_block(block);
         let terminator = self.terminator_for_block(predecessor_block)?;
         let assignment = self.assignments.iter().rev().find(|assignment| {
             assignment.block.as_deref() == Some(predecessor_block)
-                && assignment.place == return_place
+                && return_places.iter().any(|place| place == &assignment.place)
                 && assignment.statement_index < terminator.statement_index
         })?;
 
@@ -1954,11 +1955,48 @@ impl MirFunctionSummary {
         })
     }
 
-    fn join_return_source_place_for_block(&self, block: &str) -> Option<&str> {
-        self.return_source_place_for_block(block).or_else(|| {
-            let join_block = self.goto_target_for_block(block)?;
-            self.return_source_place_for_block(join_block)
-        })
+    fn join_return_source_places_for_block(&self, block: &str) -> Vec<String> {
+        let places = self.return_source_places_for_block(block);
+        if !places.is_empty() {
+            return places;
+        }
+        let Some(join_block) = self.goto_target_for_block(block) else {
+            return Vec::new();
+        };
+        self.return_source_places_for_block(join_block)
+    }
+
+    fn return_source_places_for_block(&self, block: &str) -> Vec<String> {
+        let Some(first) = self.return_source_place_for_block(block) else {
+            return Vec::new();
+        };
+        let mut places = vec![first.to_string()];
+        let mut current = first.to_string();
+        for _ in 0..4 {
+            let Some(next) = self.local_copy_source_for_block(block, &current) else {
+                break;
+            };
+            if places.iter().any(|place| place == next) {
+                break;
+            }
+            places.push(next.to_string());
+            current = next.to_string();
+        }
+        places
+    }
+
+    fn local_copy_source_for_block<'a>(&'a self, block: &str, place: &str) -> Option<&'a str> {
+        let return_statement_index = self.return_statement_index_for_block(block)?;
+        self.assignments
+            .iter()
+            .rev()
+            .find(|assignment| {
+                assignment.block.as_deref() == Some(block)
+                    && assignment.place == place
+                    && assignment.statement_index < return_statement_index
+            })
+            .map(|assignment| strip_mir_move_or_copy(&assignment.expression))
+            .filter(|source| source.starts_with('_'))
     }
 
     fn goto_target_for_block(&self, block: &str) -> Option<&str> {
@@ -3357,6 +3395,61 @@ fn zero_or_self(_1: i32) -> i32 {
 
     bb3: {
         _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "zero_or_self").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_branches(&[]),
+            vec![SemanticBranch {
+                condition: "x".to_string(),
+                arms: vec![
+                    SemanticBranchArm {
+                        guard: "x == 0".to_string(),
+                        assumptions: vec!["x == 0".to_string()],
+                        return_expression: Some("0".to_string()),
+                    },
+                    SemanticBranchArm {
+                        guard: "x != 0".to_string(),
+                        assumptions: vec!["x != 0".to_string()],
+                        return_expression: Some("x".to_string()),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_if_branch_join_copy_return_expressions() {
+        let mir = r#"
+fn zero_or_self(_1: i32) -> i32 {
+    debug x => _1;
+    debug y => _2;
+    debug z => _3;
+    let mut _0: i32;
+    let mut _2: i32;
+    let _3: i32;
+
+    bb0: {
+        _2 = copy _1;
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _2 = const 0_i32;
+        goto -> bb3;
+    }
+
+    bb2: {
+        goto -> bb3;
+    }
+
+    bb3: {
+        _3 = copy _2;
+        _0 = copy _3;
         return;
     }
 }
