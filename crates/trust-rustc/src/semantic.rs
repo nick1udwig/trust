@@ -880,17 +880,17 @@ impl MirFunctionSummary {
         let args = args.strip_suffix(')')?;
         let args = parse_mir_call_args(args);
         match (op.trim(), args.as_slice()) {
-            ("AddWithOverflow", [left, right]) => Some(format!(
+            ("Add", [left, right]) | ("AddWithOverflow", [left, right]) => Some(format!(
                 "{} + {}",
                 self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
                 self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
-            ("SubWithOverflow", [left, right]) => Some(format!(
+            ("Sub", [left, right]) | ("SubWithOverflow", [left, right]) => Some(format!(
                 "{} - {}",
                 self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
                 self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
-            ("MulWithOverflow", [left, right]) => Some(format!(
+            ("Mul", [left, right]) | ("MulWithOverflow", [left, right]) => Some(format!(
                 "{} * {}",
                 self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
                 self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
@@ -905,7 +905,7 @@ impl MirFunctionSummary {
                 self.normalized_mir_expression_with_depth(left, depth + 1, model_fields)?,
                 self.normalized_mir_expression_with_depth(right, depth + 1, model_fields)?
             )),
-            ("NegWithOverflow", [value]) => Some(format!(
+            ("Neg", [value]) | ("NegWithOverflow", [value]) => Some(format!(
                 "-{}",
                 self.normalized_mir_expression_with_depth(value, depth + 1, model_fields)?
             )),
@@ -1812,10 +1812,10 @@ fn mir_checked_arithmetic_operation(expr: &str) -> Option<(SemanticArithmeticKin
     let (op, args) = expr.split_once('(')?;
     let args = args.strip_suffix(')')?;
     let kind = match op.trim() {
-        "AddWithOverflow" => SemanticArithmeticKind::Add,
-        "SubWithOverflow" => SemanticArithmeticKind::Sub,
-        "MulWithOverflow" => SemanticArithmeticKind::Mul,
-        "NegWithOverflow" => SemanticArithmeticKind::Neg,
+        "Add" | "AddWithOverflow" => SemanticArithmeticKind::Add,
+        "Sub" | "SubWithOverflow" => SemanticArithmeticKind::Sub,
+        "Mul" | "MulWithOverflow" => SemanticArithmeticKind::Mul,
+        "Neg" | "NegWithOverflow" => SemanticArithmeticKind::Neg,
         "Div" => SemanticArithmeticKind::Div,
         "Rem" => SemanticArithmeticKind::Rem,
         _ => return None,
@@ -2772,6 +2772,73 @@ fn add_one(_1: i32) -> i32 {
                 expression: "x + 1".to_string(),
                 guards: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_plain_mir_arithmetic_operations() {
+        let mir = r#"
+fn arithmetic(_1: i32) -> i32 {
+    debug x => _1;
+    let mut _0: i32;
+    let mut _2: i32;
+    let mut _3: i32;
+    let mut _4: i32;
+    let mut _5: i32;
+
+    bb0: {
+        _2 = Add(copy _1, const 1_i32);
+        _3 = Sub(copy _1, const 1_i32);
+        _4 = Mul(copy _1, const 2_i32);
+        _5 = Neg(copy _1);
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "arithmetic").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("x + 1".to_string())
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations(),
+            vec![
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Add,
+                    ty: Some("i32".to_string()),
+                    left: "x".to_string(),
+                    right: Some("1".to_string()),
+                    expression: "x + 1".to_string(),
+                    guards: Vec::new(),
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Sub,
+                    ty: Some("i32".to_string()),
+                    left: "x".to_string(),
+                    right: Some("1".to_string()),
+                    expression: "x - 1".to_string(),
+                    guards: Vec::new(),
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Mul,
+                    ty: Some("i32".to_string()),
+                    left: "x".to_string(),
+                    right: Some("2".to_string()),
+                    expression: "x * 2".to_string(),
+                    guards: Vec::new(),
+                },
+                SemanticArithmeticOperation {
+                    kind: SemanticArithmeticKind::Neg,
+                    ty: Some("i32".to_string()),
+                    left: "x".to_string(),
+                    right: None,
+                    expression: "-x".to_string(),
+                    guards: Vec::new(),
+                },
+            ]
         );
     }
 
