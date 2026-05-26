@@ -624,6 +624,49 @@ fn type_name_tail(ty: &str) -> String {
         .to_string()
 }
 
+fn semantic_unmodeled_field_access(
+    base: &str,
+    field: &str,
+    owner_type: &str,
+    field_ty: &str,
+) -> Option<SemanticFieldAccess> {
+    if !field_owner_requires_trust_model(owner_type) || !is_source_visible_expression(base) {
+        return None;
+    }
+
+    Some(SemanticFieldAccess {
+        base: base.to_string(),
+        field: field.to_string(),
+        owner_type: owner_type.to_string(),
+        field_type: field_ty.to_string(),
+        expression: format!("{base}.{field}"),
+    })
+}
+
+fn field_owner_requires_trust_model(owner_type: &str) -> bool {
+    let owner_type = owner_type.trim();
+    !owner_type.is_empty()
+        && owner_type != "bool"
+        && owner_type != "()"
+        && owner_type != "str"
+        && !supported_mir_integer_type(owner_type)
+        && !owner_type.starts_with('&')
+        && !owner_type.starts_with('*')
+        && !owner_type.starts_with('[')
+        && !owner_type.starts_with('(')
+        && !owner_type.starts_with("Option<")
+        && !owner_type.starts_with("Result<")
+}
+
+fn is_source_visible_expression(expr: &str) -> bool {
+    expr.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && expr
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.'))
+}
+
 fn hir_contains_function(hir: &str, expected_path: &str) -> bool {
     let matches = hir
         .lines()
@@ -853,8 +896,8 @@ impl MirFunctionSummary {
                 self.normalized_mir_expression_with_depth(index, depth + 1, model_fields)?
             ));
         }
-        if let Some((place, field, _ty)) = mir_projection(expr) {
-            if let Some(field_access) = self.semantic_field_access(place, field, model_fields) {
+        if let Some((place, field, ty)) = mir_projection(expr) {
+            if let Some(field_access) = self.semantic_field_access(place, field, ty, model_fields) {
                 return Some(field_access.expression);
             }
             if field == "0" {
@@ -926,7 +969,7 @@ impl MirFunctionSummary {
             return Some(ty.to_string());
         }
         if let Some((place, field, ty)) = mir_projection(expr) {
-            if let Some(field_access) = self.semantic_field_access(place, field, model_fields) {
+            if let Some(field_access) = self.semantic_field_access(place, field, ty, model_fields) {
                 return Some(field_access.field_type);
             }
             return Some(ty.to_string());
@@ -1260,29 +1303,120 @@ impl MirFunctionSummary {
     fn semantic_field_accesses(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticFieldAccess> {
         self.assignments
             .iter()
-            .filter_map(|assignment| {
-                let expr = strip_mir_move_or_copy(&assignment.expression);
-                let (place, field, _ty) = mir_projection(expr)?;
-                self.semantic_field_access(place, field, model_fields)
+            .flat_map(|assignment| {
+                self.semantic_field_accesses_in_expression(&assignment.expression, model_fields)
             })
-            .collect()
+            .fold(Vec::new(), |mut field_accesses, field_access| {
+                if !field_accesses.iter().any(|existing: &SemanticFieldAccess| {
+                    existing.expression == field_access.expression
+                        && existing.owner_type == field_access.owner_type
+                }) {
+                    field_accesses.push(field_access);
+                }
+                field_accesses
+            })
+    }
+
+    fn semantic_field_accesses_in_expression(
+        &self,
+        expr: &str,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<SemanticFieldAccess> {
+        self.semantic_field_accesses_in_expression_with_depth(expr, 0, model_fields)
+    }
+
+    fn semantic_field_accesses_in_expression_with_depth(
+        &self,
+        expr: &str,
+        depth: usize,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<SemanticFieldAccess> {
+        if depth > 8 {
+            return Vec::new();
+        }
+        let expr = strip_mir_move_or_copy(expr.trim());
+        let mut field_accesses = Vec::new();
+        if let Some((place, field, ty)) = mir_projection(expr) {
+            if let Some(field_access) = self.semantic_field_access(place, field, ty, model_fields) {
+                field_accesses.push(field_access);
+            }
+        }
+        if let Some((_kind, args)) = mir_checked_arithmetic_operation(expr) {
+            for arg in args {
+                field_accesses.extend(self.semantic_field_accesses_in_expression_with_depth(
+                    &arg,
+                    depth + 1,
+                    model_fields,
+                ));
+            }
+        }
+        if let Some((_ty, fields)) = mir_aggregate_fields(expr) {
+            for (_field, value) in fields {
+                field_accesses.extend(self.semantic_field_accesses_in_expression_with_depth(
+                    &value,
+                    depth + 1,
+                    model_fields,
+                ));
+            }
+        }
+        if let Some((_callee, args)) = mir_call(expr) {
+            for arg in args {
+                field_accesses.extend(self.semantic_field_accesses_in_expression_with_depth(
+                    &arg,
+                    depth + 1,
+                    model_fields,
+                ));
+            }
+        }
+        if let Some((base, index)) = mir_slice_index(expr) {
+            field_accesses.extend(self.semantic_field_accesses_in_expression_with_depth(
+                base,
+                depth + 1,
+                model_fields,
+            ));
+            field_accesses.extend(self.semantic_field_accesses_in_expression_with_depth(
+                index,
+                depth + 1,
+                model_fields,
+            ));
+        }
+
+        field_accesses
+            .into_iter()
+            .fold(Vec::new(), |mut deduped, field_access| {
+                if !deduped.iter().any(|existing: &SemanticFieldAccess| {
+                    existing.expression == field_access.expression
+                        && existing.owner_type == field_access.owner_type
+                }) {
+                    deduped.push(field_access);
+                }
+                deduped
+            })
     }
 
     fn semantic_field_access(
         &self,
         place: &str,
         field: &str,
+        field_ty: &str,
         model_fields: &[ModelFieldMap],
     ) -> Option<SemanticFieldAccess> {
         let field_idx = field.parse::<usize>().ok()?;
-        let arg = self.args.iter().find(|arg| arg.place == place)?;
-        let owner_type = type_name_tail(&arg.ty);
-        let model = model_fields.iter().find(|model| model.ty == owner_type)?;
-        let model_field = model.fields.get(field_idx)?;
+        let owner_type = self.type_for_place(place).map(type_name_tail)?;
+        let model = model_fields.iter().find(|model| model.ty == owner_type);
+        if model.is_none() && !field_owner_requires_trust_model(&owner_type) {
+            return None;
+        }
+
         let base = self
-            .local_name_for_place(place)
-            .unwrap_or(place)
-            .to_string();
+            .normalized_mir_expression_with_models(place, model_fields)
+            .or_else(|| self.local_name_for_place(place).map(ToString::to_string))
+            .unwrap_or_else(|| place.to_string());
+
+        let Some(model) = model else {
+            return semantic_unmodeled_field_access(&base, field, &owner_type, field_ty);
+        };
+        let model_field = model.fields.get(field_idx)?;
         Some(SemanticFieldAccess {
             expression: format!("{}.{}", base, model_field.name),
             base,
@@ -2426,6 +2560,90 @@ fn balance(_1: Account) -> i64 {
                 owner_type: "Account".to_string(),
                 field_type: "i64".to_string(),
                 expression: "acct.balance".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_model_field_access_through_local_alias() {
+        let mir = r#"
+fn reward_alias(_1: Account) -> i64 {
+    debug acct => _1;
+    let mut _0: i64;
+    let _2: Account;
+    let mut _3: (i64, bool);
+    debug alias => _2;
+
+    bb0: {
+        _2 = move _1;
+        _3 = AddWithOverflow(copy (_2.0: i64), const 1_i64);
+        assert(!move (_3.1: bool), "overflow", copy (_2.0: i64), const 1_i64) -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move (_3.0: i64);
+        return;
+    }
+}
+"#;
+        let fields = vec![ModelFieldMap {
+            ty: "Account".to_string(),
+            fields: vec![ModelField {
+                name: "balance".to_string(),
+                ty: "i64".to_string(),
+            }],
+        }];
+        let summary = extract_mir_function_summary(mir, "reward_alias").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_field_accesses(&fields),
+            vec![SemanticFieldAccess {
+                base: "acct".to_string(),
+                field: "balance".to_string(),
+                owner_type: "Account".to_string(),
+                field_type: "i64".to_string(),
+                expression: "acct.balance".to_string(),
+            }]
+        );
+        assert_eq!(
+            summary.semantic_arithmetic_operations_with_models(&fields),
+            vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("i64".to_string()),
+                left: "acct.balance".to_string(),
+                right: Some("1".to_string()),
+                expression: "acct.balance + 1".to_string(),
+                guards: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_unmodeled_field_access_through_local_alias() {
+        let mir = r#"
+fn balance_alias(_1: Account) -> i64 {
+    debug acct => _1;
+    let mut _0: i64;
+    let _2: Account;
+    debug alias => _2;
+
+    bb0: {
+        _2 = move _1;
+        _0 = copy (_2.0: i64);
+        return;
+    }
+}
+"#;
+        let summary = extract_mir_function_summary(mir, "balance_alias").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_field_accesses(&[]),
+            vec![SemanticFieldAccess {
+                base: "acct".to_string(),
+                field: "0".to_string(),
+                owner_type: "Account".to_string(),
+                field_type: "i64".to_string(),
+                expression: "acct.0".to_string(),
             }]
         );
     }
