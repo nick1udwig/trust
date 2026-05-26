@@ -25,8 +25,9 @@ Implemented:
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
 - runtime public precondition assertions
 - MVP checks for integer overflow, division and remainder by zero, slice bounds,
-  Trust-to-Trust callee preconditions, simple postconditions, proof assertions,
-  loop invariants/decreases, and required `TrustModel` field reasoning
+  Trust-to-Trust callee preconditions, executable Trust spec calls, simple
+  postconditions, proof assertions, loop invariants/decreases, and required
+  `TrustModel` field reasoning
 
 Still intentionally limited:
 

@@ -683,16 +683,24 @@ fn function_env(
 ) -> Vec<TrustFunctionSummary> {
     metadata
         .iter()
-        .filter(|item| item.item_kind == "total")
+        .filter(|item| item.item_kind == "total" || is_executable_spec(item))
         .map(|item| {
             let source = normalize(&item.function_source);
             TrustFunctionSummary {
                 name: item.rust_function_path.clone(),
                 params: verification_params(&source, semantic_for(item, semantics)),
-                preconditions: given_preconditions(item),
+                preconditions: if item.item_kind == "total" {
+                    given_preconditions(item)
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect()
+}
+
+fn is_executable_spec(item: &TrustMetadata) -> bool {
+    item.item_kind == "spec" && item.item_id.starts_with("spec:executable:")
 }
 
 fn model_env(metadata: &[TrustMetadata]) -> Vec<String> {
@@ -3290,6 +3298,32 @@ mod tests {
         }
     }
 
+    fn executable_spec_metadata(name: &str, function_source: &str) -> TrustMetadata {
+        TrustMetadata {
+            schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "test-module".to_string(),
+            item_kind: "spec".to_string(),
+            item_id: format!("spec:executable:{name}:test"),
+            source_span: "test-span".to_string(),
+            rust_function_path: name.to_string(),
+            visibility: "private".to_string(),
+            contracts_original: Vec::new(),
+            contracts_normalized: Vec::new(),
+            contract_classes: Vec::new(),
+            assertion_policy: "always".to_string(),
+            function_source: function_source.to_string(),
+            body_hash_placeholder: format!("{name}-hash"),
+            trust_model_dependencies: Vec::new(),
+        }
+    }
+
+    fn ghost_spec_metadata(name: &str, function_source: &str) -> TrustMetadata {
+        let mut metadata = executable_spec_metadata(name, function_source);
+        metadata.item_id = format!("spec:ghost:{name}:test");
+        metadata
+    }
+
     fn proof_metadata(name: &str, function_source: &str, contracts: &[&str]) -> TrustMetadata {
         TrustMetadata {
             schema_version: 1,
@@ -5162,6 +5196,39 @@ mod tests {
         assert_eq!(
             verify_totals_with_semantics(&[caller], &[semantics], VerificationOptions::default()),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn executable_spec_calls_are_supported_without_callee_obligations() {
+        let spec = executable_spec_metadata(
+            "nonempty",
+            "fn nonempty(xs: &[i32]) -> bool { xs.len() > 0 }",
+        );
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(xs: &[i32]) -> bool { nonempty(xs) }",
+            &[],
+        );
+
+        assert_eq!(verify_totals(&[spec, caller]), Ok(()));
+    }
+
+    #[test]
+    fn ghost_spec_calls_are_not_supported_runtime_callees() {
+        let spec = ghost_spec_metadata("sorted", "fn sorted(xs: &[i32]) -> bool { true }");
+        let caller = metadata_named(
+            "caller",
+            "pub fn caller(xs: &[i32]) -> bool { sorted(xs) }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_totals(&[spec, caller]),
+            Err(VerificationError::UnsupportedCall {
+                function: "caller".to_string(),
+                callee: "sorted".to_string(),
+            })
         );
     }
 

@@ -103,6 +103,37 @@ fn pass_total_identity_can_disable_default_semantic_verification_for_debugging()
 }
 
 #[test]
+fn pass_semantic_executable_spec_call_is_supported() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_executable_spec_call_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "pass_semantic_executable_spec_call",
+        Expected::Pass,
+        &format!("pass_semantic_executable_spec_call_{suffix}"),
+        &format!("pass_semantic_executable_spec_call_{suffix}"),
+        &[("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str)],
+    );
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("calls=nonempty(xs)"));
+}
+
+#[test]
 fn pass_semantic_duplicate_leaf_names_use_module_qualified_mir_paths() {
     let suffix = std::process::id();
     let dump_dir = fixture_cache_dir(&format!("semantic_duplicate_leaf_dump_{suffix}"));
