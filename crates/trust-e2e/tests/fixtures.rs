@@ -1429,7 +1429,7 @@ fn pass_semantic_match_postcondition_uses_mir_arms() {
 }
 
 #[test]
-fn pass_semantic_match_local_alias_postcondition_uses_mir_local_type() {
+fn pass_semantic_match_local_alias_postcondition_uses_mir_alias_scrutinee() {
     let suffix = std::process::id();
     let output = run_fixture_with_cache_and_env(
         "pass_semantic_match_local_alias_postcondition",

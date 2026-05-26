@@ -1722,9 +1722,12 @@ impl MirFunctionSummary {
             .filter_map(|assignment| {
                 let scrutinee_place = mir_discriminant(&assignment.expression)?;
                 let scrutinee = self
-                    .local_name_for_place(scrutinee_place)
-                    .unwrap_or(scrutinee_place)
-                    .to_string();
+                    .normalized_mir_expression_with_models(scrutinee_place, model_fields)
+                    .or_else(|| {
+                        self.local_name_for_place(scrutinee_place)
+                            .map(ToString::to_string)
+                    })
+                    .unwrap_or_else(|| scrutinee_place.to_string());
                 let scrutinee_type = self
                     .type_for_place(scrutinee_place)
                     .map(ToString::to_string)
@@ -3613,7 +3616,7 @@ fn alias_unwrap_or_zero(_1: Option<i32>) -> i32 {
         assert_eq!(
             summary.semantic_matches(&[]),
             vec![SemanticMatch {
-                scrutinee: "y".to_string(),
+                scrutinee: "x".to_string(),
                 scrutinee_type: "Option<i32>".to_string(),
                 arms: vec![
                     SemanticMatchArm {
