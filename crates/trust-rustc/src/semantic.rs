@@ -1297,7 +1297,35 @@ impl MirFunctionSummary {
             })
             .collect::<Vec<_>>();
         calls.extend(self.semantic_len_calls_with_models(model_fields));
+        calls.extend(self.semantic_unsupported_shift_calls_with_models(model_fields));
         calls
+    }
+
+    fn semantic_unsupported_shift_calls_with_models(
+        &self,
+        model_fields: &[ModelFieldMap],
+    ) -> Vec<SemanticCall> {
+        self.assignments
+            .iter()
+            .filter_map(|assignment| {
+                let (operator, args) = mir_unsupported_shift_operation(&assignment.expression)?;
+                let [left, right] = args.as_slice() else {
+                    return None;
+                };
+                let left = self.normalized_mir_expression_with_models(left, model_fields)?;
+                let right = self.normalized_mir_expression_with_models(right, model_fields)?;
+                Some(SemanticCall {
+                    callee: format!("{left} {operator} {right}"),
+                    trust_callee: None,
+                    args: vec![left, right],
+                    guards: assignment
+                        .block
+                        .as_deref()
+                        .map(|block| self.guards_for_block_with_models(block, model_fields))
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
     fn semantic_field_accesses(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticFieldAccess> {
@@ -1956,6 +1984,17 @@ fn mir_checked_arithmetic_operation(expr: &str) -> Option<(SemanticArithmeticKin
         _ => return None,
     };
     Some((kind, parse_mir_call_args(args)))
+}
+
+fn mir_unsupported_shift_operation(expr: &str) -> Option<(&'static str, Vec<String>)> {
+    let (op, args) = expr.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    let operator = match op.trim() {
+        "Shl" => "<<",
+        "Shr" => ">>",
+        _ => return None,
+    };
+    Some((operator, parse_mir_call_args(args)))
 }
 
 fn mir_comparison_operator(op: &str) -> Option<&'static str> {
@@ -3585,6 +3624,34 @@ fn verified::caller(_1: i32) -> i32 {
             vec![SemanticCall {
                 callee: "verified::inc".to_string(),
                 args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_unsupported_shift_operation_as_semantic_call() {
+        let mir = r#"
+fn shift_left(_1: u32, _2: u32) -> u32 {
+    debug x => _1;
+    debug n => _2;
+    let mut _0: u32;
+
+    bb0: {
+        _0 = Shl(copy _1, copy _2);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "shift_left").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "x << n".to_string(),
+                args: vec!["x".to_string(), "n".to_string()],
                 guards: Vec::new(),
                 trust_callee: None,
             }]
