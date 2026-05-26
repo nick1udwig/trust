@@ -244,6 +244,11 @@ fn verifier_semantics(
             let metadata_item = metadata.iter().find(|metadata_item| {
                 metadata_item.item_kind == "total" && metadata_item.item_id == item.item_id
             })?;
+            let mut contract_bindings =
+                semantic_contract_bindings(metadata_item, mir_function, &model_fields);
+            contract_bindings.extend(semantic_local_bindings(mir_function));
+            let contract_bindings = dedup_contract_bindings(contract_bindings);
+
             Some(TrustFunctionSemantics {
                 rust_function_path: item.rust_function_path.clone(),
                 params: mir_function
@@ -259,11 +264,7 @@ fn verifier_semantics(
                     .collect(),
                 return_type: mir_function.return_type.clone(),
                 local_types: mir_function.source_local_types(),
-                contract_bindings: semantic_contract_bindings(
-                    metadata_item,
-                    mir_function,
-                    &model_fields,
-                ),
+                contract_bindings,
                 return_expression: mir_function
                     .normalized_return_expression_with_models(&model_fields),
                 arithmetic_operations: mir_function
@@ -375,6 +376,25 @@ fn semantic_contract_bindings(
             model_fields,
         ));
     }
+
+    dedup_contract_bindings(bindings)
+}
+
+fn semantic_local_bindings(mir_function: &MirFunctionSummary) -> Vec<SemanticContractBinding> {
+    let bindings = mir_function
+        .debug_locals
+        .iter()
+        .filter(|local| !mir_function.is_arg_place(&local.place) && is_ident_token(&local.name))
+        .filter_map(|local| {
+            let ty = mir_function.mir_expression_type(&local.place, &[])?;
+            Some(SemanticContractBinding {
+                expression: local.name.clone(),
+                name: local.name.clone(),
+                kind: SemanticContractBindingKind::Local,
+                ty,
+            })
+        })
+        .collect();
 
     dedup_contract_bindings(bindings)
 }
@@ -495,6 +515,7 @@ fn contract_binding_kind_name(kind: SemanticContractBindingKind) -> &'static str
         SemanticContractBindingKind::Param => "param",
         SemanticContractBindingKind::Result => "result",
         SemanticContractBindingKind::Field => "field",
+        SemanticContractBindingKind::Local => "local",
     }
 }
 
@@ -2524,7 +2545,7 @@ fn semantic_summary(
             item.mir_match
         ));
         if let Some(mir_function) = &item.mir_function {
-            let contract_bindings = metadata
+            let mut contract_bindings = metadata
                 .iter()
                 .find(|metadata_item| {
                     metadata_item.item_kind == item.item_kind
@@ -2534,6 +2555,8 @@ fn semantic_summary(
                     semantic_contract_bindings(metadata_item, mir_function, &model_fields)
                 })
                 .unwrap_or_default();
+            contract_bindings.extend(semantic_local_bindings(mir_function));
+            let contract_bindings = dedup_contract_bindings(contract_bindings);
             let return_expr = mir_function
                 .normalized_return_expression_with_models(&model_fields)
                 .or_else(|| mir_function.return_expr.clone())
@@ -3834,6 +3857,36 @@ fn keep(_1: i32) -> i32 {
         assert_eq!(
             summary.source_local_types(),
             vec!["i32".to_string(), "f32".to_string(), "u32".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_source_local_bindings_from_mir_debug_locals() {
+        let mir = r#"
+fn keep(_1: i32) -> i32 {
+    debug x => _1;
+    debug count => _2;
+    let mut _0: i32;
+    let _2: u32;
+
+    bb0: {
+        _2 = const 1_u32;
+        _0 = copy _1;
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "keep").expect("MIR summary");
+
+        assert_eq!(
+            semantic_local_bindings(&summary),
+            vec![SemanticContractBinding {
+                expression: "count".to_string(),
+                name: "count".to_string(),
+                kind: SemanticContractBindingKind::Local,
+                ty: "u32".to_string(),
+            }]
         );
     }
 

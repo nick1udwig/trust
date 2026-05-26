@@ -39,6 +39,7 @@ pub enum SemanticContractBindingKind {
     Param,
     Result,
     Field,
+    Local,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1135,8 +1136,10 @@ fn verification_value_params(
         });
     }
     for binding in &semantics.contract_bindings {
-        if binding.kind != SemanticContractBindingKind::Field
-            || value_params.iter().any(|param| param.name == binding.name)
+        if !matches!(
+            binding.kind,
+            SemanticContractBindingKind::Field | SemanticContractBindingKind::Local
+        ) || value_params.iter().any(|param| param.name == binding.name)
         {
             continue;
         }
@@ -6041,6 +6044,51 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn semantic_local_binding_proves_local_loop_measure_and_postcondition() {
+        let metadata = metadata_named_with_classes(
+            "countdown_local",
+            "pub fn countdown_local(n: usize) -> usize { let mut i = n; trust::loop_spec! { invariant(i >= 0); decreases(i); } while i > 0 { i -= 1; } i }",
+            &["out == 0"],
+            &["gives executable"],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown_local".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: vec!["usize".to_string()],
+            contract_bindings: vec![SemanticContractBinding {
+                expression: "i".to_string(),
+                name: "i".to_string(),
+                kind: SemanticContractBindingKind::Local,
+                ty: "usize".to_string(),
+            }],
+            return_expression: Some("i".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                ty: Some("usize".to_string()),
+                target: Some("i".to_string()),
+                left: "i".to_string(),
+                right: Some("1".to_string()),
+                expression: "i - 1".to_string(),
+                guards: vec!["i > 0".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Ok(())
+        );
     }
 
     #[test]
