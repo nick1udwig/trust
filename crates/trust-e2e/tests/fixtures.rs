@@ -962,12 +962,82 @@ fn fail_option_unwrap_is_rejected_by_wrapper_verifier() {
 }
 
 #[test]
+fn fail_semantic_option_unwrap_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_option_unwrap_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "fail_option_unwrap",
+        Expected::Fail,
+        &format!("fail_semantic_option_unwrap_{suffix}"),
+        &format!("fail_semantic_option_unwrap_{suffix}"),
+        &[
+            ("TRUST_SEMANTIC_VERIFY", "1"),
+            ("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str),
+        ],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains(
+        "error[trust]: unchecked unwrap is not supported; prove Some or use match",
+    );
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("calls=Option::<i32>::unwrap(x)"));
+}
+
+#[test]
 fn fail_result_expect_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_result_expect", Expected::Fail);
 
     output.assert_contains(
         "error[trust]: unchecked unwrap is not supported; prove Some or use match",
     );
+}
+
+#[test]
+fn fail_semantic_result_expect_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_result_expect_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "fail_result_expect",
+        Expected::Fail,
+        &format!("fail_semantic_result_expect_{suffix}"),
+        &format!("fail_semantic_result_expect_{suffix}"),
+        &[
+            ("TRUST_SEMANTIC_VERIFY", "1"),
+            ("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str),
+        ],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains(
+        "error[trust]: unchecked unwrap is not supported; prove Some or use match",
+    );
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("calls=Result::<i32, i32>::expect(x,const \"ok\")"));
 }
 
 #[test]
@@ -1240,6 +1310,40 @@ fn fail_explicit_panic_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_explicit_panic", Expected::Fail);
 
     output.assert_contains("error[trust]: explicit panic is not supported in `verified::fail`");
+}
+
+#[test]
+fn fail_semantic_explicit_panic_is_rejected_by_mir_verifier() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_explicit_panic_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "fail_explicit_panic",
+        Expected::Fail,
+        &format!("fail_semantic_explicit_panic_{suffix}"),
+        &format!("fail_semantic_explicit_panic_{suffix}"),
+        &[
+            ("TRUST_SEMANTIC_VERIFY", "1"),
+            ("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str),
+        ],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("error[trust]: explicit panic is not supported in `verified::fail`");
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("calls="));
+    assert!(summary.contains("panic_fmt("));
 }
 
 #[test]

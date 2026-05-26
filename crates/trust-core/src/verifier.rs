@@ -490,12 +490,12 @@ fn verify_total_with_env(
         contracts_with_assumptions(&given_contracts, &loop_postcondition_facts);
     let call_env = verification_call_env(env, semantics);
 
-    if contains_unchecked_unwrap(raw_body) {
+    if contains_unchecked_unwrap(raw_body) || contains_semantic_unchecked_unwrap(semantics) {
         return Err(VerificationError::UncheckedUnwrap {
             function: metadata.rust_function_path.clone(),
         });
     }
-    if contains_explicit_panic(raw_body) {
+    if contains_explicit_panic(raw_body) || contains_semantic_explicit_panic(semantics) {
         return Err(VerificationError::ExplicitPanic {
             function: metadata.rust_function_path.clone(),
         });
@@ -3446,6 +3446,37 @@ fn contains_explicit_panic(body: &str) -> bool {
         };
         matches!(name.as_str(), "panic" | "todo" | "unimplemented") && bang == "!" && open == "("
     })
+}
+
+fn contains_semantic_unchecked_unwrap(semantics: Option<&TrustFunctionSemantics>) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics
+            .calls
+            .iter()
+            .any(|call| semantic_call_is_unchecked_unwrap(&call.callee))
+    })
+}
+
+fn semantic_call_is_unchecked_unwrap(callee: &str) -> bool {
+    let leaf = function_leaf_name(callee);
+    matches!(leaf, "unwrap" | "expect")
+        && (callee.starts_with("Option::<") || callee.starts_with("Result::<"))
+}
+
+fn contains_semantic_explicit_panic(semantics: Option<&TrustFunctionSemantics>) -> bool {
+    semantics.into_iter().any(|semantics| {
+        semantics
+            .calls
+            .iter()
+            .any(|call| semantic_call_is_explicit_panic(&call.callee))
+    })
+}
+
+fn semantic_call_is_explicit_panic(callee: &str) -> bool {
+    matches!(
+        function_leaf_name(callee),
+        "panic_fmt" | "panic_display" | "panic_str" | "begin_panic" | "begin_panic_fmt"
+    )
 }
 
 fn contains_closure(body: &str) -> bool {
@@ -6423,6 +6454,44 @@ mod tests {
     }
 
     #[test]
+    fn semantic_call_rejects_unchecked_option_unwrap() {
+        let metadata = metadata_named(
+            "bad_unwrap",
+            "pub fn bad_unwrap(x: Option<i32>) -> i32 { 0 }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "bad_unwrap".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Option<i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("Option::<i32>::unwrap(x)".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "Option::<i32>::unwrap".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::UncheckedUnwrap {
+                function: "bad_unwrap".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_unchecked_result_expect() {
         let metadata = metadata_named(
             "bad_expect",
@@ -6432,6 +6501,44 @@ mod tests {
 
         assert_eq!(
             verify_total(&metadata),
+            Err(VerificationError::UncheckedUnwrap {
+                function: "bad_expect".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_call_rejects_unchecked_result_expect() {
+        let metadata = metadata_named(
+            "bad_expect",
+            "pub fn bad_expect(x: Result<i32, i32>) -> i32 { 0 }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "bad_expect".to_string(),
+            params: vec![SemanticParam {
+                name: "x".to_string(),
+                ty: "Result<i32, i32>".to_string(),
+            }],
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("Result::<i32, i32>::expect(x,const \"ok\")".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "Result::<i32, i32>::expect".to_string(),
+                args: vec!["x".to_string(), "const \"ok\"".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Err(VerificationError::UncheckedUnwrap {
                 function: "bad_expect".to_string(),
             })
@@ -6655,6 +6762,37 @@ mod tests {
 
         assert_eq!(
             verify_total(&metadata),
+            Err(VerificationError::ExplicitPanic {
+                function: "fail".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_call_rejects_explicit_panic() {
+        let metadata = metadata_named("fail", "pub fn fail() -> i32 { 0 }", &[]);
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "fail".to_string(),
+            params: Vec::new(),
+            return_type: "i32".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: None,
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: vec![SemanticCall {
+                callee: "core::panicking::panic_fmt".to_string(),
+                args: vec!["message".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }],
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Err(VerificationError::ExplicitPanic {
                 function: "fail".to_string(),
             })
