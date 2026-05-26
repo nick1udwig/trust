@@ -2949,7 +2949,7 @@ fn multiplication_obligation_proved(
     let z3_upper_proved = z3_proves_conclusion(&upper_numeric, contracts, params, options)
         .is_some_and(|proved| proved);
 
-    if ty == "usize" {
+    if is_unsigned_integer(ty) {
         return z3_upper_proved || upper_proved;
     }
 
@@ -3215,17 +3215,23 @@ fn complex_denominator_expression(
 }
 
 fn is_supported_integer(ty: &str) -> bool {
-    matches!(ty, "i32" | "i64" | "usize")
+    matches!(ty, "i32" | "i64" | "u32" | "u64" | "usize")
 }
 
 fn is_signed_integer(ty: &str) -> bool {
     matches!(ty, "i32" | "i64")
 }
 
+fn is_unsigned_integer(ty: &str) -> bool {
+    matches!(ty, "u32" | "u64" | "usize")
+}
+
 fn max_value(ty: &str, target_pointer_width: Option<u32>) -> Option<i128> {
     match ty {
         "i32" => Some(i32::MAX as i128),
         "i64" => Some(i64::MAX as i128),
+        "u32" => Some(u32::MAX as i128),
+        "u64" => Some(u64::MAX as i128),
         "usize" => Some(usize_max_value(target_pointer_width)),
         _ => None,
     }
@@ -3244,6 +3250,7 @@ fn min_value(ty: &str) -> Option<i128> {
     match ty {
         "i32" => Some(i32::MIN as i128),
         "i64" => Some(i64::MIN as i128),
+        "u32" | "u64" => Some(0),
         "usize" => Some(0),
         _ => None,
     }
@@ -3319,6 +3326,8 @@ fn constant_with_type(value: i128, ty: &str) -> String {
     match (value, ty) {
         (2147483646, "i32") => "i32::MAX-1".to_string(),
         (9223372036854775806, "i64") => "i64::MAX-1".to_string(),
+        (4294967294, "u32") => "u32::MAX-1".to_string(),
+        (18446744073709551614, "u64") => "u64::MAX-1".to_string(),
         _ => value.to_string(),
     }
 }
@@ -3782,6 +3791,34 @@ mod tests {
         );
 
         assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn proves_u32_add_one_from_executable_precondition() {
+        let metadata = metadata_named(
+            "add_one_u32",
+            "pub fn add_one_u32(x: u32) -> u32 { x + 1 }",
+            &["x < u32::MAX"],
+        );
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+    }
+
+    #[test]
+    fn rejects_unproved_u32_add_one() {
+        let metadata = metadata_named(
+            "add_one_u32",
+            "pub fn add_one_u32(x: u32) -> u32 { x + 1 }",
+            &[],
+        );
+
+        assert_eq!(
+            verify_total(&metadata),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "add_one_u32".to_string(),
+                expression: "x + 1".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -5396,6 +5433,44 @@ mod tests {
             Err(VerificationError::IntegerAdditionOverflow {
                 function: "overflow".to_string(),
                 expression: "i32::MAX + 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_arithmetic_uses_mir_u32_type_for_constant_addition_overflow() {
+        let metadata = metadata_named(
+            "overflow_u32",
+            "pub fn overflow_u32() -> u32 { let x: u32 = u32::MAX; x + 1 }",
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "overflow_u32".to_string(),
+            params: Vec::new(),
+            return_type: "u32".to_string(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("u32::MAX + 1".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Add,
+                ty: Some("u32".to_string()),
+                left: "u32::MAX".to_string(),
+                right: Some("1".to_string()),
+                expression: "u32::MAX + 1".to_string(),
+                guards: Vec::new(),
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::IntegerAdditionOverflow {
+                function: "overflow_u32".to_string(),
+                expression: "u32::MAX + 1".to_string(),
             })
         );
     }

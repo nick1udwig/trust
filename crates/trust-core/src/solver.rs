@@ -373,13 +373,15 @@ fn symbol_name(name: &str) -> String {
 }
 
 fn is_supported_integer(ty: &str) -> bool {
-    matches!(ty, "i32" | "i64" | "usize")
+    matches!(ty, "i32" | "i64" | "u32" | "u64" | "usize")
 }
 
 fn max_value(ty: &str, target_pointer_width: Option<u32>) -> Option<i128> {
     match ty {
         "i32" => Some(i32::MAX as i128),
         "i64" => Some(i64::MAX as i128),
+        "u32" => Some(u32::MAX as i128),
+        "u64" => Some(u64::MAX as i128),
         "usize" => Some(usize_max_value(target_pointer_width)),
         _ => None,
     }
@@ -389,6 +391,7 @@ fn min_value(ty: &str) -> Option<i128> {
     match ty {
         "i32" => Some(i32::MIN as i128),
         "i64" => Some(i64::MIN as i128),
+        "u32" | "u64" => Some(0),
         "usize" => Some(0),
         _ => None,
     }
@@ -400,6 +403,10 @@ fn rust_integer_bound(input: &str, target_pointer_width: Option<u32>) -> Option<
         "i32::MIN" => Some(i32::MIN as i128),
         "i64::MAX" => Some(i64::MAX as i128),
         "i64::MIN" => Some(i64::MIN as i128),
+        "u32::MAX" => Some(u32::MAX as i128),
+        "u32::MIN" => Some(0),
+        "u64::MAX" => Some(u64::MAX as i128),
+        "u64::MIN" => Some(0),
         "usize::MAX" => Some(usize_max_value(target_pointer_width)),
         "usize::MIN" => Some(0),
         _ => None,
@@ -452,6 +459,15 @@ mod tests {
         assert_eq!(
             parse_const_expr("usize::MAX/2", Some(16)),
             Some(u16::MAX as i128 / 2)
+        );
+    }
+
+    #[test]
+    fn parses_unsigned_rust_bounds_as_constants() {
+        assert_eq!(parse_const_expr("u32::MAX-1", None), Some(4294967294));
+        assert_eq!(
+            parse_const_expr("u64::MAX/2", None),
+            Some(u64::MAX as i128 / 2)
         );
     }
 

@@ -734,6 +734,14 @@ fn pass_i64_add_one_precondition_proves_overflow_safety() {
 }
 
 #[test]
+fn pass_u32_add_one_precondition_proves_overflow_safety() {
+    let output = run_fixture("pass_u32_add_one_precondition", Expected::Pass);
+
+    output.assert_contains("trust: discovered 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+}
+
+#[test]
 fn pass_sub_one_precondition_proves_i32_overflow_safety() {
     let output = run_fixture("pass_sub_one_precondition", Expected::Pass);
 
@@ -1461,6 +1469,13 @@ fn pass_semantic_block_call_precondition_uses_mir_call_args() {
 #[test]
 fn fail_i64_overflow_unproved_is_rejected_by_wrapper_verifier() {
     let output = run_fixture("fail_i64_overflow_unproved", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+}
+
+#[test]
+fn fail_u32_overflow_unproved_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_u32_overflow_unproved", Expected::Fail);
 
     output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
 }
