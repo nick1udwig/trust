@@ -509,6 +509,7 @@ fn verify_total_with_env(
     let loop_facts = verify_loops(
         raw_body,
         &metadata.rust_function_path,
+        &metadata.loop_specs,
         semantics,
         &given_contracts,
         &value_params,
@@ -3304,19 +3305,21 @@ fn semantic_field_access_extraction_gap(
 fn verify_loops(
     body: &str,
     function: &str,
+    metadata_loop_specs: &[String],
     semantics: Option<&TrustFunctionSemantics>,
     contracts: &[String],
     params: &[Param],
     options: VerificationOptions,
 ) -> Result<Vec<LoopFact>, VerificationError> {
-    let tokens = tokens(body);
+    let body_tokens = tokens(body);
+    let mut metadata_loop_specs = metadata_loop_specs.iter();
     let mut facts = Vec::new();
     let mut pending_spec = None;
     let mut idx = 0;
 
-    while idx < tokens.len() {
-        if let Some(open_idx) = loop_spec_open_idx(&tokens, idx) {
-            let Some(close_idx) = matching_token_group(&tokens, open_idx, "{", "}") else {
+    while idx < body_tokens.len() {
+        if let Some(open_idx) = loop_spec_open_idx(&body_tokens, idx) {
+            let Some(close_idx) = matching_token_group(&body_tokens, open_idx, "{", "}") else {
                 idx += 1;
                 continue;
             };
@@ -3325,12 +3328,23 @@ fn verify_loops(
                     function: function.to_string(),
                 });
             }
-            pending_spec = Some(parse_loop_spec(&tokens[open_idx + 1..close_idx]));
+            pending_spec = Some(if semantics.is_some() {
+                let Some(spec) = metadata_loop_specs.next() else {
+                    return Err(VerificationError::SemanticExtractionIncomplete {
+                        function: function.to_string(),
+                        category: "loop spec".to_string(),
+                        expression: token_expression(&body_tokens[open_idx + 1..close_idx]),
+                    });
+                };
+                parse_loop_spec(&tokens(spec))
+            } else {
+                parse_loop_spec(&body_tokens[open_idx + 1..close_idx])
+            });
             idx = close_idx + 1;
             continue;
         }
 
-        if tokens[idx] != "while" {
+        if body_tokens[idx] != "while" {
             idx += 1;
             continue;
         }
@@ -3340,7 +3354,7 @@ fn verify_loops(
                 function: function.to_string(),
             });
         };
-        let Some(body_open_idx) = tokens[idx + 1..]
+        let Some(body_open_idx) = body_tokens[idx + 1..]
             .iter()
             .position(|token| token == "{")
             .map(|offset| idx + 1 + offset)
@@ -3348,14 +3362,15 @@ fn verify_loops(
             idx += 1;
             continue;
         };
-        let Some(body_close_idx) = matching_token_group(&tokens, body_open_idx, "{", "}") else {
+        let Some(body_close_idx) = matching_token_group(&body_tokens, body_open_idx, "{", "}")
+        else {
             idx += 1;
             continue;
         };
 
-        let condition = token_expression(&tokens[idx + 1..body_open_idx]);
-        let loop_body = &tokens[body_open_idx + 1..body_close_idx];
-        let prefix = &tokens[..idx];
+        let condition = token_expression(&body_tokens[idx + 1..body_open_idx]);
+        let loop_body = &body_tokens[body_open_idx + 1..body_close_idx];
+        let prefix = &body_tokens[..idx];
         let invariants = verify_loop_spec(
             &spec, &condition, loop_body, prefix, function, semantics, contracts, params, options,
         )?;
@@ -3371,6 +3386,16 @@ fn verify_loops(
         return Err(VerificationError::LoopMissingSpec {
             function: function.to_string(),
         });
+    }
+
+    if semantics.is_some() {
+        if let Some(spec) = metadata_loop_specs.next() {
+            return Err(VerificationError::SemanticExtractionIncomplete {
+                function: function.to_string(),
+                category: "loop spec".to_string(),
+                expression: spec.clone(),
+            });
+        }
     }
 
     Ok(facts)
@@ -5871,6 +5896,7 @@ mod tests {
             contract_classes: classes.iter().map(|class| class.to_string()).collect(),
             assertion_policy: "always".to_string(),
             function_source: function_source.to_string(),
+            loop_specs: loop_specs_from_source(function_source),
             body_hash_placeholder: format!("{name}-hash"),
             trust_model_dependencies: Vec::new(),
         }
@@ -5891,6 +5917,7 @@ mod tests {
             contract_classes: Vec::new(),
             assertion_policy: "always".to_string(),
             function_source: format!("pub struct {name} {{ pub balance: i64 }}"),
+            loop_specs: Vec::new(),
             body_hash_placeholder: format!("{name}-hash"),
             trust_model_dependencies: Vec::new(),
         }
@@ -5911,6 +5938,7 @@ mod tests {
             contract_classes: Vec::new(),
             assertion_policy: "always".to_string(),
             function_source: function_source.to_string(),
+            loop_specs: Vec::new(),
             body_hash_placeholder: format!("{name}-hash"),
             trust_model_dependencies: Vec::new(),
         }
@@ -5943,9 +5971,32 @@ mod tests {
             contract_classes: vec!["gives ghost".to_string(); contracts.len()],
             assertion_policy: "always".to_string(),
             function_source: function_source.to_string(),
+            loop_specs: Vec::new(),
             body_hash_placeholder: format!("{name}-hash"),
             trust_model_dependencies: Vec::new(),
         }
+    }
+
+    fn loop_specs_from_source(function_source: &str) -> Vec<String> {
+        let body = body(function_source);
+        let tokens = tokens(body);
+        let mut specs = Vec::new();
+        let mut idx = 0;
+
+        while idx < tokens.len() {
+            let Some(open_idx) = loop_spec_open_idx(&tokens, idx) else {
+                idx += 1;
+                continue;
+            };
+            let Some(close_idx) = matching_token_group(&tokens, open_idx, "{", "}") else {
+                idx += 1;
+                continue;
+            };
+            specs.push(token_expression(&tokens[open_idx + 1..close_idx]));
+            idx = close_idx + 1;
+        }
+
+        specs
     }
 
     #[test]
@@ -7006,6 +7057,51 @@ mod tests {
                 function: "countdown".to_string(),
                 category: "loop decreases".to_string(),
                 expression: "n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_semantic_loop_spec_metadata_fails_closed() {
+        let mut metadata = metadata_named_with_classes(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { n = n - 1; } n }",
+            &[],
+            &[],
+        );
+        metadata.loop_specs.clear();
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("n".to_string()),
+            arithmetic_operations: vec![SemanticArithmeticOperation {
+                kind: SemanticArithmeticKind::Sub,
+                ty: Some("usize".to_string()),
+                target: Some("n".to_string()),
+                left: "n".to_string(),
+                right: Some("1".to_string()),
+                expression: "n - 1".to_string(),
+                guards: vec!["n > 0".to_string()],
+            }],
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "countdown".to_string(),
+                category: "loop spec".to_string(),
+                expression: "decreases(n);".to_string(),
             })
         );
     }

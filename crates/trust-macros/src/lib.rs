@@ -1412,6 +1412,82 @@ fn render_runtime_assertion(policy: &str, assertion: &str) -> String {
     }
 }
 
+fn loop_specs_metadata(function_source: &str) -> Vec<String> {
+    let tokens = lex(function_source);
+    let mut specs = Vec::new();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        let Some(open_idx) = loop_spec_open_idx(&tokens, idx) else {
+            idx += 1;
+            continue;
+        };
+        let Some(close_idx) = matching_punct_group(&tokens, open_idx, '{', '}') else {
+            idx += 1;
+            continue;
+        };
+        specs.push(lex_tokens_to_string(&tokens[open_idx + 1..close_idx]));
+        idx = close_idx + 1;
+    }
+
+    specs
+}
+
+fn loop_spec_open_idx(tokens: &[LexToken], idx: usize) -> Option<usize> {
+    if matches!(tokens.get(idx), Some(LexToken::Ident(ident)) if ident == "trust")
+        && matches!(tokens.get(idx + 1), Some(LexToken::Punct(':')))
+        && matches!(tokens.get(idx + 2), Some(LexToken::Punct(':')))
+        && matches!(tokens.get(idx + 3), Some(LexToken::Ident(ident)) if ident == "loop_spec")
+        && matches!(tokens.get(idx + 4), Some(LexToken::Punct('!')))
+        && matches!(tokens.get(idx + 5), Some(LexToken::Punct('{')))
+    {
+        return Some(idx + 5);
+    }
+
+    if matches!(tokens.get(idx), Some(LexToken::Ident(ident)) if ident == "loop_spec")
+        && matches!(tokens.get(idx + 1), Some(LexToken::Punct('!')))
+        && matches!(tokens.get(idx + 2), Some(LexToken::Punct('{')))
+    {
+        return Some(idx + 2);
+    }
+
+    None
+}
+
+fn matching_punct_group(
+    tokens: &[LexToken],
+    open_idx: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
+        match token {
+            LexToken::Punct(punct) if *punct == open => depth += 1,
+            LexToken::Punct(punct) if *punct == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn lex_tokens_to_string(tokens: &[LexToken]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            LexToken::Ident(ident) => out.push_str(ident),
+            LexToken::Punct(punct) => out.push(*punct),
+        }
+    }
+    out
+}
+
 fn metadata_json(
     fn_info: &FnInfo,
     module_path: Option<&str>,
@@ -1424,8 +1500,9 @@ fn metadata_json(
     let rust_function_path = module_path
         .map(|module_path| format!("{module_path}::{}", fn_info.name))
         .unwrap_or_else(|| fn_info.name.clone());
+    let loop_specs = loop_specs_metadata(function_source);
     format!(
-        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"{assertion_policy}\",\"function_source\":\"{function_source}\",\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
+        "{{\"schema_version\":{schema},\"trust_macro_version\":\"{version}\",\"module_id\":\"{module_id}\",\"item_id\":\"total:{name}:{hash}\",\"item_kind\":\"total\",\"source_span\":\"unknown\",\"rust_function_path\":\"{rust_function_path}\",\"visibility\":\"{visibility}\",\"contracts_original\":{contracts_original},\"contracts_normalized\":{contracts_normalized},\"contract_classes\":{contract_classes},\"assertion_policy\":\"{assertion_policy}\",\"function_source\":\"{function_source}\",\"loop_specs\":{loop_specs},\"body_hash_placeholder\":\"{hash}\",\"trust_model_dependencies\":[]}}",
         schema = SCHEMA_VERSION,
         version = env!("CARGO_PKG_VERSION"),
         module_id = json_escape(module_id),
@@ -1446,6 +1523,7 @@ fn metadata_json(
                 .map(|contract| contract.expression_display.as_str())
         ),
         contract_classes = json_string_array(contracts.iter().map(|contract| contract.class)),
+        loop_specs = json_string_array(loop_specs.iter().map(String::as_str)),
     )
 }
 
@@ -1862,6 +1940,25 @@ mod tests {
         assert!(metadata.contains("\"module_id\":\"left\""));
         assert!(metadata.contains("\"rust_function_path\":\"left::same\""));
         assert!(metadata.contains("\"function_source\":\"pub fn same(x: i32) -> i32 { x }\""));
+    }
+
+    #[test]
+    fn total_metadata_records_loop_specs() {
+        let source = "pub fn count_to(n: usize) -> usize { let mut i = 0; trust::loop_spec! { invariant(i <= n); decreases(n - i); } while i < n { i += 1; } i }";
+        let total = parse_total_source(source).unwrap();
+        let metadata = metadata_json(
+            &total.fn_info,
+            total.module_path.as_deref(),
+            source,
+            &total.fn_source,
+            &total.contracts,
+        );
+
+        assert_eq!(
+            loop_specs_metadata(&total.fn_source),
+            vec!["invariant(i<=n);decreases(n-i);".to_string()]
+        );
+        assert!(metadata.contains("\"loop_specs\":[\"invariant(i<=n);decreases(n-i);\"]"));
     }
 
     #[test]

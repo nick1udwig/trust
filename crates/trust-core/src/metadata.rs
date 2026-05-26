@@ -17,6 +17,7 @@ pub struct TrustMetadata {
     pub contract_classes: Vec<String>,
     pub assertion_policy: String,
     pub function_source: String,
+    pub loop_specs: Vec<String>,
     pub body_hash_placeholder: String,
     pub trust_model_dependencies: Vec<String>,
 }
@@ -66,6 +67,7 @@ pub fn parse_metadata_line(line: &str) -> Result<TrustMetadata, MetadataError> {
         contract_classes: extract_string_array(line, "contract_classes")?,
         assertion_policy: extract_string(line, "assertion_policy")?,
         function_source: extract_string(line, "function_source")?,
+        loop_specs: extract_optional_string_array(line, "loop_specs")?,
         body_hash_placeholder: extract_string(line, "body_hash_placeholder")?,
         trust_model_dependencies: extract_string_array(line, "trust_model_dependencies")?,
     })
@@ -178,6 +180,17 @@ fn extract_string_array(input: &str, field: &'static str) -> Result<Vec<String>,
     }
 }
 
+fn extract_optional_string_array(
+    input: &str,
+    field: &'static str,
+) -> Result<Vec<String>, MetadataError> {
+    if !input.contains(&format!("\"{field}\"")) {
+        return Ok(Vec::new());
+    }
+
+    extract_string_array(input, field)
+}
+
 fn after_field_colon<'a>(input: &'a str, field: &'static str) -> Result<&'a str, MetadataError> {
     let needle = format!("\"{field}\"");
     let field_start = input
@@ -214,6 +227,7 @@ mod tests {
         assert_eq!(metadata.contract_classes, ["given executable"]);
         assert_eq!(metadata.assertion_policy, "always");
         assert_eq!(metadata.function_source, "pub fn id(x: i32) -> i32 { x }");
+        assert!(metadata.loop_specs.is_empty());
         assert_eq!(metadata.body_hash_placeholder, "abc");
         assert_eq!(metadata.trust_model_dependencies, ["Model"]);
     }
@@ -235,7 +249,21 @@ mod tests {
         assert!(metadata.contracts_original.is_empty());
         assert!(metadata.contracts_normalized.is_empty());
         assert!(metadata.contract_classes.is_empty());
+        assert!(metadata.loop_specs.is_empty());
         assert!(metadata.trust_model_dependencies.is_empty());
+    }
+
+    #[test]
+    fn parses_optional_loop_specs() {
+        let metadata = parse_metadata_line(
+            r#"{"schema_version":1,"trust_macro_version":"0.1.0","module_id":"unknown","item_id":"total:count:test","item_kind":"total","source_span":"unknown","rust_function_path":"count","visibility":"public","contracts_original":[],"contracts_normalized":[],"contract_classes":[],"assertion_policy":"always","function_source":"pub fn count() {}","loop_specs":["invariant(i<=n);decreases(n-i);"],"body_hash_placeholder":"abc","trust_model_dependencies":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            metadata.loop_specs,
+            ["invariant(i<=n);decreases(n-i);".to_string()]
+        );
     }
 
     #[test]

@@ -5634,6 +5634,7 @@ fn left::caller(_1: i32) -> i32 {
             contract_classes: vec!["given executable".to_string()],
             assertion_policy: "always".to_string(),
             function_source: "pub fn inc(x: i32) -> i32 { x + 1 }".to_string(),
+            loop_specs: Vec::new(),
             body_hash_placeholder: "test".to_string(),
             trust_model_dependencies: Vec::new(),
         }];
@@ -5699,6 +5700,7 @@ fn left::caller(_1: i32) -> i32 {
             assertion_policy: "always".to_string(),
             function_source:
                 "pub fn withdraw(account: Account, amount: i64) -> Account { account }".to_string(),
+            loop_specs: Vec::new(),
             body_hash_placeholder: "test".to_string(),
             trust_model_dependencies: Vec::new(),
         };

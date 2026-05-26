@@ -1077,6 +1077,7 @@ mod tests {
             contract_classes: Vec::new(),
             assertion_policy: "always".to_string(),
             function_source: format!("pub fn {path}() {{}}"),
+            loop_specs: Vec::new(),
             body_hash_placeholder: format!("{path}-hash"),
             trust_model_dependencies: Vec::new(),
         }

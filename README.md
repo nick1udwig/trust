@@ -26,6 +26,8 @@ Implemented:
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
 - cfg-aware source-token fallback for supported `#[cfg]` predicates, aligned with
   the rustc-selected body used by HIR/MIR extraction
+- macro-emitted `loop_spec` metadata for semantic loop verification, with
+  fail-closed diagnostics if semantic verification sees token-only loop specs
 - MIR-backed arithmetic, slice-index, Trust-call, field-access, loop-invariant,
   loop-decreases, loop-exit, and return postcondition VCs when semantic
   extraction is available, with fail-closed diagnostics for token-only gaps
@@ -66,9 +68,10 @@ Still intentionally limited:
   and explicit panic calls for rejection, `if` branch return facts, nested path
   assumptions, branch-assignment and carried-local return facts at simple MIR
   joins including same-block copy chains,
-  Option/Result match arms including simple local aliases, loop decreases
-  targets and loop exit facts from compiler branch guards, source-local type and
-  initializer bindings for local loop measures and invariant establishment, and
+  Option/Result match arms including simple local aliases, macro-emitted
+  loop-spec metadata, loop decreases targets and loop exit facts from compiler
+  branch guards, source-local type and initializer bindings for local loop
+  measures and invariant establishment, and
   TrustModel field projections,
   including through unambiguous local aliases, field types, missing-TrustModel
   field checks, unsupported shift/bitwise/cast-operation and
@@ -175,20 +178,21 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
   panic calls for rejection, `if` branch return facts, nested path assumptions,
   branch-assignment and carried-local return facts at simple MIR joins including
   same-block copy chains, Option/Result
-  match arms including simple local aliases, loop decreases targets,
-  loop exit facts, and source-local type and initializer bindings for local loop
-  measures and invariant establishment, and TrustModel field projections in returns,
+  match arms including simple local aliases, macro-emitted loop-spec metadata,
+  loop decreases targets, loop exit facts, and source-local type and initializer
+  bindings for local loop measures and invariant establishment, and TrustModel field projections in returns,
   unambiguous local aliases, and path guards plus field types for arithmetic
   obligations, missing-TrustModel checks, and unsupported
   shift/bitwise/cast-operation, signature/source-local type checks, and opaque
   contract-reasoning checks, into verification. Source-token fallback prunes
   cfg-disabled body fragments for supported `#[cfg]` predicates. Arithmetic,
   parameter/return-type mapping, slice-index, Trust-call, field-access,
-  loop-invariant, loop-decreases, loop-exit, return-postcondition,
-  unsupported-call, unsupported-index, unchecked unwrap/expect, explicit panic,
-  and closure checks come from MIR facts when semantic extraction is available;
-  token-only obligations, proofs, or checks in those categories fail closed as
-  incomplete semantic extraction.
+  loop-spec metadata, loop-invariant, loop-decreases, loop-exit,
+  return-postcondition, unsupported-call, unsupported-index, unchecked
+  unwrap/expect, explicit panic, and closure checks come from macro metadata or
+  MIR facts when semantic extraction is available; token-only obligations,
+  proofs, or checks in those categories fail closed as incomplete semantic
+  extraction.
 - `TRUST_SOLVER_VERSION=...`: test/debug override for solver-version cache keys.
 - `TRUST_SOLVER_STATUS=proved|counterexample|unknown|timeout|solver_error`: mock solver status for tests.
 
