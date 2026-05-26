@@ -1307,25 +1307,77 @@ impl MirFunctionSummary {
     ) -> Vec<SemanticCall> {
         self.assignments
             .iter()
-            .filter_map(|assignment| {
-                let (operator, args) = mir_unsupported_binary_operation(&assignment.expression)?;
-                let [left, right] = args.as_slice() else {
-                    return None;
-                };
-                let left = self.normalized_mir_expression_with_models(left, model_fields)?;
-                let right = self.normalized_mir_expression_with_models(right, model_fields)?;
-                Some(SemanticCall {
-                    callee: format!("{left} {operator} {right}"),
-                    trust_callee: None,
-                    args: vec![left, right],
-                    guards: assignment
-                        .block
-                        .as_deref()
-                        .map(|block| self.guards_for_block_with_models(block, model_fields))
-                        .unwrap_or_default(),
-                })
+            .flat_map(|assignment| {
+                let guards = assignment
+                    .block
+                    .as_deref()
+                    .map(|block| self.guards_for_block_with_models(block, model_fields))
+                    .unwrap_or_default();
+                let mut calls = Vec::new();
+
+                if let Some((operator, args)) =
+                    mir_unsupported_binary_operation(&assignment.expression)
+                {
+                    if let [left, right] = args.as_slice() {
+                        if let (Some(left), Some(right)) = (
+                            self.normalized_mir_expression_with_models(left, model_fields),
+                            self.normalized_mir_expression_with_models(right, model_fields),
+                        ) {
+                            calls.push(SemanticCall {
+                                callee: format!("{left} {operator} {right}"),
+                                trust_callee: None,
+                                args: vec![left, right],
+                                guards: guards.clone(),
+                            });
+                        }
+                    }
+                }
+
+                if let Some((operator, value)) =
+                    self.mir_unsupported_unary_operation(&assignment.expression, model_fields)
+                {
+                    if let Some(value) =
+                        self.normalized_mir_expression_with_models(value, model_fields)
+                    {
+                        calls.push(SemanticCall {
+                            callee: format!("{operator}{value}"),
+                            trust_callee: None,
+                            args: vec![value],
+                            guards: guards.clone(),
+                        });
+                    }
+                }
+
+                if let Some((value, ty, cast_kind)) = mir_unsupported_cast(&assignment.expression) {
+                    if let Some(value) =
+                        self.normalized_mir_expression_with_models(value, model_fields)
+                    {
+                        calls.push(SemanticCall {
+                            callee: format!("{value} as {ty} ({cast_kind})"),
+                            trust_callee: None,
+                            args: vec![value],
+                            guards,
+                        });
+                    }
+                }
+
+                calls
             })
             .collect()
+    }
+
+    fn mir_unsupported_unary_operation<'a>(
+        &self,
+        expr: &'a str,
+        model_fields: &[ModelFieldMap],
+    ) -> Option<(&'static str, &'a str)> {
+        let (operator, value) = mir_unsupported_unary_operation(expr)?;
+        let ty = self.mir_expression_type(value, model_fields);
+        if ty.as_deref() == Some("bool") {
+            return None;
+        }
+
+        Some((operator, value))
     }
 
     fn semantic_field_accesses(&self, model_fields: &[ModelFieldMap]) -> Vec<SemanticFieldAccess> {
@@ -1998,6 +2050,17 @@ fn mir_unsupported_binary_operation(expr: &str) -> Option<(&'static str, Vec<Str
         _ => return None,
     };
     Some((operator, parse_mir_call_args(args)))
+}
+
+fn mir_unsupported_unary_operation(expr: &str) -> Option<(&'static str, &str)> {
+    let value = expr.strip_prefix("Not(")?.strip_suffix(')')?.trim();
+    Some(("!", value))
+}
+
+fn mir_unsupported_cast(expr: &str) -> Option<(&str, &str, &str)> {
+    let (value, cast) = expr.rsplit_once(" as ")?;
+    let (ty, cast_kind) = cast.rsplit_once(" (")?;
+    Some((value.trim(), ty.trim(), cast_kind.strip_suffix(')')?.trim()))
 }
 
 fn mir_comparison_operator(op: &str) -> Option<&'static str> {
@@ -3683,6 +3746,79 @@ fn bitwise_and(_1: u32, _2: u32) -> u32 {
             vec![SemanticCall {
                 callee: "x & mask".to_string(),
                 args: vec!["x".to_string(), "mask".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_unsupported_integer_not_operation_as_semantic_call() {
+        let mir = r#"
+fn bitwise_not(_1: u32) -> u32 {
+    debug x => _1;
+    let mut _0: u32;
+
+    bb0: {
+        _0 = Not(copy _1);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "bitwise_not").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "!x".to_string(),
+                args: vec!["x".to_string()],
+                guards: Vec::new(),
+                trust_callee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_supported_boolean_not_operation_as_semantic_call() {
+        let mir = r#"
+fn boolean_not(_1: bool) -> bool {
+    debug x => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = Not(copy _1);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "boolean_not").expect("MIR summary");
+
+        assert_eq!(summary.semantic_calls(), Vec::new());
+    }
+
+    #[test]
+    fn extracts_unsupported_cast_as_semantic_call() {
+        let mir = r#"
+fn narrow(_1: u64) -> u32 {
+    debug x => _1;
+    let mut _0: u32;
+
+    bb0: {
+        _0 = copy _1 as u32 (IntToInt);
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "narrow").expect("MIR summary");
+
+        assert_eq!(
+            summary.semantic_calls(),
+            vec![SemanticCall {
+                callee: "x as u32 (IntToInt)".to_string(),
+                args: vec!["x".to_string()],
                 guards: Vec::new(),
                 trust_callee: None,
             }]
