@@ -1,1 +1,1 @@
-error[trust]: could not prove callee precondition in `bad_first` for `get`: `0<xs.len()`
+error[trust]: could not prove callee precondition in `bad_first` for `verified::get`: `0<xs.len()`

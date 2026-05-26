@@ -124,7 +124,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
 - `TRUST_CACHE_DIR=/path/to/cache`: enables proof-cache reuse.
 - `TRUST_SMT_DUMP_DIR=/path/to/dumps`: writes SMT-LIB queries for z3-backed VCs.
 - `TRUST_SEMANTIC_DUMP_DIR=/path/to/dumps`: writes rustc `hir-tree`, MIR, and
-  a Trust-to-compiler-item summary for Trust crates.
+  a Trust-to-compiler-item summary for Trust crates, including resolved MIR
+  function paths when rustc exposes them.
 - `TRUST_SEMANTIC_VERIFY=0`: debug escape hatch that disables feeding default
   rustc HIR/MIR facts into verification when semantic dumps are not requested.
   By default, Trust extracts HIR/MIR for Trust verification items and feeds

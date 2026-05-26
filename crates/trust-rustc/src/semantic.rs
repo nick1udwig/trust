@@ -22,6 +22,7 @@ struct SemanticItemMatch {
     item_kind: String,
     item_id: String,
     rust_function_path: String,
+    resolved_rust_function_path: Option<String>,
     source_span: String,
     hir_match: bool,
     mir_match: bool,
@@ -30,6 +31,7 @@ struct SemanticItemMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirFunctionSummary {
+    path: String,
     args: Vec<MirArg>,
     return_type: String,
     locals: Vec<MirLocal>,
@@ -207,6 +209,9 @@ fn semantic_item_matches(
                 item_kind: item.item_kind.clone(),
                 item_id: item.item_id.clone(),
                 rust_function_path: item.rust_function_path.clone(),
+                resolved_rust_function_path: mir_function
+                    .as_ref()
+                    .map(|mir_function| mir_function.path.clone()),
                 source_span: item.source_span.clone(),
                 hir_match: hir_contains_function(hir, leaf),
                 mir_match: mir_function.is_some(),
@@ -268,7 +273,7 @@ fn semantic_trust_callees(
             })?;
             let mir_function = item.mir_function.as_ref()?;
             Some(SemanticTrustCallee {
-                rust_function_path: item.rust_function_path.clone(),
+                rust_function_path: mir_function.path.clone(),
                 params: mir_function
                     .args
                     .iter()
@@ -304,6 +309,8 @@ fn trust_callee_for_call(
         .find(|trust_callee| {
             trust_callee.rust_function_path == callee
                 || function_leaf_name(callee) == trust_callee.rust_function_path
+                || function_leaf_name(callee)
+                    == function_leaf_name(&trust_callee.rust_function_path)
         })
         .cloned()
 }
@@ -398,6 +405,7 @@ fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSumm
     let function_lines = &lines[signature_idx + 1..function_end];
 
     Some(MirFunctionSummary {
+        path: signature.path,
         args: signature.args,
         return_type: signature.return_type,
         locals: extract_mir_locals(function_lines),
@@ -1034,6 +1042,7 @@ impl MirFunctionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirSignature {
+    path: String,
     args: Vec<MirArg>,
     return_type: String,
 }
@@ -1051,7 +1060,7 @@ fn mir_signature_name(line: &str) -> Option<&str> {
 fn parse_mir_signature(line: &str) -> Option<MirSignature> {
     let rest = line.strip_prefix("fn ")?;
     let (args, rest) = rest.split_once(") -> ")?;
-    let (_name, args) = args.split_once('(')?;
+    let (path, args) = args.split_once('(')?;
     let return_type = rest
         .trim()
         .strip_suffix('{')
@@ -1059,6 +1068,7 @@ fn parse_mir_signature(line: &str) -> Option<MirSignature> {
         .trim()
         .to_string();
     Some(MirSignature {
+        path: path.trim().to_string(),
         args: parse_mir_args(args),
         return_type,
     })
@@ -1589,10 +1599,13 @@ fn semantic_summary(
     summary.push_str(&format!("semantic_items={}\n", item_matches.len()));
     for item in item_matches {
         summary.push_str(&format!(
-            "item kind={} id={} path={} span={} hir_match={} mir_match={}\n",
+            "item kind={} id={} path={} resolved_path={} span={} hir_match={} mir_match={}\n",
             item.item_kind,
             item.item_id,
             item.rust_function_path,
+            item.resolved_rust_function_path
+                .as_deref()
+                .unwrap_or("unknown"),
             item.source_span,
             item.hir_match,
             item.mir_match
@@ -1708,7 +1721,7 @@ fn semantic_summary(
                 .join(",");
             summary.push_str(&format!(
                 "mir_function path={} args={} return_type={} debug_locals={} return_expr={} arithmetic_ops={} slice_indexes={} calls={} field_accesses={} matches={} branches={}\n",
-                item.rust_function_path,
+                mir_function.path,
                 mir_function
                     .args
                     .iter()
@@ -1765,6 +1778,7 @@ fn id_i32(_1: i32) -> i32 {
         assert_eq!(
             extract_mir_function_summary(mir, "id_i32"),
             Some(MirFunctionSummary {
+                path: "id_i32".to_string(),
                 args: vec![MirArg {
                     place: "_1".to_string(),
                     ty: "i32".to_string(),
@@ -2525,6 +2539,7 @@ fn verified::caller(_1: i32) -> i32 {
 
         let summary = extract_mir_function_summary(mir, "caller").expect("MIR summary");
 
+        assert_eq!(summary.path, "verified::caller");
         assert_eq!(
             summary.semantic_calls(),
             vec![SemanticCall {
@@ -2569,6 +2584,64 @@ fn verified::caller(_1: i32) -> i32 {
                 args: vec!["x".to_string()],
                 guards: Vec::new(),
                 trust_callee: Some(trust_callee),
+            }]
+        );
+    }
+
+    #[test]
+    fn trust_callee_metadata_uses_mir_signature_path() {
+        let metadata = vec![TrustMetadata {
+            schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "unknown".to_string(),
+            item_kind: "total".to_string(),
+            item_id: "total:inc:test".to_string(),
+            source_span: "unknown".to_string(),
+            rust_function_path: "inc".to_string(),
+            visibility: "public".to_string(),
+            contracts_original: vec!["x < i32::MAX".to_string()],
+            contracts_normalized: vec!["x < i32::MAX".to_string()],
+            contract_classes: vec!["given executable".to_string()],
+            assertion_policy: "always".to_string(),
+            function_source: "pub fn inc(x: i32) -> i32 { x + 1 }".to_string(),
+            body_hash_placeholder: "test".to_string(),
+            trust_model_dependencies: Vec::new(),
+        }];
+        let item_matches = vec![SemanticItemMatch {
+            item_kind: "total".to_string(),
+            item_id: "total:inc:test".to_string(),
+            rust_function_path: "inc".to_string(),
+            resolved_rust_function_path: Some("verified::inc".to_string()),
+            source_span: "unknown".to_string(),
+            hir_match: true,
+            mir_match: true,
+            mir_function: Some(MirFunctionSummary {
+                path: "verified::inc".to_string(),
+                args: vec![MirArg {
+                    place: "_1".to_string(),
+                    ty: "i32".to_string(),
+                }],
+                return_type: "i32".to_string(),
+                locals: Vec::new(),
+                debug_locals: vec![MirDebugLocal {
+                    name: "x".to_string(),
+                    place: "_1".to_string(),
+                }],
+                assignments: Vec::new(),
+                terminators: Vec::new(),
+                return_expr: None,
+            }),
+        }];
+
+        assert_eq!(
+            semantic_trust_callees(&metadata, &item_matches),
+            vec![SemanticTrustCallee {
+                rust_function_path: "verified::inc".to_string(),
+                params: vec![SemanticParam {
+                    name: "x".to_string(),
+                    ty: "i32".to_string(),
+                }],
+                preconditions: vec!["x < i32::MAX".to_string()],
             }]
         );
     }

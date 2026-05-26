@@ -2394,7 +2394,7 @@ fn trust_callee_summary(callee: &SemanticTrustCallee) -> TrustFunctionSummary {
 }
 
 fn function_name_matches_call(function: &str, call: &str) -> bool {
-    function == call || function_leaf_name(call) == function
+    function == call || function_leaf_name(call) == function || function_leaf_name(function) == call
 }
 
 fn function_leaf_name(path: &str) -> &str {
