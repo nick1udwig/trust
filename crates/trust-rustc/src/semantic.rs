@@ -750,6 +750,13 @@ impl MirFunctionSummary {
         if let Some(operation) = self.normalized_mir_operation(expr, depth + 1, model_fields) {
             return Some(operation);
         }
+        if let Some((callee, args)) = mir_call(expr) {
+            let args = args
+                .iter()
+                .map(|arg| self.normalized_mir_expression_with_depth(arg, depth + 1, model_fields))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(format!("{callee}({})", args.join(",")));
+        }
         if let Some((base, index)) = mir_slice_index(expr) {
             return Some(format!(
                 "{}[{}]",
@@ -2587,6 +2594,31 @@ fn add_one(_1: i32) -> i32 {
                 expression: "x + 1".to_string(),
                 guards: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn normalizes_mir_direct_call_return_expression() {
+        let mir = r#"
+fn has_items(_1: &[i32]) -> bool {
+    debug xs => _1;
+    let mut _0: bool;
+
+    bb0: {
+        _0 = verified::nonempty(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+"#;
+
+        let summary = extract_mir_function_summary(mir, "has_items").expect("MIR summary");
+
+        assert_eq!(
+            summary.normalized_return_expression(),
+            Some("verified::nonempty(xs)".to_string())
         );
     }
 

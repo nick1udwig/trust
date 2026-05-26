@@ -130,6 +130,7 @@ fn pass_semantic_executable_spec_call_is_supported() {
         .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
         .expect("expected Trust semantic summary");
     let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("return_expr=nonempty(xs)"));
     assert!(summary.contains("calls=nonempty(xs)"));
 }
 
