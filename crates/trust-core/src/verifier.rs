@@ -880,6 +880,13 @@ struct LoopSpec {
     decreases: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopMeasureProof {
+    Proved,
+    Unproved,
+    SemanticExtractionIncomplete,
+}
+
 fn semantic_for<'a>(
     metadata: &TrustMetadata,
     semantics: &'a [TrustFunctionSemantics],
@@ -3300,11 +3307,21 @@ fn verify_loop_spec(
         });
     }
 
-    if !loop_measure_decreases(measure, condition, loop_body, semantics) {
-        return Err(VerificationError::LoopDecreasesNotDecreasing {
-            function: function.to_string(),
-            measure: measure.clone(),
-        });
+    match loop_measure_decreases(measure, condition, loop_body, semantics) {
+        LoopMeasureProof::Proved => {}
+        LoopMeasureProof::Unproved => {
+            return Err(VerificationError::LoopDecreasesNotDecreasing {
+                function: function.to_string(),
+                measure: measure.clone(),
+            });
+        }
+        LoopMeasureProof::SemanticExtractionIncomplete => {
+            return Err(VerificationError::SemanticExtractionIncomplete {
+                function: function.to_string(),
+                category: "loop decreases".to_string(),
+                expression: measure.clone(),
+            });
+        }
     }
 
     if let Some(invariant) = &spec.invariant {
@@ -3553,10 +3570,28 @@ fn loop_measure_decreases(
     condition: &str,
     loop_body: &[String],
     semantics: Option<&TrustFunctionSemantics>,
+) -> LoopMeasureProof {
+    if semantic_measure_decreases(measure, condition, semantics) {
+        return LoopMeasureProof::Proved;
+    }
+
+    if token_measure_decreases(measure, loop_body) {
+        return if semantics.is_some() {
+            LoopMeasureProof::SemanticExtractionIncomplete
+        } else {
+            LoopMeasureProof::Proved
+        };
+    }
+
+    LoopMeasureProof::Unproved
+}
+
+fn semantic_measure_decreases(
+    measure: &str,
+    condition: &str,
+    semantics: Option<&TrustFunctionSemantics>,
 ) -> bool {
-    if decrements_variable(loop_body, measure)
-        || semantic_decrements_variable(semantics, condition, measure)
-    {
+    if semantic_decrements_variable(semantics, condition, measure) {
         return true;
     }
 
@@ -3565,10 +3600,21 @@ fn loop_measure_decreases(
     };
     let left = left.trim();
     let right = right.trim();
-    decrements_variable(loop_body, left)
-        || semantic_decrements_variable(semantics, condition, left)
-        || increment_amount(loop_body, right).is_some()
+    semantic_decrements_variable(semantics, condition, left)
         || semantic_increment_amount(semantics, condition, right).is_some()
+}
+
+fn token_measure_decreases(measure: &str, loop_body: &[String]) -> bool {
+    if decrements_variable(loop_body, measure) {
+        return true;
+    }
+
+    let Some((left, right)) = measure.split_once('-') else {
+        return false;
+    };
+    let left = left.trim();
+    let right = right.trim();
+    decrements_variable(loop_body, left) || increment_amount(loop_body, right).is_some()
 }
 
 fn semantic_decrements_variable(
@@ -6561,6 +6607,43 @@ mod tests {
         assert_eq!(
             verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn partial_semantic_loop_decreases_fails_closed() {
+        let metadata = metadata_named_with_classes(
+            "countdown",
+            "pub fn countdown(mut n: usize) -> usize { trust::loop_spec! { decreases(n); } while n > 0 { n = n - 1; } n }",
+            &[],
+            &[],
+        );
+        let semantics = TrustFunctionSemantics {
+            rust_function_path: "countdown".to_string(),
+            params: vec![SemanticParam {
+                name: "n".to_string(),
+                ty: "usize".to_string(),
+            }],
+            return_type: "usize".to_string(),
+            local_types: Vec::new(),
+            contract_bindings: Vec::new(),
+            return_expression: Some("n".to_string()),
+            arithmetic_operations: Vec::new(),
+            slice_indexes: Vec::new(),
+            calls: Vec::new(),
+            field_accesses: Vec::new(),
+            matches: Vec::new(),
+            branches: Vec::new(),
+        };
+
+        assert_eq!(verify_total(&metadata), Ok(()));
+        assert_eq!(
+            verify_totals_with_semantics(&[metadata], &[semantics], VerificationOptions::default()),
+            Err(VerificationError::SemanticExtractionIncomplete {
+                function: "countdown".to_string(),
+                category: "loop decreases".to_string(),
+                expression: "n".to_string(),
+            })
         );
     }
 
