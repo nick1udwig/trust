@@ -463,7 +463,7 @@ fn verify_total_with_env(
     model_types: &[String],
     options: VerificationOptions,
 ) -> Result<(), VerificationError> {
-    if metadata.item_kind != "total" {
+    if !has_verifiable_rust_body(metadata) {
         return Ok(());
     }
 
@@ -1012,6 +1012,10 @@ fn function_env(
 
 fn is_executable_spec(item: &TrustMetadata) -> bool {
     item.item_kind == "spec" && item.item_id.starts_with("spec:executable:")
+}
+
+fn has_verifiable_rust_body(item: &TrustMetadata) -> bool {
+    item.item_kind == "total" || is_executable_spec(item)
 }
 
 fn model_env(metadata: &[TrustMetadata]) -> Vec<String> {
@@ -9925,6 +9929,22 @@ mod tests {
         );
 
         assert_eq!(verify_totals(&[spec, caller]), Ok(()));
+    }
+
+    #[test]
+    fn executable_spec_bodies_are_verified() {
+        let spec = executable_spec_metadata(
+            "first_positive",
+            "fn first_positive(xs: &[i32]) -> bool { xs[0] > 0 }",
+        );
+
+        assert_eq!(
+            verify_totals(&[spec]),
+            Err(VerificationError::SliceIndexOutOfBounds {
+                function: "first_positive".to_string(),
+                expression: "xs[0]".to_string(),
+            })
+        );
     }
 
     #[test]

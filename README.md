@@ -44,6 +44,8 @@ Implemented:
 - HIR/MIR-backed parameter and return-type mapping for totals and executable
   specs when semantic extraction is available, with fail-closed diagnostics for
   token-only gaps
+- executable spec bodies are verified for the same MVP runtime-safety checks
+  before totals may rely on them
 - runtime public precondition assertions
 - MVP checks for `i32`, `i64`, `u32`, `u64`, and `usize` integer overflow,
   signed division/remainder overflow, division and remainder by zero, slice bounds,

@@ -483,6 +483,15 @@ fn fail_executable_spec_quantifier_is_rejected() {
 }
 
 #[test]
+fn fail_executable_spec_slice_index_is_rejected_by_wrapper_verifier() {
+    let output = run_fixture("fail_executable_spec_slice_index", Expected::Fail);
+
+    output.assert_contains("error[trust]: could not prove index is in bounds");
+    output.assert_contains("--> Trust spec `verified::first_positive` at src/lib.rs:");
+    output.assert_contains("xs[0]");
+}
+
+#[test]
 fn pass_missing_config_uses_defaults() {
     run_fixture("pass_config_missing_defaults", Expected::Pass);
 }

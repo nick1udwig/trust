@@ -68,7 +68,7 @@ fn run() -> Result<i32, String> {
         .count();
     let verification_items = metadata
         .iter()
-        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .filter(|item| is_verification_item(item))
         .count();
     let cache_stats = if verification_items == 0 {
         CacheStats { hits: 0, misses: 0 }
@@ -233,9 +233,15 @@ fn emit_config_warnings(metadata: &[trust_core::metadata::TrustMetadata], config
 }
 
 fn metadata_has_verification_item(metadata: &[trust_core::metadata::TrustMetadata]) -> bool {
-    metadata
-        .iter()
-        .any(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+    metadata.iter().any(is_verification_item)
+}
+
+fn is_verification_item(item: &TrustMetadata) -> bool {
+    matches!(item.item_kind.as_str(), "total" | "proof") || is_executable_spec(item)
+}
+
+fn is_executable_spec(item: &TrustMetadata) -> bool {
+    item.item_kind == "spec" && item.item_id.starts_with("spec:executable:")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -327,7 +333,7 @@ fn verify_metadata(
 ) -> Result<CacheStats, String> {
     let verification_items = metadata
         .iter()
-        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .filter(|item| is_verification_item(item))
         .count();
     if verification_items == 0 {
         return Ok(CacheStats { hits: 0, misses: 0 });
@@ -422,9 +428,10 @@ fn format_verification_error(
     let Some(item_name) = verification_error_item_name(err) else {
         return diagnostic;
     };
-    let Some(item) = metadata.iter().find(|item| {
-        matches!(item.item_kind.as_str(), "total" | "proof") && item.rust_function_path == item_name
-    }) else {
+    let Some(item) = metadata
+        .iter()
+        .find(|item| is_verification_item(item) && item.rust_function_path == item_name)
+    else {
         return diagnostic;
     };
 
@@ -852,10 +859,10 @@ fn reject_ambiguous_metadata_paths(metadata: &[TrustMetadata]) -> Result<(), Str
     let mut seen = HashSet::new();
     let mut duplicates = Vec::new();
 
-    for item in metadata
-        .iter()
-        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof" | "trust_model"))
-    {
+    for item in metadata.iter().filter(|item| {
+        matches!(item.item_kind.as_str(), "total" | "proof" | "trust_model")
+            || is_executable_spec(item)
+    }) {
         if !seen.insert(item.rust_function_path.as_str())
             && !duplicates
                 .iter()
@@ -978,7 +985,7 @@ fn vc_fingerprints(
 ) -> Vec<String> {
     metadata
         .iter()
-        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .filter(|item| is_verification_item(item))
         .map(|item| vc_fingerprint(item, semantics, cache_context))
         .collect()
 }
@@ -1052,7 +1059,7 @@ fn cache_entry_contents(
 ) -> String {
     let verification_items = metadata
         .iter()
-        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .filter(|item| is_verification_item(item))
         .count();
     let vc_fingerprints = vc_fingerprints(metadata, semantics, cache_context).join(",");
     let generated_rust_fingerprint = generated_rust_fingerprint(metadata);
