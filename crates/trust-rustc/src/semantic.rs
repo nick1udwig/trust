@@ -157,6 +157,7 @@ fn extract_semantic_views(
     let item_matches = semantic_item_matches(metadata, &hir, &mir);
     reject_unmatched_required_items(&item_matches)?;
     let rustc_version = semantic_rustc_version(rustc);
+    let model_fields = model_field_maps(metadata, Some(&hir));
 
     if let Some(dump_dir) = dump_dir {
         fs::create_dir_all(&dump_dir)
@@ -166,7 +167,13 @@ fn extract_semantic_views(
         write_semantic_dump(&dump_dir.join(format!("{base}.mir.txt")), &mir)?;
         write_semantic_dump(
             &dump_dir.join(format!("{base}.trust-semantic.txt")),
-            &semantic_summary(metadata, rustc_args, &item_matches, &rustc_version),
+            &semantic_summary(
+                metadata,
+                rustc_args,
+                &item_matches,
+                &rustc_version,
+                &model_fields,
+            ),
         )?;
     }
 
@@ -182,7 +189,7 @@ fn extract_semantic_views(
     }
 
     Ok(SemanticViews {
-        semantics: verifier_semantics(metadata, &item_matches),
+        semantics: verifier_semantics(metadata, &item_matches, &model_fields),
         source_spans: semantic_source_spans(&item_matches),
     })
 }
@@ -282,8 +289,8 @@ fn semantic_source_spans(item_matches: &[SemanticItemMatch]) -> Vec<SemanticSour
 fn verifier_semantics(
     metadata: &[TrustMetadata],
     item_matches: &[SemanticItemMatch],
+    model_fields: &[ModelFieldMap],
 ) -> Vec<TrustFunctionSemantics> {
-    let model_fields = model_field_maps(metadata);
     let trust_callees = semantic_trust_callees(metadata, item_matches);
     item_matches
         .iter()
@@ -697,12 +704,15 @@ fn function_leaf_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn model_field_maps(metadata: &[TrustMetadata]) -> Vec<ModelFieldMap> {
+fn model_field_maps(metadata: &[TrustMetadata], hir: Option<&str>) -> Vec<ModelFieldMap> {
     metadata
         .iter()
         .filter(|item| item.item_kind == "trust_model")
         .filter_map(|item| {
-            let fields = parse_model_fields(&item.function_source);
+            let fields = hir
+                .and_then(|hir| hir_model_fields(hir, &item.rust_function_path))
+                .filter(|fields| !fields.is_empty())
+                .unwrap_or_else(|| parse_model_fields(&item.function_source));
             if fields.is_empty() {
                 return None;
             }
@@ -712,6 +722,84 @@ fn model_field_maps(metadata: &[TrustMetadata]) -> Vec<ModelFieldMap> {
             })
         })
         .collect()
+}
+
+fn hir_model_fields(hir: &str, expected_path: &str) -> Option<Vec<ModelField>> {
+    let lines = hir.lines().collect::<Vec<_>>();
+    let matches = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let path = hir_owner_path(line)?;
+            hir_function_path_matches(path, expected_path).then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return None;
+    }
+
+    hir_owner_model_fields(&lines, matches[0])
+}
+
+fn hir_owner_model_fields(lines: &[&str], owner_idx: usize) -> Option<Vec<ModelField>> {
+    let owner_end = lines
+        .iter()
+        .enumerate()
+        .skip(owner_idx + 1)
+        .find(|(_, line)| line.starts_with("DefId("))
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+    let mut fields = Vec::new();
+    let mut current_name = None;
+    let mut current_ty = None;
+    let mut in_field = false;
+    let mut in_field_ty = false;
+
+    for line in &lines[owner_idx + 1..owner_end] {
+        let trimmed = line.trim();
+        if trimmed.starts_with("FieldDef {") {
+            push_hir_model_field(&mut fields, current_name.take(), current_ty.take());
+            in_field = true;
+            in_field_ty = false;
+            continue;
+        }
+        if !in_field {
+            continue;
+        }
+        if trimmed.starts_with("ty: Ty {") {
+            in_field_ty = true;
+            continue;
+        }
+        if in_field_ty && current_ty.is_none() && trimmed.starts_with("ident: ") {
+            current_ty = hir_ident_line(trimmed);
+            continue;
+        }
+        if !in_field_ty && current_name.is_none() && trimmed.starts_with("ident: ") {
+            current_name = hir_ident_line(trimmed);
+        }
+    }
+    push_hir_model_field(&mut fields, current_name, current_ty);
+
+    Some(fields)
+}
+
+fn push_hir_model_field(fields: &mut Vec<ModelField>, name: Option<String>, ty: Option<String>) {
+    let (Some(name), Some(ty)) = (name, ty) else {
+        return;
+    };
+    fields.push(ModelField { name, ty });
+}
+
+fn hir_ident_line(trimmed: &str) -> Option<String> {
+    let ident = trimmed
+        .strip_prefix("ident: ")?
+        .trim_end_matches(',')
+        .trim();
+    let ident = ident.split('#').next().unwrap_or(ident).trim();
+    if ident.is_empty() || ident.starts_with("{{") {
+        return None;
+    }
+    Some(ident.to_string())
 }
 
 fn parse_model_fields(source: &str) -> Vec<ModelField> {
@@ -3140,8 +3228,8 @@ fn semantic_summary(
     rustc_args: &[OsString],
     item_matches: &[SemanticItemMatch],
     rustc_version: &str,
+    model_fields: &[ModelFieldMap],
 ) -> String {
-    let model_fields = model_field_maps(metadata);
     let trust_callees = semantic_trust_callees(metadata, item_matches);
     let mut summary = String::new();
     summary.push_str("format=trust-semantic-dump-v1\n");
@@ -3430,6 +3518,155 @@ DefId(0:2 ~ sample[abcd]::right::same) => OwnerNodes {
 "#;
 
         assert_eq!(hir_function_span(hir, "same"), None);
+    }
+
+    #[test]
+    fn hir_model_fields_extracts_struct_fields() {
+        let hir = r#"
+DefId(0:6 ~ sample[abcd]::verified::Account) => OwnerNodes {
+    node: ParentedNode {
+        node: Item(
+            Item {
+                kind: Struct(
+                    Account#0,
+                    Generics {},
+                    Struct {
+                        fields: [
+                            FieldDef {
+                                ident: id#0,
+                                ty: Ty {
+                                    kind: Path(
+                                        Resolved(
+                                            None,
+                                            Path {
+                                                segments: [
+                                                    PathSegment {
+                                                        ident: u64#0,
+                                                    },
+                                                ],
+                                            },
+                                        ),
+                                    ),
+                                },
+                            },
+                            FieldDef {
+                                ident: balance#0,
+                                ty: Ty {
+                                    kind: Path(
+                                        Resolved(
+                                            None,
+                                            Path {
+                                                segments: [
+                                                    PathSegment {
+                                                        ident: i64#0,
+                                                    },
+                                                ],
+                                            },
+                                        ),
+                                    ),
+                                },
+                            },
+                        ],
+                    },
+                ),
+            },
+        ),
+    },
+}
+"#;
+
+        assert_eq!(
+            hir_model_fields(hir, "verified::Account"),
+            Some(vec![
+                ModelField {
+                    name: "id".to_string(),
+                    ty: "u64".to_string(),
+                },
+                ModelField {
+                    name: "balance".to_string(),
+                    ty: "i64".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn model_field_maps_prefers_hir_fields() {
+        let metadata = vec![TrustMetadata {
+            schema_version: 1,
+            trust_macro_version: "test".to_string(),
+            module_id: "unknown".to_string(),
+            item_kind: "trust_model".to_string(),
+            item_id: "trust_model:Account:test".to_string(),
+            source_span: "unknown".to_string(),
+            rust_function_path: "verified::Account".to_string(),
+            visibility: "public".to_string(),
+            contracts_original: Vec::new(),
+            contracts_normalized: Vec::new(),
+            contract_classes: Vec::new(),
+            assertion_policy: "public".to_string(),
+            function_source: "#[derive(TrustModel)] pub struct Account { pub balance: u32 }"
+                .to_string(),
+            loop_specs: Vec::new(),
+            body_hash_placeholder: "test".to_string(),
+            trust_model_dependencies: Vec::new(),
+        }];
+        let hir = r#"
+DefId(0:6 ~ sample[abcd]::verified::Account) => OwnerNodes {
+    node: ParentedNode {
+        node: Item(
+            Item {
+                kind: Struct(
+                    Account#0,
+                    Generics {},
+                    Struct {
+                        fields: [
+                            FieldDef {
+                                ident: balance#0,
+                                ty: Ty {
+                                    kind: Path(
+                                        Resolved(
+                                            None,
+                                            Path {
+                                                segments: [
+                                                    PathSegment {
+                                                        ident: i64#0,
+                                                    },
+                                                ],
+                                            },
+                                        ),
+                                    ),
+                                },
+                            },
+                        ],
+                    },
+                ),
+            },
+        ),
+    },
+}
+"#;
+
+        assert_eq!(
+            model_field_maps(&metadata, Some(hir)),
+            vec![ModelFieldMap {
+                ty: "Account".to_string(),
+                fields: vec![ModelField {
+                    name: "balance".to_string(),
+                    ty: "i64".to_string(),
+                }],
+            }]
+        );
+        assert_eq!(
+            model_field_maps(&metadata, None),
+            vec![ModelFieldMap {
+                ty: "Account".to_string(),
+                fields: vec![ModelField {
+                    name: "balance".to_string(),
+                    ty: "u32".to_string(),
+                }],
+            }]
+        );
     }
 
     #[test]
@@ -5980,7 +6217,8 @@ fn left::caller(_1: i32) -> i32 {
             ]
         );
 
-        let semantics = verifier_semantics(&metadata, &item_matches);
+        let model_fields = model_field_maps(&metadata, None);
+        let semantics = verifier_semantics(&metadata, &item_matches, &model_fields);
         let spec_semantics = semantics
             .iter()
             .find(|semantics| semantics.rust_function_path == "verified::nonempty")
