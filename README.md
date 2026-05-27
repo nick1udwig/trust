@@ -65,8 +65,10 @@ Still intentionally limited:
   nested modules, record module-qualified metadata paths, but Trust metadata
   emitted from ordinary unannotated Rust modules still does not receive full
   Rust module paths
-- verification still mostly uses the metadata/token verifier plus default
-  HIR/MIR extraction; extracted compiler facts feed return expressions, arithmetic
+- verification still uses macro metadata for contracts, proof bodies, and
+  loop-spec declarations, but rustc HIR/MIR is the primary body fact source for
+  supported MVP checks when semantic extraction is available. Extracted compiler
+  facts feed parameter and return-type mapping, return expressions, arithmetic
   operations with concrete Rust integer types, slice index facts with element and
   index types, supported slice `len` receiver and slice-index base alias
   resolution, resolved primitive integer `checked_add` calls, call arguments with
@@ -74,22 +76,18 @@ Still intentionally limited:
   unsupported calls including trait-dispatch, closure, unchecked unwrap/expect,
   and explicit panic calls for rejection, `if` branch return facts, nested path
   assumptions, branch-assignment and carried-local return facts at simple MIR
-  joins including same-block copy chains,
-  Option/Result match arms including simple local aliases, macro-emitted
-  loop-spec metadata, loop decreases targets and loop exit facts from compiler
-  branch guards, source-local type and initializer bindings for local loop
-  measures and invariant establishment, and
-  TrustModel field projections,
-  including through unambiguous local aliases, field types, missing-TrustModel
-  field checks, unsupported shift/bitwise/cast-operation and
-  signature/source-local type checks, opaque contract-reasoning checks, path
-  guards, and struct returns into verification; cfg-disabled source is pruned
-  from token fallback for supported predicates, and parameter/return-type mapping,
-  arithmetic, slice-index, Trust-call, field-access, loop-invariant,
-  loop-decreases, loop-exit, and return-postcondition VCs and unsupported-call,
-  unsupported-index, unchecked unwrap/expect, explicit panic, and closure
-  rejection are generated from MIR facts when available, but HIR/MIR is not the
-  primary VC generator yet
+  joins including same-block copy chains, Option/Result match arms including
+  simple local aliases, macro-emitted loop-spec metadata, loop decreases targets
+  and loop exit facts from compiler branch guards, source-local type and
+  initializer bindings for local loop measures and invariant establishment, and
+  TrustModel field projections, including through unambiguous local aliases,
+  field types, missing-TrustModel field checks, unsupported
+  shift/bitwise/cast-operation and signature/source-local type checks, opaque
+  contract-reasoning checks, path guards, and struct returns into verification.
+  Source-token scanning remains as a fallback when semantic extraction is
+  disabled and as a fail-closed coverage check when semantic extraction is
+  enabled; cfg-disabled source is pruned from that fallback for supported
+  predicates.
 
 ## Toolchain
 
