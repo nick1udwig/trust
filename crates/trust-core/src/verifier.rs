@@ -426,18 +426,22 @@ pub fn verify_totals_with_semantics(
             &model_types,
             options,
         )?;
-        verify_proof(item)?;
+        verify_proof(item, options)?;
     }
 
     Ok(())
 }
 
-fn verify_proof(metadata: &TrustMetadata) -> Result<(), VerificationError> {
+fn verify_proof(
+    metadata: &TrustMetadata,
+    options: VerificationOptions,
+) -> Result<(), VerificationError> {
     if metadata.item_kind != "proof" {
         return Ok(());
     }
 
-    let body = body(&metadata.function_source);
+    let body = cfg_selected_body(body(&metadata.function_source), options);
+    let body = body.as_str();
     if contains_unsupported_proof_step(body) {
         return Err(VerificationError::UnsupportedProofStep {
             proof: metadata.rust_function_path.clone(),
@@ -6185,6 +6189,33 @@ mod tests {
             Err(VerificationError::UnsupportedProofStep {
                 proof: "le_refl".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn proof_body_uses_target_cfg_selection() {
+        let proof = proof_metadata(
+            "le_refl",
+            "fn le_refl(a: i32) gives ghost { a <= a; } { #[cfg(target_pointer_width = \"64\")] assert(a <= a); }",
+            &["a <= a"],
+        );
+
+        assert_eq!(
+            verify_totals_with_options(
+                &[proof.clone()],
+                VerificationOptions::default().with_target_pointer_width(32)
+            ),
+            Err(VerificationError::ProofObligationUnproved {
+                proof: "le_refl".to_string(),
+                condition: "a <= a".to_string(),
+            })
+        );
+        assert_eq!(
+            verify_totals_with_options(
+                &[proof],
+                VerificationOptions::default().with_target_pointer_width(64)
+            ),
+            Ok(())
         );
     }
 
