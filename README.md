@@ -41,8 +41,9 @@ Implemented:
   with fail-closed diagnostics for token-only gaps
 - MIR-backed unchecked unwrap/expect, explicit panic, and closure rejection when
   semantic extraction is available, with fail-closed diagnostics for token-only gaps
-- HIR/MIR-backed parameter and return-type mapping when semantic extraction is
-  available, with fail-closed diagnostics for token-only gaps
+- HIR/MIR-backed parameter and return-type mapping for totals and executable
+  specs when semantic extraction is available, with fail-closed diagnostics for
+  token-only gaps
 - runtime public precondition assertions
 - MVP checks for `i32`, `i64`, `u32`, `u64`, and `usize` integer overflow,
   signed division/remainder overflow, division and remainder by zero, slice bounds,

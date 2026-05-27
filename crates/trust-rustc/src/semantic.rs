@@ -155,7 +155,7 @@ fn extract_semantic_views(
     let hir = run_rustc_unpretty(rustc, rustc_args, "hir-tree")?;
     let mir = run_rustc_unpretty(rustc, rustc_args, "mir")?;
     let item_matches = semantic_item_matches(metadata, &hir, &mir);
-    reject_unmatched_total_items(&item_matches)?;
+    reject_unmatched_required_items(&item_matches)?;
     let rustc_version = semantic_rustc_version(rustc);
 
     if let Some(dump_dir) = dump_dir {
@@ -232,7 +232,7 @@ fn semantic_item_matches(
 ) -> Vec<SemanticItemMatch> {
     metadata
         .iter()
-        .filter(|item| matches!(item.item_kind.as_str(), "total" | "proof"))
+        .filter(|item| semantic_item_candidate(item))
         .map(|item| {
             let mir_function = extract_mir_function_summary(mir, &item.rust_function_path);
             SemanticItemMatch {
@@ -250,6 +250,22 @@ fn semantic_item_matches(
             }
         })
         .collect()
+}
+
+fn semantic_item_candidate(item: &TrustMetadata) -> bool {
+    matches!(item.item_kind.as_str(), "total" | "proof") || is_executable_spec(item)
+}
+
+fn semantic_extraction_required(item: &SemanticItemMatch) -> bool {
+    item.item_kind == "total" || is_executable_spec_match(item)
+}
+
+fn is_executable_spec(item: &TrustMetadata) -> bool {
+    item.item_kind == "spec" && item.item_id.starts_with("spec:executable:")
+}
+
+fn is_executable_spec_match(item: &SemanticItemMatch) -> bool {
+    item.item_kind == "spec" && item.item_id.starts_with("spec:executable:")
 }
 
 fn semantic_source_spans(item_matches: &[SemanticItemMatch]) -> Vec<SemanticSourceSpan> {
@@ -271,11 +287,13 @@ fn verifier_semantics(
     let trust_callees = semantic_trust_callees(metadata, item_matches);
     item_matches
         .iter()
-        .filter(|item| item.item_kind == "total" && item.hir_match)
+        .filter(|item| {
+            (item.item_kind == "total" || is_executable_spec_match(item)) && item.hir_match
+        })
         .filter_map(|item| {
             let mir_function = item.mir_function.as_ref()?;
             let metadata_item = metadata.iter().find(|metadata_item| {
-                metadata_item.item_kind == "total" && metadata_item.item_id == item.item_id
+                metadata_item.item_kind == item.item_kind && metadata_item.item_id == item.item_id
             })?;
             let mut contract_bindings =
                 semantic_contract_bindings(metadata_item, mir_function, &model_fields);
@@ -318,10 +336,12 @@ fn semantic_trust_callees(
 ) -> Vec<SemanticTrustCallee> {
     item_matches
         .iter()
-        .filter(|item| item.item_kind == "total" && item.hir_match)
+        .filter(|item| {
+            (item.item_kind == "total" || is_executable_spec_match(item)) && item.hir_match
+        })
         .filter_map(|item| {
             let metadata_item = metadata.iter().find(|metadata_item| {
-                metadata_item.item_kind == "total" && metadata_item.item_id == item.item_id
+                metadata_item.item_kind == item.item_kind && metadata_item.item_id == item.item_id
             })?;
             let mir_function = item.mir_function.as_ref()?;
             Some(SemanticTrustCallee {
@@ -632,10 +652,10 @@ fn semantic_path_matches_call(path: &str, call: &str) -> bool {
     path == call || path.ends_with(&format!("::{call}")) || call.ends_with(&format!("::{path}"))
 }
 
-fn reject_unmatched_total_items(item_matches: &[SemanticItemMatch]) -> Result<(), String> {
+fn reject_unmatched_required_items(item_matches: &[SemanticItemMatch]) -> Result<(), String> {
     let missing: Vec<_> = item_matches
         .iter()
-        .filter(|item| item.item_kind == "total" && (!item.hir_match || !item.mir_match))
+        .filter(|item| semantic_extraction_required(item) && (!item.hir_match || !item.mir_match))
         .collect();
     if missing.is_empty() {
         return Ok(());
@@ -647,9 +667,27 @@ fn reject_unmatched_total_items(item_matches: &[SemanticItemMatch]) -> Result<()
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "Trust semantic extraction could not map total function{} to rustc HIR/MIR: {names}",
-        plural(missing.len())
+        "Trust semantic extraction could not map {} to rustc HIR/MIR: {names}",
+        semantic_required_item_label(&missing)
     ))
+}
+
+fn semantic_required_item_label(items: &[&SemanticItemMatch]) -> String {
+    let totals = items
+        .iter()
+        .filter(|item| item.item_kind == "total")
+        .count();
+    let specs = items
+        .iter()
+        .filter(|item| is_executable_spec_match(item))
+        .count();
+    if totals == items.len() {
+        return format!("total function{}", plural(items.len()));
+    }
+    if specs == items.len() {
+        return format!("executable spec{}", plural(items.len()));
+    }
+    format!("Trust semantic item{}", plural(items.len()))
 }
 
 fn function_leaf_name(path: &str) -> &str {
@@ -5824,6 +5862,137 @@ fn left::caller(_1: i32) -> i32 {
                 preconditions: vec!["x < i32::MAX".to_string()],
             }]
         );
+    }
+
+    #[test]
+    fn executable_specs_are_semantic_items_and_trust_callees() {
+        let metadata = vec![
+            TrustMetadata {
+                schema_version: 1,
+                trust_macro_version: "test".to_string(),
+                module_id: "verified".to_string(),
+                item_kind: "spec".to_string(),
+                item_id: "spec:executable:nonempty:test".to_string(),
+                source_span: "unknown".to_string(),
+                rust_function_path: "verified::nonempty".to_string(),
+                visibility: "private".to_string(),
+                contracts_original: Vec::new(),
+                contracts_normalized: Vec::new(),
+                contract_classes: Vec::new(),
+                assertion_policy: "always".to_string(),
+                function_source: "fn nonempty(xs: &[i32]) -> bool { xs.len() > 0 }".to_string(),
+                loop_specs: Vec::new(),
+                body_hash_placeholder: "spec-test".to_string(),
+                trust_model_dependencies: Vec::new(),
+            },
+            TrustMetadata {
+                schema_version: 1,
+                trust_macro_version: "test".to_string(),
+                module_id: "verified".to_string(),
+                item_kind: "total".to_string(),
+                item_id: "total:has_items:test".to_string(),
+                source_span: "unknown".to_string(),
+                rust_function_path: "verified::has_items".to_string(),
+                visibility: "public".to_string(),
+                contracts_original: Vec::new(),
+                contracts_normalized: Vec::new(),
+                contract_classes: Vec::new(),
+                assertion_policy: "always".to_string(),
+                function_source: "pub fn has_items(xs: &[i32]) -> bool { nonempty(xs) }"
+                    .to_string(),
+                loop_specs: Vec::new(),
+                body_hash_placeholder: "total-test".to_string(),
+                trust_model_dependencies: Vec::new(),
+            },
+        ];
+        let item_matches = vec![
+            SemanticItemMatch {
+                item_kind: "spec".to_string(),
+                item_id: "spec:executable:nonempty:test".to_string(),
+                rust_function_path: "verified::nonempty".to_string(),
+                resolved_rust_function_path: Some("verified::nonempty".to_string()),
+                source_span: "src/lib.rs:3:9: 5:10 (#9)".to_string(),
+                hir_match: true,
+                mir_match: true,
+                mir_function: Some(MirFunctionSummary {
+                    path: "verified::nonempty".to_string(),
+                    args: vec![MirArg {
+                        place: "_1".to_string(),
+                        ty: "&[i32]".to_string(),
+                    }],
+                    return_type: "bool".to_string(),
+                    locals: Vec::new(),
+                    debug_locals: vec![MirDebugLocal {
+                        name: "xs".to_string(),
+                        place: "_1".to_string(),
+                    }],
+                    assignments: Vec::new(),
+                    terminators: Vec::new(),
+                    return_expr: None,
+                }),
+            },
+            SemanticItemMatch {
+                item_kind: "total".to_string(),
+                item_id: "total:has_items:test".to_string(),
+                rust_function_path: "verified::has_items".to_string(),
+                resolved_rust_function_path: Some("verified::has_items".to_string()),
+                source_span: "src/lib.rs:9:9: 11:10 (#9)".to_string(),
+                hir_match: true,
+                mir_match: true,
+                mir_function: Some(MirFunctionSummary {
+                    path: "verified::has_items".to_string(),
+                    args: vec![MirArg {
+                        place: "_1".to_string(),
+                        ty: "&[i32]".to_string(),
+                    }],
+                    return_type: "bool".to_string(),
+                    locals: Vec::new(),
+                    debug_locals: vec![MirDebugLocal {
+                        name: "xs".to_string(),
+                        place: "_1".to_string(),
+                    }],
+                    assignments: Vec::new(),
+                    terminators: Vec::new(),
+                    return_expr: None,
+                }),
+            },
+        ];
+
+        assert_eq!(
+            semantic_trust_callees(&metadata, &item_matches),
+            vec![
+                SemanticTrustCallee {
+                    rust_function_path: "verified::nonempty".to_string(),
+                    params: vec![SemanticParam {
+                        name: "xs".to_string(),
+                        ty: "&[i32]".to_string(),
+                    }],
+                    preconditions: Vec::new(),
+                },
+                SemanticTrustCallee {
+                    rust_function_path: "verified::has_items".to_string(),
+                    params: vec![SemanticParam {
+                        name: "xs".to_string(),
+                        ty: "&[i32]".to_string(),
+                    }],
+                    preconditions: Vec::new(),
+                },
+            ]
+        );
+
+        let semantics = verifier_semantics(&metadata, &item_matches);
+        let spec_semantics = semantics
+            .iter()
+            .find(|semantics| semantics.rust_function_path == "verified::nonempty")
+            .expect("executable spec semantics");
+        assert_eq!(
+            spec_semantics.params,
+            vec![SemanticParam {
+                name: "xs".to_string(),
+                ty: "&[i32]".to_string(),
+            }]
+        );
+        assert_eq!(spec_semantics.return_type, "bool");
     }
 
     #[test]
