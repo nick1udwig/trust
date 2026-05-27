@@ -3239,6 +3239,19 @@ fn semantic_summary(
     }
     summary.push_str(&format!("metadata_items={}\n", metadata.len()));
     summary.push_str(&format!("semantic_items={}\n", item_matches.len()));
+    summary.push_str(&format!("model_fields={}\n", model_fields.len()));
+    for model in model_fields {
+        summary.push_str(&format!(
+            "model ty={} fields={}\n",
+            model.ty,
+            model
+                .fields
+                .iter()
+                .map(|field| format!("{}:{}", field.name, field.ty))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     for item in item_matches {
         summary.push_str(&format!(
             "item kind={} id={} path={} resolved_path={} span={} hir_match={} mir_match={}\n",

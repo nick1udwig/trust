@@ -313,6 +313,37 @@ fn pass_trust_model_struct_allows_field_reasoning() {
 }
 
 #[test]
+fn pass_trust_model_struct_dumps_hir_model_fields() {
+    let suffix = std::process::id();
+    let dump_dir = fixture_cache_dir(&format!("semantic_trust_model_dump_{suffix}"));
+    let dump_dir_str = dump_dir
+        .to_str()
+        .expect("semantic dump path should be UTF-8");
+    let output = run_fixture_with_cache_and_env(
+        "pass_trust_model_struct",
+        Expected::Pass,
+        &format!("pass_trust_model_struct_dump_{suffix}"),
+        &format!("pass_trust_model_struct_dump_{suffix}"),
+        &[("TRUST_SEMANTIC_DUMP_DIR", dump_dir_str)],
+    );
+
+    output.assert_contains("trust: extracted HIR/MIR for 1 total function");
+    output.assert_contains("trust: proved 1 total function");
+
+    let summary_path = fs::read_dir(&dump_dir)
+        .expect("read semantic dump dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read semantic dump entries")
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".trust-semantic.txt"))
+        .expect("expected Trust semantic summary");
+    let summary = fs::read_to_string(summary_path).expect("read semantic summary");
+    assert!(summary.contains("model_fields=1"));
+    assert!(summary.contains("model ty=Account fields=id:u64,balance:i64"));
+}
+
+#[test]
 fn fail_trust_model_unsupported_field_type_is_rejected() {
     let output = run_fixture("fail_trust_model_unsupported_field_type", Expected::Fail);
 

@@ -26,6 +26,8 @@ Implemented:
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
 - HIR-derived function spans in semantic dumps and verifier diagnostics when
   semantic extraction is available
+- HIR-derived `TrustModel` field maps in semantic dumps and verifier field
+  reasoning, with metadata source parsing retained as a fallback
 - cfg-aware source-token fallback for supported `#[cfg]` predicates, aligned with
   the rustc-selected body used by HIR/MIR extraction
 - macro-emitted `loop_spec` metadata for semantic loop verification, with
@@ -170,7 +172,8 @@ calling `add_one(i32::MAX)` panics instead of crossing an unchecked public bound
 - `TRUST_SMT_DUMP_DIR=/path/to/dumps`: writes SMT-LIB queries for z3-backed VCs.
 - `TRUST_SEMANTIC_DUMP_DIR=/path/to/dumps`: writes rustc `hir-tree`, MIR, and
   a Trust-to-compiler-item summary for Trust crates, including resolved MIR
-  function paths and typed contract identifier bindings when rustc exposes them.
+  function paths, HIR-derived `TrustModel` fields, and typed contract identifier
+  bindings when rustc exposes them.
 - `TRUST_SEMANTIC_VERIFY=0`: debug escape hatch that disables feeding default
   rustc HIR/MIR facts into verification when semantic dumps are not requested.
   By default, Trust extracts HIR/MIR for Trust verification items and feeds
