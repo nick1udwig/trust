@@ -114,14 +114,26 @@ struct MirVariantProjection {
     ty: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticViews {
+    pub(crate) semantics: Vec<TrustFunctionSemantics>,
+    pub(crate) source_spans: Vec<SemanticSourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticSourceSpan {
+    pub(crate) rust_function_path: String,
+    pub(crate) source_span: String,
+}
+
 pub(crate) fn maybe_extract_semantic_views(
     rustc: &OsString,
     rustc_args: &[OsString],
     metadata: &[TrustMetadata],
-) -> Result<Vec<TrustFunctionSemantics>, String> {
+) -> Result<SemanticViews, String> {
     let dump_dir = env::var_os("TRUST_SEMANTIC_DUMP_DIR").map(PathBuf::from);
     if dump_dir.is_none() && !semantic_verify_enabled() {
-        return Ok(Vec::new());
+        return Ok(SemanticViews::default());
     }
 
     extract_semantic_views(rustc, rustc_args, metadata, dump_dir)
@@ -139,7 +151,7 @@ fn extract_semantic_views(
     rustc_args: &[OsString],
     metadata: &[TrustMetadata],
     dump_dir: Option<PathBuf>,
-) -> Result<Vec<TrustFunctionSemantics>, String> {
+) -> Result<SemanticViews, String> {
     let hir = run_rustc_unpretty(rustc, rustc_args, "hir-tree")?;
     let mir = run_rustc_unpretty(rustc, rustc_args, "mir")?;
     let item_matches = semantic_item_matches(metadata, &hir, &mir);
@@ -169,7 +181,10 @@ fn extract_semantic_views(
         );
     }
 
-    Ok(verifier_semantics(metadata, &item_matches))
+    Ok(SemanticViews {
+        semantics: verifier_semantics(metadata, &item_matches),
+        source_spans: semantic_source_spans(&item_matches),
+    })
 }
 
 fn run_rustc_unpretty(
@@ -227,11 +242,23 @@ fn semantic_item_matches(
                 resolved_rust_function_path: mir_function
                     .as_ref()
                     .map(|mir_function| mir_function.path.clone()),
-                source_span: item.source_span.clone(),
+                source_span: hir_function_span(hir, &item.rust_function_path)
+                    .unwrap_or_else(|| item.source_span.clone()),
                 hir_match: hir_contains_function(hir, &item.rust_function_path),
                 mir_match: mir_function.is_some(),
                 mir_function,
             }
+        })
+        .collect()
+}
+
+fn semantic_source_spans(item_matches: &[SemanticItemMatch]) -> Vec<SemanticSourceSpan> {
+    item_matches
+        .iter()
+        .filter(|item| item.source_span != "unknown")
+        .map(|item| SemanticSourceSpan {
+            rust_function_path: item.rust_function_path.clone(),
+            source_span: item.source_span.clone(),
         })
         .collect()
 }
@@ -757,6 +784,69 @@ fn hir_function_path_matches(path: &str, expected_path: &str) -> bool {
     } else {
         function_leaf_name(path) == expected_path
     }
+}
+
+fn hir_function_span(hir: &str, expected_path: &str) -> Option<String> {
+    let lines = hir.lines().collect::<Vec<_>>();
+    let matches = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let path = hir_owner_path(line)?;
+            hir_function_path_matches(path, expected_path).then_some(idx)
+        })
+        .collect::<Vec<_>>();
+
+    if matches.len() != 1 {
+        return None;
+    }
+
+    hir_owner_item_span(&lines, matches[0])
+}
+
+fn hir_owner_item_span(lines: &[&str], owner_idx: usize) -> Option<String> {
+    let owner_end = lines
+        .iter()
+        .enumerate()
+        .skip(owner_idx + 1)
+        .find(|(_, line)| line.starts_with("DefId("))
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+    let mut saw_fn_kind = false;
+    let mut best_span: Option<(usize, String)> = None;
+
+    for line in &lines[owner_idx + 1..owner_end] {
+        let trimmed = line.trim();
+        if trimmed.starts_with("kind: Fn") {
+            saw_fn_kind = true;
+        }
+        if !saw_fn_kind {
+            continue;
+        }
+
+        let Some(span) = hir_span_line(line) else {
+            continue;
+        };
+        let indent = line.len() - line.trim_start().len();
+        if best_span
+            .as_ref()
+            .is_none_or(|(best_indent, _)| indent < *best_indent)
+        {
+            best_span = Some((indent, span));
+        }
+    }
+
+    best_span.map(|(_, span)| span)
+}
+
+fn hir_span_line(line: &str) -> Option<String> {
+    let span = line.trim().strip_prefix("span: ")?.trim();
+    let span = span.strip_suffix(',').unwrap_or(span).trim();
+    if span.is_empty() || span.starts_with("no-location") {
+        return None;
+    }
+
+    Some(span.to_string())
 }
 
 fn extract_mir_function_summary(mir: &str, name: &str) -> Option<MirFunctionSummary> {
@@ -3249,6 +3339,59 @@ DefId(0:1 ~ sample[abcd]::__TRUST_META_same_1234) => OwnerNodes {
 
         assert!(!hir_contains_function(hir, "left::same"));
         assert!(!hir_contains_function(hir, "same"));
+    }
+
+    #[test]
+    fn hir_function_span_extracts_item_span() {
+        let hir = r#"
+DefId(0:6 ~ sample[abcd]::verified::id_i32) => OwnerNodes {
+    node: ParentedNode {
+        node: Item(
+            Item {
+                kind: Fn {
+                    sig: FnSig {
+                        span: src/lib.rs:2:10: 2:13 (#9),
+                    },
+                },
+                span: src/lib.rs:3:5: 5:6 (#9),
+            },
+        ),
+    },
+}
+"#;
+
+        assert_eq!(
+            hir_function_span(hir, "verified::id_i32"),
+            Some("src/lib.rs:3:5: 5:6 (#9)".to_string())
+        );
+    }
+
+    #[test]
+    fn hir_function_span_requires_unique_leaf() {
+        let hir = r#"
+DefId(0:1 ~ sample[abcd]::left::same) => OwnerNodes {
+    node: ParentedNode {
+        node: Item(
+            Item {
+                kind: Fn {},
+                span: src/lib.rs:1:1: 1:10 (#9),
+            },
+        ),
+    },
+}
+DefId(0:2 ~ sample[abcd]::right::same) => OwnerNodes {
+    node: ParentedNode {
+        node: Item(
+            Item {
+                kind: Fn {},
+                span: src/lib.rs:2:1: 2:10 (#9),
+            },
+        ),
+    },
+}
+"#;
+
+        assert_eq!(hir_function_span(hir, "same"), None);
     }
 
     #[test]

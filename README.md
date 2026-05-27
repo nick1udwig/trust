@@ -24,6 +24,8 @@ Implemented:
 - target-aware `usize` proof bounds using the rustc target pointer width
 - optional SMT-LIB query dumps with `TRUST_SMT_DUMP_DIR`
 - optional rustc HIR/MIR semantic dumps with `TRUST_SEMANTIC_DUMP_DIR`
+- HIR-derived function spans in semantic dumps and verifier diagnostics when
+  semantic extraction is available
 - cfg-aware source-token fallback for supported `#[cfg]` predicates, aligned with
   the rustc-selected body used by HIR/MIR extraction
 - macro-emitted `loop_spec` metadata for semantic loop verification, with

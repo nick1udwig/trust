@@ -55,11 +55,13 @@ fn run() -> Result<i32, String> {
     let metadata = read_metadata(&metadata_path)?;
     reject_ambiguous_metadata_paths(&metadata)?;
     emit_config_warnings(&metadata, &config);
-    let semantics = if metadata_has_verification_item(&metadata) {
+    let semantic_views = if metadata_has_verification_item(&metadata) {
         semantic::maybe_extract_semantic_views(&rustc, &rustc_args, &metadata)?
     } else {
-        Vec::new()
+        semantic::SemanticViews::default()
     };
+    let semantics = semantic_views.semantics;
+    let semantic_source_spans = semantic_views.source_spans;
     let totals = metadata
         .iter()
         .filter(|item| item.item_kind == "total")
@@ -72,7 +74,13 @@ fn run() -> Result<i32, String> {
         CacheStats { hits: 0, misses: 0 }
     } else {
         let cache_context = CacheContext::from_rustc_args(&rustc, &rustc_args, &config)?;
-        verify_metadata(&metadata, &semantics, &cache_context, &config)?
+        verify_metadata(
+            &metadata,
+            &semantics,
+            &semantic_source_spans,
+            &cache_context,
+            &config,
+        )?
     };
 
     if deterministic_test_mode() && totals > 0 {
@@ -313,6 +321,7 @@ struct TargetCfg {
 fn verify_metadata(
     metadata: &[trust_core::metadata::TrustMetadata],
     semantics: &[TrustFunctionSemantics],
+    semantic_source_spans: &[semantic::SemanticSourceSpan],
     cache_context: &CacheContext,
     config: &TrustConfig,
 ) -> Result<CacheStats, String> {
@@ -336,7 +345,13 @@ fn verify_metadata(
             });
         }
 
-        verify_all(metadata, semantics, cache_context, config)?;
+        verify_all(
+            metadata,
+            semantics,
+            semantic_source_spans,
+            cache_context,
+            config,
+        )?;
         write_cache_entry(&cache_file, metadata, semantics, cache_context)?;
         return Ok(CacheStats {
             hits: 0,
@@ -344,7 +359,13 @@ fn verify_metadata(
         });
     }
 
-    verify_all(metadata, semantics, cache_context, config)?;
+    verify_all(
+        metadata,
+        semantics,
+        semantic_source_spans,
+        cache_context,
+        config,
+    )?;
     Ok(CacheStats {
         hits: 0,
         misses: verification_items,
@@ -354,6 +375,7 @@ fn verify_metadata(
 fn verify_all(
     metadata: &[trust_core::metadata::TrustMetadata],
     semantics: &[TrustFunctionSemantics],
+    semantic_source_spans: &[semantic::SemanticSourceSpan],
     cache_context: &CacheContext,
     config: &TrustConfig,
 ) -> Result<(), String> {
@@ -366,7 +388,7 @@ fn verify_all(
         solver => return Err(format!("unsupported solver `{solver}`")),
     };
 
-    result.map_err(|err| format_verification_error(&err, metadata))
+    result.map_err(|err| format_verification_error(&err, metadata, semantic_source_spans))
 }
 
 fn verification_options(config: &TrustConfig, cache_context: &CacheContext) -> VerificationOptions {
@@ -391,7 +413,11 @@ fn target_pointer_width(pointer_width: &str) -> Option<u32> {
     }
 }
 
-fn format_verification_error(err: &VerificationError, metadata: &[TrustMetadata]) -> String {
+fn format_verification_error(
+    err: &VerificationError,
+    metadata: &[TrustMetadata],
+    semantic_source_spans: &[semantic::SemanticSourceSpan],
+) -> String {
     let mut diagnostic = err.to_string();
     let Some(item_name) = verification_error_item_name(err) else {
         return diagnostic;
@@ -406,8 +432,8 @@ fn format_verification_error(err: &VerificationError, metadata: &[TrustMetadata]
         "\n  --> Trust {} `{}`",
         item.item_kind, item.rust_function_path
     ));
-    if item.source_span != "unknown" {
-        diagnostic.push_str(&format!(" at {}", item.source_span));
+    if let Some(source_span) = diagnostic_source_span(item, semantic_source_spans) {
+        diagnostic.push_str(&format!(" at {source_span}"));
     }
 
     let snippet = diagnostic_source_snippet(err, item)
@@ -424,6 +450,23 @@ fn format_verification_error(err: &VerificationError, metadata: &[TrustMetadata]
     }
 
     diagnostic
+}
+
+fn diagnostic_source_span<'a>(
+    item: &'a TrustMetadata,
+    semantic_source_spans: &'a [semantic::SemanticSourceSpan],
+) -> Option<&'a str> {
+    if item.source_span != "unknown" {
+        return Some(item.source_span.as_str());
+    }
+
+    semantic_source_spans
+        .iter()
+        .find(|source_span| {
+            source_span.rust_function_path == item.rust_function_path
+                && source_span.source_span != "unknown"
+        })
+        .map(|source_span| source_span.source_span.as_str())
 }
 
 fn verification_error_item_name(err: &VerificationError) -> Option<&str> {
@@ -1167,6 +1210,30 @@ mod tests {
             reject_ambiguous_metadata_paths(&metadata),
             Err("duplicate Trust metadata path `same`; Trust MVP requires unique total/proof/model paths within a crate so HIR/MIR facts map unambiguously".to_string())
         );
+    }
+
+    #[test]
+    fn verification_error_uses_semantic_span_when_metadata_span_unknown() {
+        let mut item = metadata_item("total", "verified::add_one");
+        item.source_span = "unknown".to_string();
+        item.function_source = "pub fn add_one(x: i32) -> i32 { x + 1 }".to_string();
+        let err = VerificationError::IntegerAdditionOverflow {
+            function: "verified::add_one".to_string(),
+            expression: "x + 1".to_string(),
+        };
+        let diagnostic = format_verification_error(
+            &err,
+            &[item],
+            &[semantic::SemanticSourceSpan {
+                rust_function_path: "verified::add_one".to_string(),
+                source_span: "src/lib.rs:3:5: 3:42 (#0)".to_string(),
+            }],
+        );
+
+        assert!(
+            diagnostic.contains("--> Trust total `verified::add_one` at src/lib.rs:3:5: 3:42 (#0)")
+        );
+        assert!(diagnostic.contains("pub fn add_one(x: i32) -> i32 { x + 1 }"));
     }
 
     #[test]

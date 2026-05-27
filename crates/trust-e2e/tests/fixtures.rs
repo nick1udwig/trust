@@ -63,6 +63,7 @@ fn pass_total_identity_writes_hir_mir_semantic_dumps_when_requested() {
     assert!(summary.contains("rustc_version=rustc-test"));
     assert!(summary.contains("item kind=total"));
     assert!(summary.contains("path=verified::id_i32"));
+    assert!(summary.contains("span=src/lib.rs:"));
     assert!(summary.contains("hir_match=true"));
     assert!(summary.contains("mir_match=true"));
     assert!(summary.contains("mir_function path=id_i32"));
@@ -1496,6 +1497,7 @@ fn fail_semantic_block_add_unproved_is_rejected_by_mir_verifier() {
 
     output.assert_contains("trust: extracted HIR/MIR for 1 total function");
     output.assert_contains("error[trust]: could not prove integer addition cannot overflow");
+    output.assert_contains("--> Trust total `verified::add_one` at src/lib.rs:");
     output.assert_contains("x + 1");
 }
 
